@@ -260,6 +260,7 @@ case "$ACTION" in
             --pids-limit 1024 \
             --memory "${AKG_WORKER_MEMORY:-48g}" \
             --tmpfs /tmp:rw,nosuid,nodev,exec,mode=1777 \
+            --tmpfs /root/ascend:rw,nosuid,nodev,noexec,mode=0700 \
             --env-file "$WORKER_ENV_FILE" \
             --env "LD_LIBRARY_PATH=$WORKER_LD_LIBRARY_PATH" \
             --env "ASCEND_VISIBLE_DEVICES=$DEVICE_ID" \
@@ -315,6 +316,7 @@ case "$ACTION" in
             --log-opt "max-size=${AKG_LOG_MAX_SIZE:-20m}" \
             --log-opt "max-file=${AKG_LOG_MAX_FILES:-5}" \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
+            --tmpfs /root/ascend:rw,nosuid,nodev,noexec,mode=0700 \
             --env-file "$WORKER_ENV_FILE" \
             --env-file "$HIDDEN_ENV_FILE" \
             --env "LD_LIBRARY_PATH=$WORKER_LD_LIBRARY_PATH" \

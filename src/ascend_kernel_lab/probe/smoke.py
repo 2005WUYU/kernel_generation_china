@@ -8,6 +8,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+RESULT_PREFIX = "AKG_TRITON_PROBE_RESULT="
+
 _ELEMENTWISE_SOURCE = r'''
 import torch
 import torch_npu
@@ -146,7 +148,9 @@ def main() -> int:
             "error": f"{type(exc).__name__}: {exc}",
             "traceback_tail": traceback.format_exc().splitlines()[-20:],
         }
-    print(json.dumps(result, ensure_ascii=False))
+    # CANN may write log warnings to stdout without a newline during process
+    # teardown.  A sentinel lets the parent recover this JSON from noisy text.
+    print(RESULT_PREFIX + json.dumps(result, ensure_ascii=False), flush=True)
     return 0 if result["correct"] else 1
 
 

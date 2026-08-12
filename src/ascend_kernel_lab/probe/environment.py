@@ -22,6 +22,19 @@ from ascend_kernel_lab.storage.permissions import (
 )
 
 _MAX_OUTPUT = 256_000
+_PROBE_RESULT_PREFIX = "AKG_TRITON_PROBE_RESULT="
+
+
+def _probe_result(text: str) -> dict[str, Any] | None:
+    position = text.rfind(_PROBE_RESULT_PREFIX)
+    if position < 0:
+        return None
+    payload = text[position + len(_PROBE_RESULT_PREFIX) :].lstrip()
+    try:
+        value, _ = json.JSONDecoder().raw_decode(payload)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -209,23 +222,32 @@ class EnvironmentProber:
         )
         results: dict[str, Any] = {}
         for feature in features:
+            print(f"[probe] {feature}: running", file=sys.stderr, flush=True)
             probe = self.command((
                 self.python_executable, "-m", "ascend_kernel_lab.probe.smoke", "--feature", feature,
             ), timeout=120)
-            parsed: Any = None
-            for line in reversed(probe.stdout.splitlines()):
-                try:
-                    parsed = json.loads(line)
-                    break
-                except json.JSONDecodeError:
-                    continue
+            parsed = _probe_result(probe.stdout)
             results[feature] = parsed or {
                 "feature": feature,
                 "compile": False,
                 "run": False,
                 "correct": False,
-                "error": probe.stderr or f"exit code {probe.returncode}",
+                "error": (
+                    probe.stderr[-4000:]
+                    or probe.stdout[-4000:]
+                    or f"exit code {probe.returncode}"
+                ),
+                "returncode": probe.returncode,
+                "timed_out": probe.timed_out,
             }
+            outcome = results[feature]
+            passed = bool(outcome.get("correct"))
+            detail = "" if passed else f": {outcome.get('error') or 'unknown error'}"
+            print(
+                f"[probe] {feature}: {'PASS' if passed else 'FAIL'}{detail}",
+                file=sys.stderr,
+                flush=True,
+            )
         device_visibility = self.command(
             (
                 self.python_executable,
