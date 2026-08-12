@@ -89,7 +89,9 @@ class ResourceLimits:
     """POSIX limits applied in the child immediately before exec."""
 
     address_space_bytes: int = 16 * 1024**3
-    file_size_bytes: int = 256 * 1024**2
+    # Triton-Ascend/FlagTree can generate a precompiled C++ header well above
+    # 256 MiB before launching even a small kernel.
+    file_size_bytes: int = 2 * 1024**3
     open_files: int = 256
     # RLIMIT_NPROC counts every process owned by the Unix user on several
     # platforms. Keep this above a normal shared development account's baseline;
