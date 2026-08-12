@@ -318,7 +318,6 @@ def _probe_readiness_failures(
             profiler.get("schema_version") != "ascend_profiler_capabilities_v1"
             or profiler.get("msprof_available") is not True
             or profiler.get("live_smoke_completed") is not True
-            or missing_groups
         ):
             failures.append("profiler live smoke did not complete")
         if missing_groups:

@@ -69,6 +69,49 @@ class MsprofParserTests(unittest.TestCase):
         self.assertAlmostEqual(summary.pipeline["scalar_ratio"] or 0, 0.5)
         self.assertAlmostEqual(summary.pipeline["mte2_ratio"] or 0, 1.0)
 
+    def test_cann9_split_operator_metric_tables_are_merged(self) -> None:
+        parser = MsprofParser((r"^_add$",))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "OpBasicInfo.csv").write_text(
+                "Op Name,Op Type,Task Duration(us),Block Dim,\n"
+                "_add,vector,1.3,4,\n",
+                encoding="utf-8",
+            )
+            (root / "PipeUtilization.csv").write_text(
+                "block_id,sub_block_id,aic_cube_ratio,aic_scalar_ratio,"
+                "aiv_vec_ratio,aiv_mte2_ratio,aiv_mte3_ratio,aiv_scalar_ratio,\n"
+                "0,0,,,0.41,0.35,0.06,0.18,\n",
+                encoding="utf-8",
+            )
+            (root / "Memory.csv").write_text(
+                "block_id,aiv_gm_to_ub_bw(GB/s),aiv_ub_to_gm_bw(GB/s),\n"
+                "0,128.5,96.25,\n",
+                encoding="utf-8",
+            )
+            (root / "MemoryUB.csv").write_text(
+                "block_id,aiv_ub_read_bw_vector(GB/s),"
+                "aiv_ub_write_bw_vector(GB/s),\n"
+                "0,512.0,480.0,\n",
+                encoding="utf-8",
+            )
+            (root / "L2Cache.csv").write_text(
+                "block_id,aiv_total_hit_rate(%),\n0,87.5%,\n",
+                encoding="utf-8",
+            )
+            summary = parser.parse(root)
+
+        self.assertTrue(summary.profile_available)
+        self.assertEqual(summary.kernel_count, 1)
+        self.assertAlmostEqual(summary.pipeline["vector_ratio"] or 0, 0.41)
+        self.assertAlmostEqual(summary.pipeline["scalar_ratio"] or 0, 0.18)
+        self.assertAlmostEqual(summary.pipeline["mte2_ratio"] or 0, 0.35)
+        self.assertAlmostEqual(summary.memory["gm_read_gbps"] or 0, 128.5)
+        self.assertAlmostEqual(summary.memory["gm_write_gbps"] or 0, 96.25)
+        self.assertAlmostEqual(summary.memory["ub_read_gbps"] or 0, 512.0)
+        self.assertAlmostEqual(summary.memory["ub_write_gbps"] or 0, 480.0)
+        self.assertAlmostEqual(summary.memory["l2_hit_rate"] or 0, 0.875)
+
     def test_no_csv_is_explicitly_unavailable(self) -> None:
         parser = MsprofParser(("generated",))
         with tempfile.TemporaryDirectory() as temporary:

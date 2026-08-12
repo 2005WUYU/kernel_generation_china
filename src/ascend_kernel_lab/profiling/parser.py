@@ -18,26 +18,62 @@ _ALIASES: Mapping[str, tuple[str, ...]] = {
     "duration_us": ("durationus", "taskdurationus", "aicoretimeus", "duration", "任务时长us"),
     "duration_ns": ("durationns", "taskdurationns"),
     "block_dim": ("blockdim", "blockdimension", "block维度"),
-    "vector_ratio": ("vectorratio", "vectorutilization", "vector占比"),
-    "cube_ratio": ("cuberatio", "cubeutilization", "cube占比"),
-    "scalar_ratio": ("scalarratio", "scalarutilization", "scalar占比"),
-    "mte2_ratio": ("mte2ratio", "mte2utilization", "mte2占比"),
-    "mte3_ratio": ("mte3ratio", "mte3utilization", "mte3占比"),
-    "gm_read_gbps": ("gmreadgbps", "gmreadbandwidthgbps"),
-    "gm_write_gbps": ("gmwritegbps", "gmwritebandwidthgbps"),
-    "ub_read_gbps": ("ubreadgbps", "ubreadbandwidthgbps"),
-    "ub_write_gbps": ("ubwritegbps", "ubwritebandwidthgbps"),
-    "l2_hit_rate": ("l2hit", "l2hitrate", "l2cachehitrate"),
+    "vector_ratio": (
+        "vectorratio", "vectorutilization", "vector占比", "aivvecratio",
+    ),
+    "cube_ratio": (
+        "cuberatio", "cubeutilization", "cube占比", "aiccuberatio",
+    ),
+    "scalar_ratio": (
+        "scalarratio", "scalarutilization", "scalar占比",
+        "aivscalarratio", "aicscalarratio",
+    ),
+    "mte2_ratio": (
+        "mte2ratio", "mte2utilization", "mte2占比",
+        "aivmte2ratio", "aicmte2ratio",
+    ),
+    "mte3_ratio": (
+        "mte3ratio", "mte3utilization", "mte3占比",
+        "aivmte3ratio", "aicmte3ratio",
+    ),
+    "gm_read_gbps": (
+        "gmreadgbps", "gmreadbandwidthgbps", "aivgmtoubbwgbps",
+        "aiv_gm_to_ub_bw(GB/s)", "aiv_main_mem_read_bw(GB/s)",
+        "aic_main_mem_read_bw(GB/s)",
+    ),
+    "gm_write_gbps": (
+        "gmwritegbps", "gmwritebandwidthgbps", "aivubtogmbwgbps",
+        "aiv_ub_to_gm_bw(GB/s)", "aiv_main_mem_write_bw(GB/s)",
+        "aic_main_mem_write_bw(GB/s)",
+    ),
+    "ub_read_gbps": (
+        "ubreadgbps", "ubreadbandwidthgbps", "aivubreadbwvectorgbps",
+        "aiv_ub_read_bw_vector(GB/s)", "aiv_ub_read_bw_scalar(GB/s)",
+    ),
+    "ub_write_gbps": (
+        "ubwritegbps", "ubwritebandwidthgbps", "aivubwritebwvectorgbps",
+        "aiv_ub_write_bw_vector(GB/s)", "aiv_ub_write_bw_scalar(GB/s)",
+    ),
+    "l2_hit_rate": (
+        "l2hit", "l2hitrate", "l2cachehitrate",
+        "aivtotalhitrate", "aictotalhitrate",
+    ),
     "host_enqueue_us": ("hostenqueueus", "hosttaskdurationus", "hostdurationus"),
 }
 
 
 def _find_column(headers: Sequence[str], metric: str) -> str | None:
+    columns = _find_columns(headers, metric)
+    return columns[0] if columns else None
+
+
+def _find_columns(headers: Sequence[str], metric: str) -> tuple[str, ...]:
     normalized = {_key(header): header for header in headers}
-    for alias in _ALIASES[metric]:
-        if _key(alias) in normalized:
-            return normalized[_key(alias)]
-    return None
+    return tuple(dict.fromkeys(
+        normalized[key]
+        for alias in _ALIASES[metric]
+        if (key := _key(alias)) in normalized
+    ))
 
 
 def _number(value: Any) -> float | None:
@@ -129,6 +165,19 @@ class MsprofParser:
         readable: list[str] = []
         usable: list[str] = []
         normalized_rows: list[dict[str, Any]] = []
+        split_metric_samples: dict[str, list[float]] = {
+            metric: []
+            for metric in _ALIASES
+            if metric not in {"kernel_name", "duration_us", "duration_ns"}
+        }
+        ratio_metrics = {
+            "vector_ratio",
+            "cube_ratio",
+            "scalar_ratio",
+            "mte2_ratio",
+            "mte3_ratio",
+            "l2_hit_rate",
+        }
         for path in files:
             try:
                 with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -136,19 +185,40 @@ class MsprofParser:
                     if not reader.fieldnames:
                         continue
                     readable.append(str(path))
-                    columns = {
-                        metric: _find_column(tuple(reader.fieldnames), metric)
+                    all_columns = {
+                        metric: _find_columns(tuple(reader.fieldnames), metric)
                         for metric in _ALIASES
                     }
-                    name_column = columns["kernel_name"]
-                    duration_column = columns["duration_us"]
-                    duration_ns_column = columns["duration_ns"]
-                    if name_column is None or (
-                        duration_column is None and duration_ns_column is None
-                    ):
-                        continue
-                    usable.append(str(path))
+                    name_column = _find_column(tuple(reader.fieldnames), "kernel_name")
+                    duration_column = _find_column(tuple(reader.fieldnames), "duration_us")
+                    duration_ns_column = _find_column(tuple(reader.fieldnames), "duration_ns")
+                    operation_table = name_column is not None and (
+                        duration_column is not None or duration_ns_column is not None
+                    )
+                    if operation_table:
+                        usable.append(str(path))
                     for row in reader:
+                        metrics: dict[str, float | None] = {}
+                        for metric, columns in all_columns.items():
+                            if metric in {"kernel_name", "duration_us", "duration_ns"}:
+                                continue
+                            values = []
+                            for column in columns:
+                                value = (
+                                    _ratio(row.get(column))
+                                    if metric in ratio_metrics
+                                    else _number(row.get(column))
+                                )
+                                if value is not None:
+                                    values.append(value)
+                                    if not operation_table:
+                                        split_metric_samples[metric].append(value)
+                            metrics[metric] = (
+                                sum(values) / len(values) if values else None
+                            )
+                        if not operation_table:
+                            continue
+                        assert name_column is not None
                         duration = (
                             _number(row.get(duration_column))
                             if duration_column
@@ -160,29 +230,9 @@ class MsprofParser:
                                 nanoseconds / 1000.0
                                 if nanoseconds is not None
                                 else None
-                            )
+                        )
                         if duration is None or duration < 0:
                             continue
-                        metrics = {
-                            metric: (
-                                _ratio(row.get(column))
-                                if metric
-                                in {
-                                    "vector_ratio",
-                                    "cube_ratio",
-                                    "scalar_ratio",
-                                    "mte2_ratio",
-                                    "mte3_ratio",
-                                    "l2_hit_rate",
-                                }
-                                else _number(row.get(column))
-                            )
-                            if column is not None
-                            else None
-                            for metric, column in columns.items()
-                            if metric
-                            not in {"kernel_name", "duration_us", "duration_ns"}
-                        }
                         normalized_rows.append(
                             {
                                 "kernel_name": str(row.get(name_column, "")).strip(),
@@ -223,8 +273,9 @@ class MsprofParser:
         def average(metric: str) -> float | None:
             if not candidate_rows:
                 return None
-            values = [row.get(metric) for row in candidate_rows]
-            present = [value for value in values if value is not None]
+            row_values = [row.get(metric) for row in candidate_rows]
+            present = [value for value in row_values if value is not None]
+            present.extend(split_metric_samples.get(metric, ()))
             return (
                 sum(float(value) for value in present) / len(present)
                 if present
