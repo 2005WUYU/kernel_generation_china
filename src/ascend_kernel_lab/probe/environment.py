@@ -15,6 +15,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from ascend_kernel_lab.storage.permissions import (
+    SHARED_FILE_MODE,
+    ensure_shared_directory,
+    ensure_shared_regular_file,
+)
+
 _MAX_OUTPUT = 256_000
 
 
@@ -27,6 +33,7 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+    ensure_shared_regular_file(path, mode=SHARED_FILE_MODE)
     try:
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
@@ -122,9 +129,11 @@ class EnvironmentProber:
     @staticmethod
     def _probe_env() -> dict[str, str]:
         allowed = {
-            "PATH", "LD_LIBRARY_PATH", "PYTHONPATH", "ASCEND_HOME_PATH", "ASCEND_OPP_PATH",
-            "ASCEND_AICPU_PATH", "ASCEND_TOOLKIT_HOME", "NPU_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES",
-            "LANG", "LC_ALL", "TMPDIR",
+            "PATH", "HOME", "LD_LIBRARY_PATH", "PYTHONPATH", "ASCEND_HOME_PATH",
+            "ASCEND_OPP_PATH", "ASCEND_AICPU_PATH", "ASCEND_TOOLKIT_HOME",
+            "ASCEND_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES", "NPU_VISIBLE_DEVICES",
+            "DEVICE_ID", "LANG", "LC_ALL", "TMPDIR", "TRITON_CACHE_DIR",
+            "TRITON_DUMP_DIR",
         }
         return {key: value for key, value in os.environ.items() if key in allowed}
 
@@ -217,10 +226,32 @@ class EnvironmentProber:
                 "correct": False,
                 "error": probe.stderr or f"exit code {probe.returncode}",
             }
+        device_visibility = self.command(
+            (
+                self.python_executable,
+                "-c",
+                "import json, torch, torch_npu; "
+                "print(json.dumps({'available': bool(torch.npu.is_available()), "
+                "'count': int(torch.npu.device_count())}))",
+            )
+        )
+        visibility_value: Any = None
+        for line in reversed(device_visibility.stdout.splitlines()):
+            try:
+                visibility_value = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
         return {
             "schema_version": "ascend_triton_capabilities_v1",
             "captured_at_unix": time.time(),
             "import_check": import_check,
+            "device_visibility": visibility_value or {
+                "available": False,
+                "count": None,
+                "error": device_visibility.stderr
+                or f"exit code {device_visibility.returncode}",
+            },
             "features": results,
             "ir": {
                 "debug_environment": {"TRITON_DEBUG": "1", "TRITON_ALWAYS_COMPILE": "1"},
@@ -354,7 +385,9 @@ class EnvironmentProber:
         if requested_root.exists() and requested_root.is_symlink():
             raise ValueError("probe output root must not be a symlink")
         root = requested_root.resolve()
-        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_shared_directory(root)
+        if any(root.iterdir()):
+            raise ValueError("probe output root must be empty; preserve or remove the old bundle first")
         environment = self.collect_environment()
         capabilities = self.collect_capabilities() if run_feature_smokes else {
             "schema_version": "ascend_triton_capabilities_v1",

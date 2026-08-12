@@ -109,9 +109,17 @@ Controller 文件填写 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、
 任何 `ANTHROPIC_`、`KIMI_`、`OPENAI_` 或 `AIPING_` 变量，也不要 source 宿主 CANN。
 环境文件必须是普通文件且权限为 `0600` 或 `0400`。
 
-两个容器需要用同一个数字 UID/GID 写 SQLite、WAL 和 artifact。先按基础镜像实际账号
-确定 UID/GID，并把远端 `runs/` 设为共享组、setgid、other 无权限；启动前分别用两个
-镜像执行一次文件创建/读取探针。不要对候选 attempt 私有目录递归放宽权限。
+两个容器使用不同的专用数字 UID，并加入同一个共享数字 GID 来写 SQLite、WAL 和
+artifact。把远端 `runs/` 设为共享组、setgid、other 无权限；启动前分别用两个镜像执行
+一次文件创建/读取探针。不要对候选 attempt 私有目录递归放宽权限。
+
+同一张 NPU 的 probe、baseline 和 Worker 还会共享宿主设备锁目录。该目录必须预先创建为
+普通目录，属组与 `runs/` 相同且权限精确为 `2770`；启动脚本会拒绝缺失、符号链接或错误
+权限。示例：
+
+```bash
+install -d -o root -g <共享数字GID> -m 2770 /var/lock/ascend-kernel-lab
+```
 
 Worker 还需加入 NPU 设备节点的数字属组，先读取实际值，不能猜组名：
 
@@ -128,6 +136,7 @@ export AKG_CONTROLLER_UID=<controller数字UID>
 export AKG_WORKER_UID=<worker数字UID>
 export AKG_SHARED_GID=<runs共享数字GID>
 export AKG_NPU_DEVICE_GID=<NPU设备节点数字GID>
+export AKG_DEVICE_LOCK_ROOT=/var/lock/ascend-kernel-lab
 
 ./scripts/run-containers-910c.sh init
 ./scripts/run-containers-910c.sh probe
@@ -144,6 +153,9 @@ Worker 启动会强制验证：没有模型变量、隐藏 seed 合法、只暴�
 
 `probe` 会执行真实 Triton JIT、NPU feature smoke、计时和 profiler 能力探测；
 `baseline` 会对配置中的全部任务生成环境绑定的 B0/B1/B2 基线。任何一步非零退出都停止。
+`probe` 使用可执行的临时 Triton cache、验证子进程恰好只能看到一张 NPU，并要求所有必需
+feature、计时方法和 profiler 指标通过；固定输出目录必须为空，避免旧 profiler 数据混入。
+维护期间若项目 Worker 正在运行会直接拒绝。
 检查 `runs/probe/` 和 baseline 证据后，再按验收指南完成板端验收。只有这些门禁通过、
 Worker 状态变成 `healthy` 后才运行：
 

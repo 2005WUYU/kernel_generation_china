@@ -55,6 +55,13 @@ class ContainerDeploymentContractTests(unittest.TestCase):
         self.assertIn("--security-opt no-new-privileges", runner)
         self.assertIn("probe|baseline", runner)
         self.assertIn("{{.State.Health.Status}}", runner)
+        self.assertIn("AKG_DEVICE_LOCK_ROOT", runner)
+        self.assertEqual(
+            runner.count('--volume "$LOCK_ROOT:/var/lock/ascend-kernel-lab:rw"'),
+            2,
+        )
+        self.assertIn("stop the project Worker before probe or baseline", runner)
+        self.assertIn("device lock root must have AKG_SHARED_GID", runner)
         worker_block = runner.split("start-worker)", 1)[1].split(";;", 1)[0]
         self.assertNotIn('"$CONTROLLER_ENV_FILE"', worker_block)
         self.assertIn("reject_model_environment", entrypoint)

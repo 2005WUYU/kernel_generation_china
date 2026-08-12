@@ -39,6 +39,7 @@ from ascend_kernel_lab.tasks import TaskRegistry
 from ascend_kernel_lab.tasks.loader import TaskSpecError
 from ascend_kernel_lab.tasks.runtime import validate_hidden_seed
 from ascend_kernel_lab.verification import RunVerifier
+from ascend_kernel_lab.worker import DeviceLock, DeviceLockTimeout
 
 DEFAULT_CONFIG = "configs/experiment_910c_kimi_k3.yaml"
 EXIT_USAGE = 2
@@ -242,6 +243,69 @@ def _load_probe_snapshot(
     environment = _load_json_object(root / "env_manifest.json", label="environment manifest")
     capabilities = _load_json_object(root / "capability_matrix.json", label="capability matrix")
     profiler = _load_json_object(root / "profiler_capabilities.json", label="profiler manifest")
+    failures = _probe_readiness_failures(
+        config,
+        capabilities,
+        profiler,
+        require_profile=require_profile,
+    )
+    if failures:
+        raise CommandError(
+            "probe capability snapshot is not ready: " + "; ".join(failures),
+            exit_code=EXIT_NOT_READY,
+        )
+    snapshot = {
+        "schema_version": "ascend_prompt_environment_v1",
+        "environment": environment,
+        "capabilities": capabilities,
+        "profiler": profiler,
+        "environment_sha256": hashlib.sha256(_canonical(environment)).hexdigest(),
+        "capability_sha256": hashlib.sha256(_canonical(capabilities)).hexdigest(),
+        "profiler_sha256": hashlib.sha256(_canonical(profiler)).hexdigest(),
+    }
+    snapshot["probe_snapshot_sha256"] = hashlib.sha256(_canonical(snapshot)).hexdigest()
+    return snapshot
+
+
+_REQUIRED_PROBE_FEATURES = (
+    "vector_add",
+    "masked_load_store",
+    "fp16",
+    "bfloat16",
+    "fp32",
+    "reduction_sum",
+    "max_exp",
+    "dot",
+    "grid_2d",
+    "multiple_kernels",
+)
+
+
+def _probe_readiness_failures(
+    config: ExperimentConfig,
+    capabilities: Mapping[str, Any],
+    profiler: Mapping[str, Any],
+    *,
+    require_profile: bool,
+) -> list[str]:
+    failures: list[str] = []
+    if capabilities.get("schema_version") != "ascend_triton_capabilities_v1":
+        failures.append("invalid Triton capability schema")
+    features_value = capabilities.get("features")
+    features = features_value if isinstance(features_value, Mapping) else {}
+    visibility_value = capabilities.get("device_visibility")
+    visibility = visibility_value if isinstance(visibility_value, Mapping) else {}
+    if visibility.get("available") is not True or visibility.get("count") != 1:
+        failures.append("probe subprocess did not see exactly one available NPU")
+    for name in _REQUIRED_PROBE_FEATURES:
+        result_value = features.get(name)
+        result = result_value if isinstance(result_value, Mapping) else {}
+        if not all(result.get(field) is True for field in ("compile", "run", "correct")):
+            failures.append(f"Triton feature {name} did not compile, run, and verify")
+    timing_value = capabilities.get("timing")
+    timing = timing_value if isinstance(timing_value, Mapping) else {}
+    if timing.get("verified") is not True:
+        failures.append("NPU timing primitive was not verified")
     if require_profile:
         emitted = profiler.get("emitted")
         emitted_mapping = emitted if isinstance(emitted, Mapping) else {}
@@ -256,26 +320,12 @@ def _load_probe_snapshot(
             or profiler.get("live_smoke_completed") is not True
             or missing_groups
         ):
-            suffix = (
-                f"; missing emitted groups: {', '.join(missing_groups)}"
-                if missing_groups
-                else ""
+            failures.append("profiler live smoke did not complete")
+        if missing_groups:
+            failures.append(
+                "profiler did not emit mandatory groups: " + ", ".join(missing_groups)
             )
-            raise CommandError(
-                "profiler capability snapshot does not satisfy the mandatory "
-                f"live-smoke contract{suffix}; rerun `akg probe all` on the 910C"
-            )
-    snapshot = {
-        "schema_version": "ascend_prompt_environment_v1",
-        "environment": environment,
-        "capabilities": capabilities,
-        "profiler": profiler,
-        "environment_sha256": hashlib.sha256(_canonical(environment)).hexdigest(),
-        "capability_sha256": hashlib.sha256(_canonical(capabilities)).hexdigest(),
-        "profiler_sha256": hashlib.sha256(_canonical(profiler)).hexdigest(),
-    }
-    snapshot["probe_snapshot_sha256"] = hashlib.sha256(_canonical(snapshot)).hexdigest()
-    return snapshot
+    return failures
 
 
 def _baseline_root(config: ExperimentConfig) -> Path:
@@ -359,6 +409,15 @@ def _source_guard(config: ExperimentConfig) -> Any:
     )
 
 
+def _device_lock_root() -> Path:
+    lock_root = Path(
+        os.environ.get("AKG_DEVICE_LOCK_ROOT", "/tmp/ascend-kernel-lab-locks")
+    )
+    if not lock_root.is_absolute():
+        raise CommandError("AKG_DEVICE_LOCK_ROOT must be absolute", exit_code=EXIT_USAGE)
+    return lock_root
+
+
 def _real_backend(config: ExperimentConfig) -> AscendTritonBackend:
     return AscendTritonBackend(
         device=config.worker.device,
@@ -369,6 +428,7 @@ def _real_backend(config: ExperimentConfig) -> AscendTritonBackend:
         profile_timeout_seconds=config.timeouts.profile_seconds,
         benchmark_settings=dataclasses.asdict(config.benchmark),
         profile_settings=dataclasses.asdict(config.profile),
+        lock_root=_device_lock_root(),
     )
 
 
@@ -442,8 +502,27 @@ def _cmd_db_upgrade(args: argparse.Namespace) -> int:
 def _cmd_probe_all(args: argparse.Namespace) -> int:
     config = _config(args)
     root = _probe_root(config, args.output)
-    bundle = EnvironmentProber(command_timeout=args.command_timeout).write_bundle(
-        root, run_feature_smokes=not args.skip_feature_smokes
+    try:
+        with DeviceLock(
+            config.worker.device,
+            lock_root=_device_lock_root(),
+            timeout_seconds=5.0,
+        ):
+            bundle = EnvironmentProber(command_timeout=args.command_timeout).write_bundle(
+                root, run_feature_smokes=not args.skip_feature_smokes
+            )
+    except DeviceLockTimeout as exc:
+        raise CommandError(
+            "probe refused to overlap another process using the configured NPU",
+            exit_code=EXIT_NOT_READY,
+        ) from exc
+    capabilities = _load_json_object(bundle.capability_path, label="capability matrix")
+    profiler = _load_json_object(bundle.profiler_path, label="profiler manifest")
+    failures = _probe_readiness_failures(
+        config,
+        capabilities,
+        profiler,
+        require_profile=True,
     )
     report = {
         "schema_version": "ascend_probe_result_v1",
@@ -455,9 +534,11 @@ def _cmd_probe_all(args: argparse.Namespace) -> int:
         "capability_sha256": bundle.capability_sha256,
         "profiler_sha256": bundle.profiler_sha256,
         "feature_smokes_run": not args.skip_feature_smokes,
+        "ready": not failures,
+        "failures": failures,
     }
     _print_json(report)
-    return 0
+    return 0 if not failures else EXIT_NOT_READY
 
 
 def _cmd_baseline_run(args: argparse.Namespace) -> int:

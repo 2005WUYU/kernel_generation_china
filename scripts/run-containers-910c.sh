@@ -34,6 +34,7 @@ WORKER_UID=${AKG_WORKER_UID:-}
 SHARED_GID=${AKG_SHARED_GID:-}
 NPU_DEVICE_GID=${AKG_NPU_DEVICE_GID:-}
 CONTAINER_PROJECT_ROOT=/workspace
+LOCK_ROOT=${AKG_DEVICE_LOCK_ROOT:-/var/lock/ascend-kernel-lab}
 
 # Status and emergency stop must remain available even if the checkout or its
 # permissions are damaged. They deliberately require no environment files.
@@ -75,6 +76,20 @@ case "$NPU_DEVICE_GID" in
         exit 2
         ;;
 esac
+case "$LOCK_ROOT" in
+    /*) ;;
+    *) echo "error: AKG_DEVICE_LOCK_ROOT must be absolute" >&2; exit 2 ;;
+esac
+if [ -L "$LOCK_ROOT" ] || [ ! -d "$LOCK_ROOT" ]; then
+    echo "error: AKG_DEVICE_LOCK_ROOT must be a real pre-created directory" >&2
+    exit 3
+fi
+LOCK_GID=$(stat -c '%g' "$LOCK_ROOT")
+LOCK_MODE=$(stat -c '%a' "$LOCK_ROOT")
+if [ "$LOCK_GID" != "$SHARED_GID" ] || [ "$LOCK_MODE" != 2770 ]; then
+    echo "error: device lock root must have AKG_SHARED_GID and exact mode 2770" >&2
+    exit 3
+fi
 
 case "$PROJECT_ROOT" in
     /*) ;;
@@ -193,6 +208,10 @@ case "$ACTION" in
             'umask 0007; export PYTHONPATH=/workspace/src; cd /workspace; python3 -m ascend_kernel_lab db upgrade -c configs/experiment_910c_kimi_k3.yaml'
         ;;
     probe|baseline)
+        if docker container inspect "$WORKER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
+            echo "error: stop the project Worker before probe or baseline maintenance" >&2
+            exit 3
+        fi
         validate_env_file "$WORKER_ENV_FILE" worker
         reject_worker_model_env_file
         if [ "$ACTION" = probe ]; then
@@ -210,23 +229,29 @@ case "$ACTION" in
             --security-opt no-new-privileges \
             --pids-limit 1024 \
             --memory "${AKG_WORKER_MEMORY:-48g}" \
-            --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
+            --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
             --env-file "$WORKER_ENV_FILE" \
             --env "ASCEND_VISIBLE_DEVICES=$DEVICE_ID" \
             --env DEVICE_ID=0 \
             --env HOME=/tmp/akg-home \
+            --env TRITON_CACHE_DIR=/tmp/akg-triton-cache \
+            --env TRITON_DUMP_DIR=/tmp/akg-triton-dump \
+            --env AKG_DEVICE_LOCK_ROOT=/var/lock/ascend-kernel-lab \
             --env GIT_CONFIG_COUNT=1 \
             --env GIT_CONFIG_KEY_0=safe.directory \
             --env "GIT_CONFIG_VALUE_0=$CONTAINER_PROJECT_ROOT" \
             --env GIT_OPTIONAL_LOCKS=0 \
             --volume "$PROJECT_ROOT:$CONTAINER_PROJECT_ROOT:ro" \
             --volume "$PROJECT_ROOT/runs:$CONTAINER_PROJECT_ROOT/runs:rw" \
+            --volume "$LOCK_ROOT:/var/lock/ascend-kernel-lab:rw" \
             --entrypoint /bin/sh \
             "$WORKER_IMAGE" -c \
             'set -eu
              umask 0007
              mkdir -p "$HOME"
+             mkdir -p "$TRITON_CACHE_DIR" "$TRITON_DUMP_DIR"
              chmod 0700 "$HOME"
+             chmod 0700 "$TRITON_CACHE_DIR" "$TRITON_DUMP_DIR"
              export PYTHONPATH=/workspace/src
              cd /workspace
              python3 -c '\''import torch, torch_npu, triton; assert torch.npu.is_available(); assert torch.npu.device_count() == 1'\''
@@ -264,6 +289,7 @@ case "$ACTION" in
             --env "DEVICE_ID=0" \
             --env "AKG_PROJECT_ROOT=$CONTAINER_PROJECT_ROOT" \
             --env "AKG_CONFIG_PATH=$CONTAINER_PROJECT_ROOT/configs/experiment_910c_kimi_k3.yaml" \
+            --env AKG_DEVICE_LOCK_ROOT=/var/lock/ascend-kernel-lab \
             --env HOME=/tmp/akg-home \
             --env GIT_CONFIG_COUNT=1 \
             --env GIT_CONFIG_KEY_0=safe.directory \
@@ -271,6 +297,7 @@ case "$ACTION" in
             --env GIT_OPTIONAL_LOCKS=0 \
             --volume "$PROJECT_ROOT:$CONTAINER_PROJECT_ROOT:ro" \
             --volume "$PROJECT_ROOT/runs:$CONTAINER_PROJECT_ROOT/runs:rw" \
+            --volume "$LOCK_ROOT:/var/lock/ascend-kernel-lab:rw" \
             "$WORKER_IMAGE"
         ;;
     start-controller)
