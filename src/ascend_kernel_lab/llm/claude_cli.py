@@ -40,6 +40,7 @@ ProcessRunner = Callable[
 ]
 
 _SAFE_INHERITED_ENV = {
+    "API_TIMEOUT_MS",
     "HOME",
     "HTTP_PROXY",
     "HTTPS_PROXY",

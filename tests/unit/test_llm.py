@@ -183,6 +183,7 @@ class ClaudeCliTests(unittest.TestCase):
         environment = {
             "PATH": "/usr/bin",
             "HOME": "/tmp/test-home",
+            "API_TIMEOUT_MS": "3000000",
             "ANTHROPIC_BASE_URL": "https://aiping.example",
             "ANTHROPIC_AUTH_TOKEN": "top-secret",
             "ANTHROPIC_MODEL": "kimi-k3",
@@ -207,6 +208,7 @@ class ClaudeCliTests(unittest.TestCase):
         self.assertNotIn("user value", argv)
         self.assertIn("user value", captured["stdin"])
         self.assertNotIn("UNRELATED_SECRET", captured["env"])
+        self.assertEqual(captured["env"]["API_TIMEOUT_MS"], "3000000")
         self.assertEqual(captured["env"]["ANTHROPIC_BASE_URL"], "https://aiping.example")
         self.assertEqual(captured["env"]["ANTHROPIC_AUTH_TOKEN"], "top-secret")
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", help_environment)
