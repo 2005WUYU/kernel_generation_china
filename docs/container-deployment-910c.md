@@ -105,7 +105,7 @@ sudoedit /etc/ascend-kernel-lab/worker-container.env
 ```
 
 Controller 文件填写 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、
-`ANTHROPIC_MODEL=kimi-k3`；hidden 文件只放 `AKG_HIDDEN_SEED`。Worker 文件不得出现
+`ANTHROPIC_MODEL=Kimi-K3`；hidden 文件只放 `AKG_HIDDEN_SEED`。Worker 文件不得出现
 任何 `ANTHROPIC_`、`KIMI_`、`OPENAI_` 或 `AIPING_` 变量，也不要 source 宿主 CANN。
 环境文件必须是普通文件且权限为 `0600` 或 `0400`。
 

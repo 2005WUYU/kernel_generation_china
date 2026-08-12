@@ -15,7 +15,7 @@ experiment:
 
 model:
   provider: claude_cli
-  model: kimi-k3
+  model: Kimi-K3
   reasoning_effort: high
   structured_output: true
   request_timeout_seconds: 300

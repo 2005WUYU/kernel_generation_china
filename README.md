@@ -156,7 +156,7 @@ akg doctor -c configs/experiment_910c_kimi_k3.yaml --allow-not-ready
 ```dotenv
 ANTHROPIC_BASE_URL=https://your-aiping-anthropic-compatible-endpoint.example
 ANTHROPIC_AUTH_TOKEN=replace-with-a-real-token
-ANTHROPIC_MODEL=kimi-k3
+ANTHROPIC_MODEL=Kimi-K3
 ```
 
 另建仅含隐藏 seed 的共享可信环境文件：

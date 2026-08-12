@@ -173,7 +173,7 @@ sudoedit /etc/ascend-kernel-lab/controller.env
 ```dotenv
 ANTHROPIC_BASE_URL=https://<tenant-endpoint>
 ANTHROPIC_AUTH_TOKEN=<secret>
-ANTHROPIC_MODEL=kimi-k3
+ANTHROPIC_MODEL=Kimi-K3
 ```
 
 隐藏 seed 使用独立文件，同时由可信 controller 和可信 Worker 加载：

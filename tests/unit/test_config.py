@@ -35,7 +35,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_unknown_field_is_rejected_with_path(self) -> None:
         text = CONFIG.read_text(encoding="utf-8").replace(
-            "  model: kimi-k3", "  model: kimi-k3\n  surprise: false", 1
+            "  model: Kimi-K3", "  model: Kimi-K3\n  surprise: false", 1
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bad.yaml"
