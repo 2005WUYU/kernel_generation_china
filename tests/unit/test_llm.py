@@ -194,6 +194,9 @@ class ClaudeCliTests(unittest.TestCase):
         argv = captured["argv"]
         self.assertIn("--print", argv)
         self.assertIn("--json-schema", argv)
+        cli_schema = json.loads(argv[argv.index("--json-schema") + 1])
+        self.assertNotIn("$schema", cli_schema)
+        self.assertFalse(cli_schema["additionalProperties"])
         self.assertEqual(argv[argv.index("--tools") + 1], "")
         self.assertNotIn("user value", argv)
         self.assertIn("user value", captured["stdin"])

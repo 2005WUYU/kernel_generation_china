@@ -399,8 +399,14 @@ class ClaudeCliGateway:
         schema: str | None = None
         if self._config.structured_output:
             try:
+                cli_schema = dict(request.json_schema)
+                # Claude Code 2.1.228 validates the inline schema with a
+                # dialect whose meta-schema registry does not include the
+                # 2020-12 URI. The dialect declaration is only an annotation;
+                # all response constraints remain in the payload.
+                cli_schema.pop("$schema", None)
                 schema = json.dumps(
-                    dict(request.json_schema),
+                    cli_schema,
                     ensure_ascii=False,
                     separators=(",", ":"),
                     allow_nan=False,
