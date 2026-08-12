@@ -85,7 +85,9 @@ export CLAUDE_CODE_INTEGRITY='sha512-S3Iy+c6ZuFjswQOekbVgXA+RxAuU8H2ae2nxFynqmvR
 Docker daemon。镜像分两层：平台层由平台负责人根据批准的兼容矩阵构建并形成自己的
 不可变 SHA；项目 Worker 层只继承已审批且通过真实 kernel smoke 的平台层。项目构建不
 安装或替换 torch、torch_npu、Triton、CANN、驱动或固件，只检查平台镜像已经提供完整
-兼容栈和 PyYAML。
+兼容栈和 PyYAML。镜像构建阶段没有 Ascend 设备及驱动挂载，因此这里只检查加速包存在，
+不导入 `torch_npu`；真正的导入、单卡可见性和 NPU 运算必须在 `--runtime=ascend` 的
+临时容器及后续 `probe` 中通过。
 
 ## 4. 准备运行文件和权限
 

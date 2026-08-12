@@ -11,7 +11,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
     && command -v git >/dev/null \
     && python3 -c 'import yaml' \
-    && python3 -c 'import torch, torch_npu, triton; assert hasattr(torch, "npu")'
+    && python3 -c 'import importlib.util as u; names=("torch", "torch_npu", "triton"); missing=[name for name in names if u.find_spec(name) is None]; assert not missing, missing'
 
 COPY worker-entrypoint.sh /usr/local/bin/akg-worker-entrypoint
 RUN chmod 0555 /usr/local/bin/akg-worker-entrypoint

@@ -40,7 +40,9 @@ class ContainerDeploymentContractTests(unittest.TestCase):
         worker = (CONTAINER / "Dockerfile.worker").read_text(encoding="utf-8")
         for forbidden in ("pip install", "torch==", "torch_npu==", "triton==", "apt-get"):
             self.assertNotIn(forbidden, worker)
-        self.assertIn("import torch, torch_npu, triton", worker)
+        self.assertIn('names=("torch", "torch_npu", "triton")', worker)
+        self.assertIn("find_spec(name)", worker)
+        self.assertNotIn("import torch, torch_npu, triton", worker)
         self.assertIn("import yaml", worker)
 
     def test_worker_is_networkless_secretless_and_single_npu(self) -> None:
