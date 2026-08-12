@@ -30,6 +30,7 @@ WORKER_NAME=${AKG_WORKER_CONTAINER:-ascend-kernel-worker}
 CONTROLLER_NAME=${AKG_CONTROLLER_CONTAINER:-ascend-kernel-controller}
 DEVICE_ID=${AKG_DEVICE_ID:-0}
 TASK_ID=${AKG_TASK_ID:-}
+EXPERIMENT_ID=${AKG_EXPERIMENT_ID:-}
 CONTROLLER_UID=${AKG_CONTROLLER_UID:-}
 WORKER_UID=${AKG_WORKER_UID:-}
 SHARED_GID=${AKG_SHARED_GID:-}
@@ -66,6 +67,10 @@ esac
 case "$TASK_ID" in
     ""|k[0-9][0-9]_[a-z0-9_]*) ;;
     *) echo "error: AKG_TASK_ID must be empty or a task ID such as k01_vector_add" >&2; exit 2 ;;
+esac
+case "$EXPERIMENT_ID" in
+    ""|[A-Za-z0-9][A-Za-z0-9._-]*) ;;
+    *) echo "error: AKG_EXPERIMENT_ID must contain only letters, digits, dot, underscore, or dash" >&2; exit 2 ;;
 esac
 for identity in "$CONTROLLER_UID" "$WORKER_UID"; do
     case "$identity" in
@@ -349,6 +354,9 @@ case "$ACTION" in
             set -- python3 -m ascend_kernel_lab experiment resume \
                 -c "$CONTAINER_PROJECT_ROOT/configs/experiment_910c_kimi_k3.yaml" \
                 --task "$TASK_ID" --allow-missing-baseline
+            if [ -n "$EXPERIMENT_ID" ]; then
+                set -- "$@" --experiment-id "$EXPERIMENT_ID"
+            fi
         else
             set --
         fi
