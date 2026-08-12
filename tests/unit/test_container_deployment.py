@@ -59,6 +59,17 @@ class ContainerDeploymentContractTests(unittest.TestCase):
         self.assertIn("torch.npu.device_count() != 1", entrypoint)
         self.assertIn("*','*", entrypoint)
 
+    def test_controller_explicitly_uses_runc_when_ascend_is_host_default(self) -> None:
+        runner = (ROOT / "scripts/run-containers-910c.sh").read_text(encoding="utf-8")
+        init_block = runner.split("    init)", 1)[1].split("    ;;", 1)[0]
+        controller_block = runner.split("    start-controller)", 1)[1].split(
+            "    ;;", 1
+        )[0]
+        self.assertIn("--runtime=runc", init_block)
+        self.assertNotIn("--runtime=ascend", init_block)
+        self.assertIn("--runtime=runc", controller_block)
+        self.assertNotIn("--runtime=ascend", controller_block)
+
     def test_checkout_and_hidden_seed_are_fail_closed(self) -> None:
         for name in ("controller-entrypoint.sh", "worker-entrypoint.sh"):
             content = (CONTAINER / name).read_text(encoding="utf-8")

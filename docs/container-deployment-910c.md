@@ -154,8 +154,9 @@ Worker 状态变成 `healthy` 后才运行：
 docker logs --tail 100 ascend-kernel-controller
 ```
 
-Controller 有 AIPing 网络但不挂 NPU；生产上再用主机防火墙或 egress proxy 只允许租户
-端点。停止顺序是 Controller 再 Worker：
+Controller 有 AIPing 网络但不挂 NPU；即使宿主 Docker 把 Ascend 设为默认 runtime，启动
+脚本也会为 Controller 和数据库初始化显式选择 `runc`。生产上再用主机防火墙或 egress
+proxy 只允许租户端点。停止顺序是 Controller 再 Worker：
 
 ```bash
 ./scripts/run-containers-910c.sh stop

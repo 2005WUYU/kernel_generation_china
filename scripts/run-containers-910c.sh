@@ -177,6 +177,7 @@ ensure_absent() {
 case "$ACTION" in
     init)
         docker run --rm \
+            --runtime=runc \
             --network none \
             --read-only \
             --user "$CONTROLLER_UID:$SHARED_GID" \
@@ -284,6 +285,7 @@ case "$ACTION" in
         ensure_absent "$CONTROLLER_NAME"
         docker run --detach \
             --name "$CONTROLLER_NAME" \
+            --runtime=runc \
             --user "$CONTROLLER_UID:$SHARED_GID" \
             --restart on-failure:3 \
             --read-only \
