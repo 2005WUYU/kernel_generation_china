@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from ascend_kernel_lab.config import ModelConfig, OpenAIHTTPConfig, RetryConfig
 from ascend_kernel_lab.llm import (
+    SYSTEM_PROMPT,
     ClaudeCliGateway,
     ModelAuthenticationError,
     ModelCapabilityError,
@@ -157,6 +158,11 @@ class ResponseTests(unittest.TestCase):
 
 
 class PromptTests(unittest.TestCase):
+    def test_system_prompt_states_source_guard_host_wrapper_contract(self) -> None:
+        self.assertIn("每一条返回路径都必须先启动候选 Triton Kernel", SYSTEM_PROMPT)
+        self.assertIn("包括 n == 0 等提前返回", SYSTEM_PROMPT)
+        self.assertIn("不得调用自定义 Python 辅助函数", SYSTEM_PROMPT)
+
     def test_first_and_followup_prompts_remove_hidden_content_recursively(self) -> None:
         builder = PromptBuilder()
         first = builder.build_first_round(

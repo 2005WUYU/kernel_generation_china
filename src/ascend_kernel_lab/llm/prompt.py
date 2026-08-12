@@ -25,6 +25,8 @@ SYSTEM_PROMPT = """你负责生成可在华为昇腾 Triton-Ascend 环境运行�
 8. 必须正确处理任务中所有公开 shape 和 dtype, 不得猜测或索取隐藏用例。
 9. 只能依据提供的实际编译、正确性、延迟和 profiler 摘要进行修改。
 10. 返回结果必须严格符合给定 JSON Schema; code 字段始终返回完整源码。
+11. custom_op 的每一条返回路径都必须先启动候选 Triton Kernel; 禁止在 Kernel 启动前返回刚分配的输出, 包括 n == 0 等提前返回。
+12. custom_op 不得调用自定义 Python 辅助函数; host 侧的 shape、grid 和 launch 参数选择逻辑必须直接内联在 custom_op 中。
 """
 
 _SENSITIVE_EXACT = {
