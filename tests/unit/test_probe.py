@@ -14,6 +14,7 @@ from ascend_kernel_lab.cli import (
 )
 from ascend_kernel_lab.config import load_config
 from ascend_kernel_lab.probe.environment import EnvironmentProber
+from ascend_kernel_lab.probe.smoke import _run_source
 
 
 class ProbeTests(unittest.TestCase):
@@ -39,6 +40,15 @@ class ProbeTests(unittest.TestCase):
             self.assertFalse(profiler["live_smoke_completed"])
             self.assertIn("emitted", profiler)
             self.assertNotIn("probe profiler --live", profiler["note"])
+
+    def test_smoke_source_exists_while_run_is_called(self) -> None:
+        source = """
+from pathlib import Path
+
+def run():
+    return Path(__file__).is_file()
+"""
+        self.assertTrue(_run_source(source))
 
     def test_probe_bundle_refuses_to_mix_with_existing_output(self) -> None:
         prober = EnvironmentProber(command_timeout=2)

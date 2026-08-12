@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import tempfile
 import traceback
+from pathlib import Path
 from typing import Any
 
 _ELEMENTWISE_SOURCE = r'''
@@ -96,25 +99,33 @@ def run():
 '''
 
 
+def _run_source(source: str, *args: Any) -> Any:
+    with tempfile.TemporaryDirectory(prefix="ascend-kernel-probe-") as temporary:
+        module_path = Path(temporary) / "feature_smoke.py"
+        module_path.write_text(source, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("_ascend_kernel_probe_feature", module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"failed to load probe module from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.run(*args)
+
+
 def run_feature(feature: str) -> dict[str, Any]:
-    namespace: dict[str, Any] = {}
     if feature in {"vector_add", "masked_load_store", "fp16", "bfloat16", "fp32", "multiple_kernels"}:
-        exec(_ELEMENTWISE_SOURCE, namespace)
-        torch = namespace["torch"]
+        import torch
+
         dtype = {"bfloat16": torch.bfloat16, "fp32": torch.float32}.get(feature, torch.float16)
         n = 1003 if feature == "masked_load_store" else 1024
-        correct = namespace["run"](dtype, n)
+        correct = _run_source(_ELEMENTWISE_SOURCE, dtype, n)
         if feature == "multiple_kernels":
-            correct = correct and namespace["run"](dtype, n)
+            correct = correct and _run_source(_ELEMENTWISE_SOURCE, dtype, n)
     elif feature in {"reduction_sum", "max_exp"}:
-        exec(_REDUCTION_SOURCE, namespace)
-        correct = namespace["run"](feature == "max_exp")
+        correct = _run_source(_REDUCTION_SOURCE, feature == "max_exp")
     elif feature == "dot":
-        exec(_DOT_SOURCE, namespace)
-        correct = namespace["run"]()
+        correct = _run_source(_DOT_SOURCE)
     elif feature == "grid_2d":
-        exec(_GRID_SOURCE, namespace)
-        correct = namespace["run"]()
+        correct = _run_source(_GRID_SOURCE)
     else:
         raise ValueError(f"unknown feature {feature}")
     return {"feature": feature, "compile": True, "run": True, "correct": bool(correct), "error": None}
