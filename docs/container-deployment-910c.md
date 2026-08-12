@@ -113,6 +113,19 @@ Controller 文件填写 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、
 artifact。把远端 `runs/` 设为共享组、setgid、other 无权限；启动前分别用两个镜像执行
 一次文件创建/读取探针。不要对候选 attempt 私有目录递归放宽权限。
 
+当前单机部署可固定使用下面三个未占用的数字身份。它们只用于本项目，不改变现有
+FlagBLAS 容器：
+
+```bash
+getent group 27100 >/dev/null || groupadd --system --gid 27100 akg-shared
+getent passwd 27101 >/dev/null || useradd --system --uid 27101 --gid 27100 \
+  --home-dir /nonexistent --shell /sbin/nologin akg-controller
+getent passwd 27102 >/dev/null || useradd --system --uid 27102 --gid 27100 \
+  --home-dir /nonexistent --shell /sbin/nologin akg-worker
+chown root:27100 /opt/ascend-kernel-lab/runs
+chmod 2770 /opt/ascend-kernel-lab/runs
+```
+
 同一张 NPU 的 probe、baseline 和 Worker 还会共享宿主设备锁目录。该目录必须预先创建为
 普通目录，属组与 `runs/` 相同且权限精确为 `2770`；启动脚本会拒绝缺失、符号链接或错误
 权限。示例：
@@ -156,6 +169,14 @@ Worker 启动会强制验证：没有模型变量、隐藏 seed 合法、只暴�
 `probe` 使用可执行的临时 Triton cache、验证子进程恰好只能看到一张 NPU，并要求所有必需
 feature、计时方法和 profiler 指标通过；固定输出目录必须为空，避免旧 profiler 数据混入。
 维护期间若项目 Worker 正在运行会直接拒绝。
+若 probe 失败，先保留整个失败证据目录再重跑，禁止直接删除：
+
+```bash
+if [ -d runs/probe ]; then
+  mv runs/probe "runs/probe.failed.$(date -u +%Y%m%dT%H%M%SZ).$$"
+fi
+```
+
 检查 `runs/probe/` 和 baseline 证据后，再按验收指南完成板端验收。只有这些门禁通过、
 Worker 状态变成 `healthy` 后才运行：
 

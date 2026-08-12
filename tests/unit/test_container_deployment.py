@@ -62,6 +62,10 @@ class ContainerDeploymentContractTests(unittest.TestCase):
         )
         self.assertIn("stop the project Worker before probe or baseline", runner)
         self.assertIn("device lock root must have AKG_SHARED_GID", runner)
+        maintenance_block = runner.split("    probe|baseline)", 1)[1].split(
+            "        ;;", 1
+        )[0]
+        self.assertIn("--tmpfs /tmp:rw,nosuid,nodev,exec,mode=1777", maintenance_block)
         worker_block = runner.split("start-worker)", 1)[1].split(";;", 1)[0]
         self.assertNotIn('"$CONTROLLER_ENV_FILE"', worker_block)
         self.assertIn("reject_model_environment", entrypoint)

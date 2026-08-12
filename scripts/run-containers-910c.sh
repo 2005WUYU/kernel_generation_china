@@ -229,7 +229,7 @@ case "$ACTION" in
             --security-opt no-new-privileges \
             --pids-limit 1024 \
             --memory "${AKG_WORKER_MEMORY:-48g}" \
-            --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+            --tmpfs /tmp:rw,nosuid,nodev,exec,mode=1777 \
             --env-file "$WORKER_ENV_FILE" \
             --env "ASCEND_VISIBLE_DEVICES=$DEVICE_ID" \
             --env DEVICE_ID=0 \
