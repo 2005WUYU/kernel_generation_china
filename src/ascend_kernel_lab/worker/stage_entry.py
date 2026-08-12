@@ -399,15 +399,25 @@ def _measurement_session(
     *,
     batches: int,
     target_batch_time_ms: float,
+    candidate_context: Callable[[], contextlib.AbstractContextManager[None]],
     observe_candidate_output: Callable[[Any], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
+    def measure_candidate(repeats: int) -> float:
+        last_output: Any = None
+
+        def tracked_candidate() -> Any:
+            nonlocal last_output
+            last_output = candidate()
+            return last_output
+
+        with candidate_context():
+            latency = _measure_batch(torch, tracked_candidate, repeats)
+        if observe_candidate_output is not None:
+            observe_candidate_output(last_output)
+        return latency
+
     candidate_once = max(
-        _measure_batch(
-            torch,
-            candidate,
-            1,
-            observe_output=observe_candidate_output,
-        ),
+        measure_candidate(1),
         1e-3,
     )
     baseline_once = max(_measure_batch(torch, baseline, 1), 1e-3)
@@ -423,23 +433,9 @@ def _measurement_session(
     for batch in range(batches):
         if batch % 2 == 0:
             baseline_samples.append(_measure_batch(torch, baseline, repeats))
-            candidate_samples.append(
-                _measure_batch(
-                    torch,
-                    candidate,
-                    repeats,
-                    observe_output=observe_candidate_output,
-                )
-            )
+            candidate_samples.append(measure_candidate(repeats))
         else:
-            candidate_samples.append(
-                _measure_batch(
-                    torch,
-                    candidate,
-                    repeats,
-                    observe_output=observe_candidate_output,
-                )
-            )
+            candidate_samples.append(measure_candidate(repeats))
             baseline_samples.append(_measure_batch(torch, baseline, repeats))
     return (
         summarize_samples(candidate_samples).to_dict(),
@@ -478,8 +474,7 @@ def _benchmark(
         _sync(torch)
 
         def candidate_call(inputs: tuple[Any, ...] = candidate_inputs) -> Any:
-            with _candidate_guard(torch):
-                return entry(*inputs)
+            return entry(*inputs)
 
         def baseline_call(inputs: tuple[Any, ...] = baseline_inputs) -> Any:
             return reference(task, inputs, torch)
@@ -510,8 +505,10 @@ def _benchmark(
                 )
 
         warmup_output: Any = None
+        with _candidate_guard(torch):
+            for _ in range(warmup):
+                warmup_output = candidate_call()
         for _ in range(warmup):
-            warmup_output = candidate_call()
             baseline_call()
         _sync(torch)
         validate_timed_output(warmup_output)
@@ -528,6 +525,7 @@ def _benchmark(
                 baseline_call,
                 batches=batches,
                 target_batch_time_ms=target_ms,
+                candidate_context=lambda: _candidate_guard(torch),
                 observe_candidate_output=validate_timed_output,
             )
             maximum_observed_cv = max(

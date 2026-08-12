@@ -754,7 +754,7 @@ class AscendTritonBackend(Backend):
         )
 
     @staticmethod
-    def _kernel_patterns(candidate_path: Path) -> tuple[str, ...]:
+    def _kernel_names(candidate_path: Path) -> tuple[str, ...]:
         try:
             tree = ast.parse(Path(candidate_path).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, SyntaxError) as exc:
@@ -771,7 +771,17 @@ class AscendTritonBackend(Backend):
                     names.append(node.name)
         if not names:
             raise ValueError("candidate source declares no attributable Triton kernel")
-        return tuple(dict.fromkeys(candidate_kernel_pattern(name) for name in names))
+        unique_names = tuple(dict.fromkeys(names))
+        for name in unique_names:
+            candidate_kernel_pattern(name)
+        return unique_names
+
+    @classmethod
+    def _kernel_patterns(cls, candidate_path: Path) -> tuple[str, ...]:
+        return tuple(
+            candidate_kernel_pattern(name)
+            for name in cls._kernel_names(candidate_path)
+        )
 
     @staticmethod
     def _missing_profile_groups(
@@ -837,7 +847,10 @@ class AscendTritonBackend(Backend):
                 },
             )
         try:
-            kernel_patterns = self._kernel_patterns(candidate_path)
+            kernel_names = self._kernel_names(candidate_path)
+            kernel_patterns = tuple(
+                candidate_kernel_pattern(name) for name in kernel_names
+            )
             attempt, work, env = self._prepare(artifact_dir, "profile", candidate_path)
             private_cases = bool(cases) and all(
                 case.id.startswith("hidden_") for case in cases
@@ -895,7 +908,7 @@ class AscendTritonBackend(Backend):
                 output_root=raw_root,
                 python_executable=self.python_executable,
                 script=driver,
-                kernel_name=None,
+                kernel_name=kernel_names[0],
             )
             with self._lock():
                 run = self.runner.run(

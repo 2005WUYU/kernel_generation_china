@@ -506,6 +506,8 @@ def custom_op(x, y):
         )
         self.assertEqual(result.status, StageStatus.PASS)
         self.assertEqual(result.details["missing_mandatory_groups"], [])
+        argv = cast(tuple[str, ...], runner.calls[0]["argv"])
+        self.assertIn("--kernel-name=generated_kernel", argv)
 
     def test_hidden_profile_passes_cases_only_over_stdin(self) -> None:
         assert self.task.root is not None
