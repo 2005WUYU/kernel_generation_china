@@ -86,8 +86,19 @@ def _command(argv: tuple[str, ...], *, cwd: Path, timeout: float = 10.0) -> dict
                     "LD_LIBRARY_PATH",
                     "PYTHONPATH",
                     "ASCEND_HOME_PATH",
+                    "ASCEND_AICPU_PATH",
+                    "ASCEND_CANN_PACKAGE_PATH",
+                    "ASCEND_CUSTOM_OPP_PATH",
                     "ASCEND_OPP_PATH",
+                    "ASCEND_RT_VISIBLE_DEVICES",
                     "ASCEND_TOOLKIT_HOME",
+                    "ASCEND_VISIBLE_DEVICES",
+                    "DEVICE_ID",
+                    "NPU_VISIBLE_DEVICES",
+                    "SOC_VERSION",
+                    "TBE_IMPL_PATH",
+                    "TOOLCHAIN_HOME",
+                    "GIT_OPTIONAL_LOCKS",
                 )
                 if (value := os.environ.get(key)) is not None
             },
@@ -124,10 +135,15 @@ def _python_runtime_check(cwd: Path) -> dict[str, Any]:
     )
     result = _command((sys.executable, "-c", script), cwd=cwd, timeout=30.0)
     if result.get("returncode") == 0:
-        try:
-            result["runtime"] = json.loads(str(result.get("stdout", "")).splitlines()[-1])
-        except (IndexError, json.JSONDecodeError):
-            result["runtime"] = {}
+        for line in reversed(str(result.get("stdout", "")).splitlines()):
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                result["runtime"] = parsed
+                break
+    result.setdefault("runtime", {})
     return result
 
 
@@ -197,8 +213,39 @@ def build_doctor_report(
         )
     )
 
-    git = _command(("git", "status", "--porcelain=v1"), cwd=config.project_root)
-    git_ok = git.get("returncode") == 0 and not str(git.get("stdout", "")).strip()
+    safe_directory = f"safe.directory={config.project_root}"
+    git = _command(
+        (
+            "git",
+            "-c",
+            safe_directory,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ),
+        cwd=config.project_root,
+    )
+    git_head = _command(
+        ("git", "-c", safe_directory, "rev-parse", "--verify", "HEAD"),
+        cwd=config.project_root,
+    )
+    git_top = _command(
+        ("git", "-c", safe_directory, "rev-parse", "--show-toplevel"),
+        cwd=config.project_root,
+    )
+    revision = str(git_head.get("stdout", "")).strip()
+    top_level = str(git_top.get("stdout", "")).strip()
+    revision_ok = len(revision) in {40, 64} and all(
+        character in "0123456789abcdef" for character in revision
+    )
+    git_ok = (
+        git.get("returncode") == 0
+        and git_head.get("returncode") == 0
+        and git_top.get("returncode") == 0
+        and not str(git.get("stdout", "")).strip()
+        and revision_ok
+        and top_level == str(config.project_root)
+    )
     checks.append(
         _check(
             "git_release",
@@ -208,6 +255,9 @@ def build_doctor_report(
                 "available": git.get("available"),
                 "returncode": git.get("returncode"),
                 "dirty_entries": len(str(git.get("stdout", "")).splitlines()),
+                "revision": revision if revision_ok else None,
+                "top_level_matches": top_level == str(config.project_root),
+                "stderr_tail": str(git.get("stderr", ""))[-2048:],
             },
         )
     )
@@ -254,7 +304,14 @@ def build_doctor_report(
                 "ascend_python_runtime",
                 runtime_ok,
                 "torch, torch_npu, triton-ascend, and an NPU are available",
-                details=runtime_values if isinstance(runtime_values, Mapping) else {},
+                details={
+                    "runtime": (
+                        runtime_values if isinstance(runtime_values, Mapping) else {}
+                    ),
+                    "returncode": runtime.get("returncode"),
+                    "timed_out": runtime.get("timed_out"),
+                    "stderr_tail": str(runtime.get("stderr", ""))[-2048:],
+                },
             )
         )
 

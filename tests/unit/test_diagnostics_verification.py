@@ -25,6 +25,40 @@ from ascend_kernel_lab.verification import RunVerifier
 
 
 class DiagnosticsTests(unittest.TestCase):
+    def test_diagnostic_subprocess_preserves_runtime_but_not_credentials(self) -> None:
+        from ascend_kernel_lab.diagnostics import _command
+
+        captured: dict[str, str] = {}
+
+        def run_double(*_args: object, **kwargs: object) -> object:
+            environment = kwargs.get("env")
+            assert isinstance(environment, dict)
+            captured.update(environment)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        source = {
+            "PATH": "/bin",
+            "ASCEND_VISIBLE_DEVICES": "0",
+            "DEVICE_ID": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "safe.directory",
+            "GIT_CONFIG_VALUE_0": "/workspace",
+            "ANTHROPIC_AUTH_TOKEN": "must-not-pass",
+            "HTTPS_PROXY": "must-not-pass",
+        }
+        with (
+            mock.patch.dict("os.environ", source, clear=True),
+            mock.patch("ascend_kernel_lab.diagnostics.shutil.which", return_value="/bin/x"),
+            mock.patch("ascend_kernel_lab.diagnostics.subprocess.run", side_effect=run_double),
+        ):
+            _command(("x",), cwd=Path("."))
+
+        self.assertEqual(captured["ASCEND_VISIBLE_DEVICES"], "0")
+        self.assertEqual(captured["DEVICE_ID"], "0")
+        self.assertNotIn("GIT_CONFIG_VALUE_0", captured)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", captured)
+        self.assertNotIn("HTTPS_PROXY", captured)
+
     def test_doctor_is_machine_readable_on_non_npu_host(self) -> None:
         config = load_config("configs/experiment_910c_kimi_k3.yaml")
         report = build_doctor_report(config)
