@@ -364,7 +364,7 @@ case "$ACTION" in
             --name "$CONTROLLER_NAME" \
             --runtime=runc \
             --user "$CONTROLLER_UID:$SHARED_GID" \
-            --restart on-failure:3 \
+            --restart=no \
             --read-only \
             --cap-drop ALL \
             --security-opt no-new-privileges \

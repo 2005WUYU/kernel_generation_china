@@ -72,9 +72,11 @@ def normalize_claude_envelope(raw: Mapping[str, Any]) -> ModelCompletion:
 
     # With --json-schema Claude CLI exposes this field; proxy versions sometimes
     # use output/result/content or the OpenAI-compatible message shape instead.
+    structured_output = raw.get("structured_output")
+    if structured_output is None:
+        structured_output = _lookup(raw, ("result", "structured_output"))
     candidates = (
-        raw.get("structured_output"),
-        _lookup(raw, ("result", "structured_output")),
+        structured_output,
         raw.get("output"),
         raw.get("result"),
         _lookup(raw, ("message", "content")),
@@ -97,6 +99,17 @@ def normalize_claude_envelope(raw: Mapping[str, Any]) -> ModelCompletion:
         ("response", "finish_reason"),
     )
     if finish_reason is None and raw.get("subtype") == "success":
+        finish_reason = "stop"
+    # Claude CLI implements --json-schema through an internal output tool. A
+    # successful result therefore reports stop_reason=tool_use even though
+    # built-in tools were disabled with --tools "". Accept only that narrowly
+    # identified structured-output terminal state; ordinary tool requests must
+    # remain failures. Keep the original envelope unchanged for audit.
+    if (
+        finish_reason == "tool_use"
+        and raw.get("subtype") == "success"
+        and structured_output is not None
+    ):
         finish_reason = "stop"
     if finish_reason is not None and not isinstance(finish_reason, str):
         finish_reason = str(finish_reason)

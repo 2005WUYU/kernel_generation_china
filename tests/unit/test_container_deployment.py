@@ -88,6 +88,17 @@ class ContainerDeploymentContractTests(unittest.TestCase):
         self.assertIn("--runtime=runc", controller_block)
         self.assertNotIn("--runtime=ascend", controller_block)
 
+    def test_controller_is_oneshot_while_worker_restarts_after_failure(self) -> None:
+        runner = (ROOT / "scripts/run-containers-910c.sh").read_text(encoding="utf-8")
+        worker_block = runner.split("    start-worker)", 1)[1].split("        ;;", 1)[0]
+        controller_block = runner.split("    start-controller)", 1)[1].split(
+            "        ;;", 1
+        )[0]
+
+        self.assertIn("--restart on-failure:3", worker_block)
+        self.assertIn("--restart=no", controller_block)
+        self.assertNotIn("--restart on-failure", controller_block)
+
     def test_checkout_and_hidden_seed_are_fail_closed(self) -> None:
         for name in ("controller-entrypoint.sh", "worker-entrypoint.sh"):
             content = (CONTAINER / name).read_text(encoding="utf-8")

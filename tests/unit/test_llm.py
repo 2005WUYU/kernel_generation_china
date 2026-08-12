@@ -29,6 +29,7 @@ from ascend_kernel_lab.llm import (
     validate_model_response,
 )
 from ascend_kernel_lab.llm.claude_cli import parse_claude_cli_capabilities
+from ascend_kernel_lab.llm.envelopes import normalize_claude_envelope
 from ascend_kernel_lab.llm.safety import redact_text, truncate_utf8
 from ascend_kernel_lab.llm.types import ModelCompletion
 
@@ -83,6 +84,51 @@ class ResponseTests(unittest.TestCase):
         completion = ModelCompletion(json.dumps(candidate()), "length", {})
         with self.assertRaises(TruncatedResponseError):
             validate_completion(completion)
+
+    def test_claude_structured_output_tool_use_is_a_successful_terminal_result(self) -> None:
+        raw = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "stop_reason": "tool_use",
+            "structured_output": candidate(),
+        }
+
+        completion = normalize_claude_envelope(raw)
+        response = validate_completion(completion, expected_round=1)
+
+        self.assertEqual(completion.finish_reason, "stop")
+        self.assertEqual(completion.raw_response["stop_reason"], "tool_use")
+        self.assertEqual(response.status, "candidate")
+
+    def test_claude_tool_use_without_structured_output_remains_rejected(self) -> None:
+        completion = normalize_claude_envelope(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "stop_reason": "tool_use",
+                "result": json.dumps(candidate()),
+            }
+        )
+
+        with self.assertRaises(ModelResponseError):
+            validate_completion(completion, expected_round=1)
+
+    def test_structured_output_tool_use_does_not_skip_local_schema_validation(self) -> None:
+        invalid = candidate(round_number=2)
+        completion = normalize_claude_envelope(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "stop_reason": "tool_use",
+                "structured_output": invalid,
+            }
+        )
+
+        with self.assertRaises(ModelResponseError):
+            validate_completion(completion, expected_round=1)
 
     def test_bounded_format_repair(self) -> None:
         replay = ReplayGateway(["not json", candidate()])
