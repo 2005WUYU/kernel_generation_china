@@ -348,7 +348,7 @@ case "$ACTION" in
         if [ -n "$TASK_ID" ]; then
             set -- python3 -m ascend_kernel_lab experiment resume \
                 -c "$CONTAINER_PROJECT_ROOT/configs/experiment_910c_kimi_k3.yaml" \
-                --task "$TASK_ID" --allow-missing-baseline --allow-unverified-profile
+                --task "$TASK_ID" --allow-missing-baseline
         else
             set --
         fi

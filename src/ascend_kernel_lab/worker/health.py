@@ -48,21 +48,6 @@ class AscendHealthChecker:
             cwd=self.work_dir,
             timeout_seconds=self.timeout_seconds,
         )
-        if not smi.succeeded:
-            return StageResult.infrastructure_error(
-                "HEALTH_CHECK",
-                message="npu-smi info failed or timed out",
-                error_type="DeviceManagementError",
-                retryable=True,
-                timed_out=smi.timed_out,
-                started_at=started,
-                details={
-                    "healthy": False,
-                    "npu_smi_returncode": smi.returncode,
-                    "npu_smi_stderr": smi.stderr_text()[-4096:],
-                },
-            )
-
         script = """
 import importlib, json
 torch = importlib.import_module("torch")
@@ -73,9 +58,9 @@ available = bool(torch.npu.is_available())
 count = int(torch.npu.device_count()) if available else 0
 if available:
     torch.npu.synchronize()
-print(json.dumps({"available": available, "count": count,
-                  "torch": str(torch.__version__),
-                  "triton": str(triton.__version__)}))
+print("AKG_HEALTH_RESULT=" + json.dumps({"available": available, "count": count,
+                                         "torch": str(torch.__version__),
+                                         "triton": str(triton.__version__)}), flush=True)
 """.strip() % int(self.device.removeprefix("npu:"))
         runtime = self.runner.run(
             (self.python_executable, "-I", "-c", script),
@@ -86,6 +71,8 @@ print(json.dumps({"available": available, "count": count,
             "healthy": False,
             "npu_smi_available": True,
             "npu_smi_returncode": smi.returncode,
+            "npu_smi_usable": smi.succeeded,
+            "npu_smi_stderr": smi.stderr_text()[-4096:],
         }
         if not runtime.succeeded:
             details.update(
@@ -104,7 +91,14 @@ print(json.dumps({"available": available, "count": count,
                 details=details,
             )
         try:
-            runtime_details = json.loads(runtime.stdout_text().splitlines()[-1])
+            output = runtime.stdout_text()
+            marker = "AKG_HEALTH_RESULT="
+            position = output.rfind(marker)
+            if position < 0:
+                raise ValueError("health result marker is missing")
+            runtime_details, _ = json.JSONDecoder().raw_decode(
+                output[position + len(marker) :].lstrip()
+            )
             if not isinstance(runtime_details, dict):
                 raise ValueError("health JSON must be an object")
             count = int(runtime_details.get("count", 0))
@@ -120,6 +114,11 @@ print(json.dumps({"available": available, "count": count,
         healthy = bool(runtime_details.get("available")) and count > 0
         details.update(runtime_details)
         details["healthy"] = healthy
+        if not smi.succeeded:
+            details["warning"] = (
+                "container npu-smi was unavailable, but the NPU runtime "
+                "imported and synchronized successfully"
+            )
         return StageResult(
             stage="HEALTH_CHECK",
             status=StageStatus.PASS if healthy else StageStatus.FAIL,

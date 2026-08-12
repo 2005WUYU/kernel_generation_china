@@ -334,6 +334,7 @@ class EnvironmentProber:
                 (
                     executable,
                     "op",
+                    "--kernel-name=_add",
                     f"--output={raw_root}",
                     self.python_executable,
                     str(driver),
