@@ -56,6 +56,11 @@ class ContainerDeploymentContractTests(unittest.TestCase):
         self.assertIn("probe|baseline", runner)
         self.assertIn("{{.State.Health.Status}}", runner)
         self.assertIn("AKG_DEVICE_LOCK_ROOT", runner)
+        self.assertIn("/usr/local/Ascend/driver/lib64/driver", runner)
+        self.assertEqual(
+            runner.count('--env "LD_LIBRARY_PATH=$WORKER_LD_LIBRARY_PATH"'),
+            2,
+        )
         self.assertEqual(
             runner.count('--volume "$LOCK_ROOT:/var/lock/ascend-kernel-lab:rw"'),
             2,

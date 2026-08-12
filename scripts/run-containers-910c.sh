@@ -29,6 +29,7 @@ CONTROLLER_IMAGE=${AKG_CONTROLLER_IMAGE:-ascend-kernel-lab-controller:local}
 WORKER_NAME=${AKG_WORKER_CONTAINER:-ascend-kernel-worker}
 CONTROLLER_NAME=${AKG_CONTROLLER_CONTAINER:-ascend-kernel-controller}
 DEVICE_ID=${AKG_DEVICE_ID:-0}
+TASK_ID=${AKG_TASK_ID:-}
 CONTROLLER_UID=${AKG_CONTROLLER_UID:-}
 WORKER_UID=${AKG_WORKER_UID:-}
 SHARED_GID=${AKG_SHARED_GID:-}
@@ -61,6 +62,10 @@ case "$DEVICE_ID" in
         echo "error: AKG_DEVICE_ID must select exactly one numeric NPU" >&2
         exit 2
         ;;
+esac
+case "$TASK_ID" in
+    ""|k[0-9][0-9]_[a-z0-9_]*) ;;
+    *) echo "error: AKG_TASK_ID must be empty or a task ID such as k01_vector_add" >&2; exit 2 ;;
 esac
 for identity in "$CONTROLLER_UID" "$WORKER_UID"; do
     case "$identity" in
@@ -240,6 +245,9 @@ case "$ACTION" in
             MAINTENANCE_COMMAND='python3 -m ascend_kernel_lab probe all -c configs/experiment_910c_kimi_k3.yaml -o runs/probe'
         else
             MAINTENANCE_COMMAND='python3 -m ascend_kernel_lab baseline run -c configs/experiment_910c_kimi_k3.yaml'
+            if [ -n "$TASK_ID" ]; then
+                MAINTENANCE_COMMAND="$MAINTENANCE_COMMAND --task $TASK_ID"
+            fi
         fi
         docker run --rm \
             --runtime=ascend \
@@ -335,6 +343,13 @@ case "$ACTION" in
             exit 3
         fi
         ensure_absent "$CONTROLLER_NAME"
+        if [ -n "$TASK_ID" ]; then
+            set -- python3 -m ascend_kernel_lab experiment resume \
+                -c "$CONTAINER_PROJECT_ROOT/configs/experiment_910c_kimi_k3.yaml" \
+                --task "$TASK_ID" --allow-missing-baseline
+        else
+            set --
+        fi
         docker run --detach \
             --name "$CONTROLLER_NAME" \
             --runtime=runc \
@@ -359,6 +374,6 @@ case "$ACTION" in
             --env GIT_OPTIONAL_LOCKS=0 \
             --volume "$PROJECT_ROOT:$CONTAINER_PROJECT_ROOT:ro" \
             --volume "$PROJECT_ROOT/runs:$CONTAINER_PROJECT_ROOT/runs:rw" \
-            "$CONTROLLER_IMAGE"
+            "$CONTROLLER_IMAGE" "$@"
         ;;
 esac
