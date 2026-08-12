@@ -50,19 +50,16 @@ Triton JIT、非对齐 shape、归约、计时和 profiler 形成证据；失败
 
 ## 2. 准备 Controller 基础镜像
 
-Controller 使用两个不可变基础：`CONTROLLER_BASE` 提供 Python 3.10+、PyYAML 和 Git；
-`CONTROLLER_NODE_BASE` 提供 Node.js 22+ 和 npm。两者都必须是 `linux/arm64`。当前可把
+Controller 使用不可变的 `CONTROLLER_BASE` 提供 Python 3.10+、PyYAML 和 Git。当前可把
 Mentor DNN base
 `sha256:8b5b663f9979d54cf5af3cbfbb4fbdb4884bb64dea311a5b1d81bdeccca65d54`
-用于 Controller；Node 层应使用经摘要审批的官方 `node:22-bookworm-slim` arm64 镜像。
-项目 Dockerfile 通过 multi-stage 只复制 Node 镜像的 `/usr/local`，再安装一个明确版本的
-Claude Code，不把凭据写进镜像层。
+用于 Controller。Claude Code 使用 Anthropic 官方 GitHub Release 的 Linux ARM64 单文件
+归档；宿主机先下载并核对固定 SHA-256，Docker 构建只做离线安装，不访问 npm 或其他包仓库。
 
-2026-08-13 查询到的 Claude Code 候选是 `2.1.228`，npm integrity 为
-`sha512-S3Iy+c6ZuFjswQOekbVgXA+RxAuU8H2ae2nxFynqmvR5r3Gm9oyFV19XgiuatYRFKKjxP0K3i5vvvelPDgx12g==`。
-构建会先从 registry 读取该版本的 `dist.integrity` 精确比对，再核对安装后的 package
-version 和 `claude --version`；若批准更新版，必须同时显式更新版本和 integrity，禁止
-使用 `latest`、`next` 或 `beta`。
+2026-08-13 锁定的 Claude Code 是 `2.1.228`，官方 `claude-linux-arm64.tar.gz` SHA-256 为
+`877d423c35e6d059752f86399352837df5bf1af2a9dbcda5753d898629a439f4`。构建会在宿主和镜像内
+各核对一次摘要，再检查归档只含一个 `claude` 文件及 `claude --version`。更新版本时必须
+同时更新版本、官方归档和摘要，禁止使用 `latest`、`next` 或 `beta`。
 
 跨主机发布时，三个基础镜像必须写成 `repository@sha256:<64位摘要>`。当前本机镜像没有
 RepoDigest，构建脚本也接受完整 `sha256:<64位本地image ID>`：它会 inspect 精确匹配、
@@ -75,9 +72,9 @@ RepoDigest，构建脚本也接受完整 `sha256:<64位本地image ID>`：它会
 ```bash
 export WORKER_BASE=sha256:6cc5e9d45432fe79306890bd616c3d82eea558ac18e3a1a337640f7accabc349
 export CONTROLLER_BASE=sha256:8b5b663f9979d54cf5af3cbfbb4fbdb4884bb64dea311a5b1d81bdeccca65d54
-export CONTROLLER_NODE_BASE=node@sha256:<审批后的arm64 node:22-bookworm-slim摘要>
+export CLAUDE_CODE_ARCHIVE=/var/cache/ascend-kernel-lab/claude-linux-arm64-2.1.228.tar.gz
 export CLAUDE_CODE_VERSION=2.1.228
-export CLAUDE_CODE_INTEGRITY='sha512-S3Iy+c6ZuFjswQOekbVgXA+RxAuU8H2ae2nxFynqmvR5r3Gm9oyFV19XgiuatYRFKKjxP0K3i5vvvelPDgx12g=='
+export CLAUDE_CODE_SHA256=877d423c35e6d059752f86399352837df5bf1af2a9dbcda5753d898629a439f4
 ./scripts/build-container-images.sh
 ```
 
