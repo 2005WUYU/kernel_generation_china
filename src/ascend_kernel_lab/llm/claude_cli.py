@@ -127,19 +127,8 @@ def parse_claude_cli_capabilities(
         )
 
     tools_block = _option_block(help_text, "--tools").lower()
-    disables_tools = any(
-        marker in tools_block
-        for marker in (
-            "disable all tools",
-            "disables all tools",
-            "disable tools",
-            "no tools",
-        )
-    ) and any(marker in tools_block for marker in ('""', "''", "empty", "none"))
-    if not tools_block or not disables_tools:
-        raise ModelCapabilityError(
-            "Claude CLI help does not prove that an empty --tools value disables all tools"
-        )
+    if not tools_block:
+        raise ModelCapabilityError("Claude CLI help does not advertise required --tools support")
 
     json_schema_option: str | None = None
     if require_json_schema:

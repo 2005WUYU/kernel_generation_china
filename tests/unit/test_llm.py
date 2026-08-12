@@ -28,6 +28,7 @@ from ascend_kernel_lab.llm import (
     validate_completion,
     validate_model_response,
 )
+from ascend_kernel_lab.llm.claude_cli import parse_claude_cli_capabilities
 from ascend_kernel_lab.llm.safety import redact_text, truncate_utf8
 from ascend_kernel_lab.llm.types import ModelCompletion
 
@@ -151,6 +152,19 @@ class ProviderSafetyTests(unittest.TestCase):
 
 
 class ClaudeCliTests(unittest.TestCase):
+    def test_cli_accepts_installed_tools_option_wording(self) -> None:
+        current_help = CLAUDE_HELP.replace(
+            'Use "" to disable all tools',
+            "Specify the available built-in tools",
+        )
+
+        capabilities = parse_claude_cli_capabilities(
+            current_help,
+            require_json_schema=True,
+        )
+
+        self.assertEqual(capabilities.tools_option, "--tools")
+
     def test_cli_is_one_shot_tool_free_stdin_and_clean_environment(self) -> None:
         captured: dict[str, object] = {}
         help_environment: dict[str, str] = {}
@@ -365,9 +379,12 @@ class ClaudeCliTests(unittest.TestCase):
             gateway.complete(ModelRequest("system", "user"))
         self.assertEqual(api_count, 1)
 
-    def test_cli_missing_tool_disable_capability_never_sends_prompt(self) -> None:
+    def test_cli_missing_tools_option_never_sends_prompt(self) -> None:
         api_count = 0
-        unsafe_help = CLAUDE_HELP.replace('Use "" to disable all tools', "Choose enabled tools")
+        unsafe_help = CLAUDE_HELP.replace(
+            '  --tools <tools...>             Use "" to disable all tools\n',
+            "",
+        )
 
         def runner(
             argv: Sequence[str], stdin: str, cwd: Path, env: Mapping[str, str], timeout: float
