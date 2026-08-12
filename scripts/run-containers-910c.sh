@@ -62,14 +62,20 @@ case "$DEVICE_ID" in
         exit 2
         ;;
 esac
-for identity in "$CONTROLLER_UID" "$WORKER_UID" "$SHARED_GID"; do
+for identity in "$CONTROLLER_UID" "$WORKER_UID"; do
     case "$identity" in
-        ""|0|*[!0-9]*)
-            echo "error: AKG_CONTROLLER_UID, AKG_WORKER_UID, and AKG_SHARED_GID must be non-zero numeric IDs" >&2
+        ""|*[!0-9]*)
+            echo "error: AKG_CONTROLLER_UID and AKG_WORKER_UID must be numeric IDs" >&2
             exit 2
             ;;
     esac
 done
+case "$SHARED_GID" in
+    ""|0|*[!0-9]*)
+        echo "error: AKG_SHARED_GID must be a non-zero numeric ID" >&2
+        exit 2
+        ;;
+esac
 case "$NPU_DEVICE_GID" in
     ""|*[!0-9]*)
         echo "error: AKG_NPU_DEVICE_GID must be the numeric group owning NPU devices" >&2
@@ -189,6 +195,21 @@ ensure_absent() {
     fi
 }
 
+worker_library_path() {
+    # Ascend Docker Runtime bind-mounts the host driver, but older runtime
+    # releases do not consistently extend LD_LIBRARY_PATH for an arbitrary
+    # non-root UID when the image entrypoint is overridden.  Keep the
+    # platform image's own CANN paths and add the standard driver locations.
+    image_path=$(docker image inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+        "$WORKER_IMAGE" | sed -n 's/^LD_LIBRARY_PATH=//p' | tail -n 1)
+    driver_path=/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver
+    if [ -n "$image_path" ]; then
+        printf '%s:%s\n' "$driver_path" "$image_path"
+    else
+        printf '%s\n' "$driver_path"
+    fi
+}
+
 case "$ACTION" in
     init)
         docker run --rm \
@@ -208,6 +229,7 @@ case "$ACTION" in
             'umask 0007; export PYTHONPATH=/workspace/src; cd /workspace; python3 -m ascend_kernel_lab db upgrade -c configs/experiment_910c_kimi_k3.yaml'
         ;;
     probe|baseline)
+        WORKER_LD_LIBRARY_PATH=$(worker_library_path)
         if docker container inspect "$WORKER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
             echo "error: stop the project Worker before probe or baseline maintenance" >&2
             exit 3
@@ -231,6 +253,7 @@ case "$ACTION" in
             --memory "${AKG_WORKER_MEMORY:-48g}" \
             --tmpfs /tmp:rw,nosuid,nodev,exec,mode=1777 \
             --env-file "$WORKER_ENV_FILE" \
+            --env "LD_LIBRARY_PATH=$WORKER_LD_LIBRARY_PATH" \
             --env "ASCEND_VISIBLE_DEVICES=$DEVICE_ID" \
             --env DEVICE_ID=0 \
             --env HOME=/tmp/akg-home \
@@ -258,6 +281,7 @@ case "$ACTION" in
              exec /bin/sh -c "$1"' sh "$MAINTENANCE_COMMAND"
         ;;
     start-worker)
+        WORKER_LD_LIBRARY_PATH=$(worker_library_path)
         validate_env_file "$HIDDEN_ENV_FILE" hidden
         validate_env_file "$WORKER_ENV_FILE" worker
         reject_hidden_model_env_file
@@ -285,6 +309,7 @@ case "$ACTION" in
             --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
             --env-file "$WORKER_ENV_FILE" \
             --env-file "$HIDDEN_ENV_FILE" \
+            --env "LD_LIBRARY_PATH=$WORKER_LD_LIBRARY_PATH" \
             --env "ASCEND_VISIBLE_DEVICES=$DEVICE_ID" \
             --env "DEVICE_ID=0" \
             --env "AKG_PROJECT_ROOT=$CONTAINER_PROJECT_ROOT" \
