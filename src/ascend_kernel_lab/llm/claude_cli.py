@@ -17,6 +17,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from ascend_kernel_lab.config import ModelConfig
@@ -65,6 +66,31 @@ _TRANSIENT_FAILURE = re.compile(
     r"timeout|econnreset|etimedout|connection\s+reset|network\s+error)"
 )
 _RETRY_AFTER = re.compile(r"(?i)retry[- ]after\s*[:=]?\s*(\d+(?:\.\d+)?)")
+_UNSUPPORTED_CLAUDE_SCHEMA_KEYWORDS = {
+    "$schema",
+    "$id",
+    "title",
+    "minimum",
+    "maximum",
+    "minItems",
+    "maxItems",
+    "minLength",
+    "maxLength",
+}
+
+
+def _claude_json_schema(value: Any) -> Any:
+    """Project a strict schema onto Claude structured output's supported subset."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: _claude_json_schema(item)
+            for key, item in value.items()
+            if key not in _UNSUPPORTED_CLAUDE_SCHEMA_KEYWORDS
+        }
+    if isinstance(value, list):
+        return [_claude_json_schema(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,12 +425,10 @@ class ClaudeCliGateway:
         schema: str | None = None
         if self._config.structured_output:
             try:
-                cli_schema = dict(request.json_schema)
-                # Claude Code 2.1.228 validates the inline schema with a
-                # dialect whose meta-schema registry does not include the
-                # 2020-12 URI. The dialect declaration is only an annotation;
-                # all response constraints remain in the payload.
-                cli_schema.pop("$schema", None)
+                # Claude Code 2.1.228 accepts a documented subset of JSON
+                # Schema. The stricter limits remain enforced by
+                # validate_model_response after the provider returns.
+                cli_schema = _claude_json_schema(request.json_schema)
                 schema = json.dumps(
                     cli_schema,
                     ensure_ascii=False,
