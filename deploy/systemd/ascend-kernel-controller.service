@@ -1,0 +1,44 @@
+[Unit]
+Description=Ascend Kernel Lab Experiment Controller
+Wants=network-online.target ascend-kernel-worker.service
+After=network-online.target ascend-kernel-worker.service
+ConditionPathExists=/opt/ascend-kernel-lab/scripts/run-controller.sh
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=ascend-kernel-controller
+Group=ascend-kernel
+WorkingDirectory=/opt/ascend-kernel-lab
+EnvironmentFile=/etc/ascend-kernel-lab/controller.env
+EnvironmentFile=-/etc/ascend-kernel-lab/hidden.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/ascend-kernel-lab/scripts/run-controller.sh
+Restart=on-failure
+RestartPreventExitStatus=2 3 5 10 130
+RestartSec=10s
+TimeoutStartSec=infinity
+TimeoutStopSec=45s
+KillMode=control-group
+UMask=0007
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/opt/ascend-kernel-lab/runs
+TasksMax=512
+LimitNOFILE=65536

@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+import argparse
+import json
+import traceback
+from typing import Any
+
+_ELEMENTWISE_SOURCE = r'''
+import torch
+import torch_npu
+import triton
+import triton.language as tl
+
+@triton.jit
+def _add(x, y, out, n: tl.constexpr, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n
+    tl.store(out + offsets, tl.load(x + offsets, mask=mask) + tl.load(y + offsets, mask=mask), mask=mask)
+
+def run(dtype, n):
+    x = torch.randn((n,), device='npu:0', dtype=dtype)
+    y = torch.randn((n,), device='npu:0', dtype=dtype)
+    out = torch.empty_like(x)
+    _add[(triton.cdiv(n, 256),)](x, y, out, n=n, BLOCK=256)
+    torch.npu.synchronize()
+    return bool(torch.allclose(out, x + y, rtol=0.01, atol=0.01))
+'''
+
+_REDUCTION_SOURCE = r'''
+import torch
+import torch_npu
+import triton
+import triton.language as tl
+
+@triton.jit
+def _reduce(x, out, N: tl.constexpr, USE_MAX_EXP: tl.constexpr):
+    offsets = tl.arange(0, N)
+    values = tl.load(x + offsets)
+    if USE_MAX_EXP:
+        maximum = tl.max(values, axis=0)
+        result = tl.sum(tl.exp(values - maximum), axis=0)
+    else:
+        result = tl.sum(values, axis=0)
+    tl.store(out, result)
+
+def run(use_max_exp):
+    x = torch.randn((128,), device='npu:0', dtype=torch.float32)
+    out = torch.empty((1,), device='npu:0', dtype=torch.float32)
+    _reduce[(1,)](x, out, N=128, USE_MAX_EXP=use_max_exp)
+    torch.npu.synchronize()
+    expected = torch.exp(x-x.max()).sum() if use_max_exp else x.sum()
+    return bool(torch.allclose(out[0], expected, rtol=0.001, atol=0.001))
+'''
+
+_DOT_SOURCE = r'''
+import torch
+import torch_npu
+import triton
+import triton.language as tl
+
+@triton.jit
+def _dot(a, b, out, BLOCK: tl.constexpr):
+    row = tl.arange(0, BLOCK)[:, None]
+    col = tl.arange(0, BLOCK)[None, :]
+    k = tl.arange(0, BLOCK)
+    av = tl.load(a + row * BLOCK + k[None, :])
+    bv = tl.load(b + k[:, None] * BLOCK + col)
+    tl.store(out + row * BLOCK + col, tl.dot(av, bv))
+
+def run():
+    a = torch.randn((16,16), device='npu:0', dtype=torch.float16)
+    b = torch.randn((16,16), device='npu:0', dtype=torch.float16)
+    out = torch.empty((16,16), device='npu:0', dtype=torch.float16)
+    _dot[(1,)](a,b,out,BLOCK=16)
+    torch.npu.synchronize()
+    return bool(torch.allclose(out, a@b, rtol=0.02, atol=0.02))
+'''
+
+_GRID_SOURCE = r'''
+import torch
+import torch_npu
+import triton
+import triton.language as tl
+
+@triton.jit
+def _copy2d(x, out, M: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < N
+    tl.store(out + row*N + offsets, tl.load(x + row*N + offsets, mask=mask), mask=mask)
+
+def run():
+    x=torch.randn((17,129),device='npu:0',dtype=torch.float16); out=torch.empty_like(x)
+    _copy2d[(17,triton.cdiv(129,64))](x,out,M=17,N=129,BLOCK=64)
+    torch.npu.synchronize(); return bool(torch.equal(out,x))
+'''
+
+
+def run_feature(feature: str) -> dict[str, Any]:
+    namespace: dict[str, Any] = {}
+    if feature in {"vector_add", "masked_load_store", "fp16", "bfloat16", "fp32", "multiple_kernels"}:
+        exec(_ELEMENTWISE_SOURCE, namespace)
+        torch = namespace["torch"]
+        dtype = {"bfloat16": torch.bfloat16, "fp32": torch.float32}.get(feature, torch.float16)
+        n = 1003 if feature == "masked_load_store" else 1024
+        correct = namespace["run"](dtype, n)
+        if feature == "multiple_kernels":
+            correct = correct and namespace["run"](dtype, n)
+    elif feature in {"reduction_sum", "max_exp"}:
+        exec(_REDUCTION_SOURCE, namespace)
+        correct = namespace["run"](feature == "max_exp")
+    elif feature == "dot":
+        exec(_DOT_SOURCE, namespace)
+        correct = namespace["run"]()
+    elif feature == "grid_2d":
+        exec(_GRID_SOURCE, namespace)
+        correct = namespace["run"]()
+    else:
+        raise ValueError(f"unknown feature {feature}")
+    return {"feature": feature, "compile": True, "run": True, "correct": bool(correct), "error": None}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--feature", required=True)
+    args = parser.parse_args()
+    try:
+        result = run_feature(args.feature)
+    except Exception as exc:
+        result = {
+            "feature": args.feature,
+            "compile": False,
+            "run": False,
+            "correct": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback_tail": traceback.format_exc().splitlines()[-20:],
+        }
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["correct"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

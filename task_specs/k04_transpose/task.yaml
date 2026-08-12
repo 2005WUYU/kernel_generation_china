@@ -1,0 +1,16 @@
+id: k04_transpose
+version: 1
+name: 2D Transpose
+description: Transpose a two-dimensional tensor and materialize a contiguous output.
+entry_point: custom_op
+inputs:
+  - {name: x, shape: [M, N], dtypes: [float16, bfloat16, float32], layout: contiguous}
+outputs:
+  - {name: output, shape: [N, M], dtype: same_as_x, layout: contiguous}
+semantics: {formula: "output[j, i] = x[i, j]", input_rank: 2, output_contiguous: true}
+correctness:
+  check_input_unchanged: true
+  rtol: {float16: 0.0, bfloat16: 0.0, float32: 0.0}
+  atol: {float16: 0.0, bfloat16: 0.0, float32: 0.0}
+benchmark: {warmup: 20, measurement_batches: 7, target_batch_time_ms: 200, maximum_cv: 0.05}
+restrictions: {allow_multiple_triton_kernels: true, allow_torch_allocation: true, allow_torch_compute: false, allow_cpu_fallback: false, allow_file_io: false, allow_network: false, allow_subprocess: false}

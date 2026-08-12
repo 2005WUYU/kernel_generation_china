@@ -1,0 +1,21 @@
+ARG WORKER_BASE
+FROM ${WORKER_BASE}
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONNOUSERSITE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# The platform image must already contain Python, CANN, torch_npu and
+# Triton-Ascend. This image intentionally installs none of those components.
+RUN python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
+    && command -v git >/dev/null \
+    && python3 -c 'import yaml' \
+    && python3 -c 'import torch, torch_npu, triton; assert hasattr(torch, "npu")'
+
+COPY worker-entrypoint.sh /usr/local/bin/akg-worker-entrypoint
+RUN chmod 0555 /usr/local/bin/akg-worker-entrypoint
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/akg-worker-entrypoint"]
+CMD []

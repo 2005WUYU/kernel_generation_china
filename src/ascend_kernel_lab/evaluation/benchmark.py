@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+import math
+import statistics
+from collections.abc import Iterable, Sequence
+from dataclasses import asdict, dataclass
+from typing import Any
+
+
+def percentile(values: Sequence[float], probability: float) -> float:
+    if not values:
+        raise ValueError("values must not be empty")
+    if not 0 <= probability <= 1:
+        raise ValueError("probability must be between zero and one")
+    ordered = sorted(float(value) for value in values)
+    if any(not math.isfinite(value) or value < 0 for value in ordered):
+        raise ValueError("samples must be finite and non-negative")
+    position = (len(ordered) - 1) * probability
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] * (upper - position) + ordered[upper] * (position - lower)
+
+
+@dataclass(frozen=True)
+class BenchmarkStatistics:
+    median_us: float
+    p20_us: float
+    p80_us: float
+    mean_us: float
+    standard_deviation_us: float
+    cv: float
+    sample_count: int
+    raw_samples_us: tuple[float, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def summarize_samples(samples_us: Iterable[float]) -> BenchmarkStatistics:
+    samples = tuple(float(value) for value in samples_us)
+    if not samples:
+        raise ValueError("samples must not be empty")
+    if any(not math.isfinite(value) or value <= 0 for value in samples):
+        raise ValueError("samples must be finite and positive")
+    mean = statistics.fmean(samples)
+    deviation = statistics.stdev(samples) if len(samples) > 1 else 0.0
+    return BenchmarkStatistics(
+        median_us=statistics.median(samples),
+        p20_us=percentile(samples, 0.2),
+        p80_us=percentile(samples, 0.8),
+        mean_us=mean,
+        standard_deviation_us=deviation,
+        cv=deviation / mean if mean else 0.0,
+        sample_count=len(samples),
+        raw_samples_us=samples,
+    )
+
+
+def weighted_geometric_mean(values: Sequence[float], weights: Sequence[float] | None = None) -> float:
+    if not values:
+        raise ValueError("values must not be empty")
+    weights = tuple(1.0 for _ in values) if weights is None else tuple(float(weight) for weight in weights)
+    if len(weights) != len(values):
+        raise ValueError("values and weights must have the same length")
+    if any(not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("geometric mean values must be finite and positive")
+    if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
+        raise ValueError("weights must be finite and positive")
+    total = sum(weights)
+    return math.exp(
+        sum(
+            weight * math.log(value)
+            for value, weight in zip(values, weights, strict=True)
+        )
+        / total
+    )
+
+
+def speedup_summary(per_case: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    valid = [item for item in per_case if item.get("speedup_vs_eager") is not None]
+    if not valid:
+        return {"geomean_speedup_vs_eager": None, "minimum_speedup_vs_eager": None, "maximum_speedup_vs_eager": None}
+    speeds = [float(item["speedup_vs_eager"]) for item in valid]
+    weights = [float(item.get("weight", 1.0)) for item in valid]
+    return {
+        "geomean_speedup_vs_eager": weighted_geometric_mean(speeds, weights),
+        "minimum_speedup_vs_eager": min(speeds),
+        "maximum_speedup_vs_eager": max(speeds),
+    }

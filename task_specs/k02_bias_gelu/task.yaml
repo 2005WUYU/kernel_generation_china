@@ -1,0 +1,17 @@
+id: k02_bias_gelu
+version: 1
+name: Bias plus GELU
+description: Add a last-dimension bias and apply tanh-approximate GELU in one fused operation.
+entry_point: custom_op
+inputs:
+  - {name: x, shape: [M, N], dtypes: [float16, bfloat16], layout: contiguous}
+  - {name: bias, shape: [N], dtypes: [float16, bfloat16], layout: contiguous}
+outputs:
+  - {name: output, shape: [M, N], dtype: same_as_x, layout: contiguous}
+semantics: {formula: "gelu_tanh(x + bias)", bias_axis: -1, gelu_approximation: tanh, accumulation_dtype: float32}
+correctness:
+  check_input_unchanged: true
+  rtol: {float16: 0.004, bfloat16: 0.015}
+  atol: {float16: 0.004, bfloat16: 0.015}
+benchmark: {warmup: 20, measurement_batches: 7, target_batch_time_ms: 200, maximum_cv: 0.05}
+restrictions: {allow_multiple_triton_kernels: true, allow_torch_allocation: true, allow_torch_compute: false, allow_cpu_fallback: false, allow_file_io: false, allow_network: false, allow_subprocess: false}

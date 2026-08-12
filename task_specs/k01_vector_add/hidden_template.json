@@ -1,0 +1,1 @@
+{"schema_version":1,"dtypes":["float16","bfloat16","float32"],"dimensions":{"n":[2,7,31,33,127,129,511,513,4093,65521,999983,1048583,4194319]},"allow_noncontiguous":false}

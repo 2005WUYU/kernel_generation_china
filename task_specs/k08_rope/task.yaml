@@ -1,0 +1,18 @@
+id: k08_rope
+version: 1
+name: Rotary Position Embedding
+description: Apply interleaved even/odd rotary position embeddings to the final dimension.
+entry_point: custom_op
+inputs:
+  - {name: x, shape: [SEQ, HEADS, DIM], dtypes: [float16, bfloat16], layout: contiguous}
+  - {name: cos, shape: [SEQ, "DIM/2"], dtypes: [float16, bfloat16], layout: contiguous}
+  - {name: sin, shape: [SEQ, "DIM/2"], dtypes: [float16, bfloat16], layout: contiguous}
+outputs:
+  - {name: output, shape: [SEQ, HEADS, DIM], dtype: same_as_x, layout: contiguous}
+semantics: {variant: interleaved_even_odd, rotation_dim: -1, formula_even: "x_even*cos - x_odd*sin", formula_odd: "x_even*sin + x_odd*cos", accumulation_dtype: float32}
+correctness:
+  check_input_unchanged: true
+  rtol: {float16: 0.004, bfloat16: 0.015}
+  atol: {float16: 0.004, bfloat16: 0.015}
+benchmark: {warmup: 20, measurement_batches: 7, target_batch_time_ms: 200, maximum_cv: 0.05}
+restrictions: {allow_multiple_triton_kernels: true, allow_torch_allocation: true, allow_torch_compute: false, allow_cpu_fallback: false, allow_file_io: false, allow_network: false, allow_subprocess: false}

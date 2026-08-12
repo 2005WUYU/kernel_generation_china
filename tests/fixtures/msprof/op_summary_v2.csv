@@ -1,0 +1,4 @@
+Kernel Name,Duration(ns),Block Dimension,Vector Utilization,Cube Utilization,GM Read Bandwidth(GB/s)
+generated_gemm_kernel,25000,32,0.20,0.70,812.5
+generated_epilogue_kernel,5000,32,0.75,0.00,215.0
+framework_kernel,1000,1,0.01,0.00,1.0

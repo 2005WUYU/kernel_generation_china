@@ -1,0 +1,11 @@
+{"id":"c01_tiny_fp16","kind":"correctness","dtype":"float16","params":{"m":1,"n":19},"distribution":"normal","seed":301}
+{"id":"c02_small_bf16","kind":"correctness","dtype":"bfloat16","params":{"m":7,"n":127},"distribution":"near_zero","seed":302,"address_offset":3}
+{"id":"c03_odd_fp16","kind":"correctness","dtype":"float16","params":{"m":33,"n":1001},"distribution":"large","seed":303}
+{"id":"c04_1k_fp16","kind":"correctness","dtype":"float16","params":{"m":1024,"n":4096},"distribution":"normal","seed":304}
+{"id":"c05_square_bf16","kind":"correctness","dtype":"bfloat16","params":{"m":4096,"n":4096},"distribution":"repeated","seed":305}
+{"id":"c06_llm_fp16","kind":"correctness","dtype":"float16","params":{"m":512,"n":11008},"distribution":"normal","seed":306,"address_offset":1}
+{"id":"c07_zero_bf16","kind":"correctness","dtype":"bfloat16","params":{"m":31,"n":4097},"distribution":"zeros","seed":307}
+{"id":"c08_boundary_fp16","kind":"correctness","dtype":"float16","params":{"m":257,"n":8193},"distribution":"normal","seed":308,"address_offset":7}
+{"id":"b01_1k_fp16","kind":"benchmark","dtype":"float16","params":{"m":1024,"n":4096},"seed":401}
+{"id":"b02_4k_bf16","kind":"benchmark","dtype":"bfloat16","params":{"m":4096,"n":4096},"seed":402}
+{"id":"b03_llm_fp16","kind":"benchmark","dtype":"float16","params":{"m":512,"n":11008},"seed":403}

@@ -1,0 +1,3 @@
+Op Name,Task Duration(us),Block Dim,Vector Ratio,Scalar Ratio,MTE2 Ratio,MTE3 Ratio,L2 Hit Rate
+generated_softmax_kernel,18.0,48,41%,18%,35%,6%,72%
+unrelated_framework_kernel,0.4,1,5%,80%,10%,5%,90%

@@ -1,0 +1,28 @@
+# Candidate source policy; copied into the versioned experiment manifest.
+security:
+  allowed_import_roots:
+    - torch
+    - triton
+  forbidden_import_roots:
+    - ctypes
+    - http
+    - multiprocessing
+    - os
+    - pathlib
+    - requests
+    - shutil
+    - socket
+    - subprocess
+    - urllib
+  forbidden_call_prefixes:
+    - torch.matmul
+    - torch.mm
+    - torch.bmm
+    - torch.softmax
+    - torch.sum
+    - torch.nn
+    - torch.nn.functional
+    - torch.compile
+    - torch.ops
+  maximum_source_bytes: 262144
+  required_entrypoint: custom_op

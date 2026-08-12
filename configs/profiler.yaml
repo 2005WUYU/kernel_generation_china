@@ -1,0 +1,12 @@
+# Standalone documented profile policy. The experiment file embeds the same
+# values so that every committed run is fully reproducible from one manifest.
+profile:
+  run_after_correctness: true
+  mandatory_groups:
+    - task_time
+    - pipe_utilization
+  optional_groups:
+    - memory
+    - l2_cache
+    - resource_conflict
+  full_profile_for_final_best: true

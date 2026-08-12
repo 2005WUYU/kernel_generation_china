@@ -1,0 +1,17 @@
+id: k01_vector_add
+version: 1
+name: Vector Add
+description: Elementwise addition of two equally shaped contiguous tensors.
+entry_point: custom_op
+inputs:
+  - {name: x, shape: [N], dtypes: [float16, bfloat16, float32], layout: contiguous}
+  - {name: y, shape: [N], dtypes: [float16, bfloat16, float32], layout: contiguous}
+outputs:
+  - {name: output, shape: [N], dtype: same_as_x, layout: contiguous}
+semantics: {formula: "x + y", accumulation_dtype: same_as_input}
+correctness:
+  check_input_unchanged: true
+  rtol: {float16: 0.001, bfloat16: 0.005, float32: 0.00001}
+  atol: {float16: 0.001, bfloat16: 0.005, float32: 0.000001}
+benchmark: {warmup: 20, measurement_batches: 7, target_batch_time_ms: 200, maximum_cv: 0.05}
+restrictions: {allow_multiple_triton_kernels: true, allow_torch_allocation: true, allow_torch_compute: false, allow_cpu_fallback: false, allow_file_io: false, allow_network: false, allow_subprocess: false}

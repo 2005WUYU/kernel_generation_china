@@ -1,0 +1,18 @@
+id: k10_gemm_bias_gelu
+version: 1
+name: GEMM plus Bias plus GELU
+description: Fuse A[M,K] by B[K,N], last-dimension bias addition, and tanh-approximate GELU.
+entry_point: custom_op
+inputs:
+  - {name: a, shape: [M, K], dtypes: [float16, bfloat16], layout: contiguous}
+  - {name: b, shape: [K, N], dtypes: [float16, bfloat16], layout: contiguous}
+  - {name: bias, shape: [N], dtypes: [float16, bfloat16], layout: contiguous}
+outputs:
+  - {name: output, shape: [M, N], dtype: same_as_a, layout: contiguous}
+semantics: {formula: "gelu_tanh(A @ B + bias)", a_shape: "[M,K]", b_shape: "[K,N]", bias_axis: -1, gelu_approximation: tanh, accumulation_dtype: float32}
+correctness:
+  check_input_unchanged: true
+  rtol: {float16: 0.02, bfloat16: 0.04}
+  atol: {float16: 0.02, bfloat16: 0.04}
+benchmark: {warmup: 20, measurement_batches: 7, target_batch_time_ms: 200, maximum_cv: 0.05}
+restrictions: {allow_multiple_triton_kernels: true, allow_torch_allocation: true, allow_torch_compute: false, allow_cpu_fallback: false, allow_file_io: false, allow_network: false, allow_subprocess: false, bounded_autotune_configs: 32}

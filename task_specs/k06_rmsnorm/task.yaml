@@ -1,0 +1,17 @@
+id: k06_rmsnorm
+version: 1
+name: RMSNorm
+description: Normalize each row by its root mean square and apply a learned last-dimension weight.
+entry_point: custom_op
+inputs:
+  - {name: x, shape: [M, N], dtypes: [float16, bfloat16], layout: contiguous}
+  - {name: weight, shape: [N], dtypes: [float16, bfloat16], layout: contiguous}
+outputs:
+  - {name: output, shape: [M, N], dtype: same_as_x, layout: contiguous}
+semantics: {formula: "x * rsqrt(mean(x*x) + epsilon) * weight", reduction_dim: -1, epsilon: 0.000001, accumulation_dtype: float32}
+correctness:
+  check_input_unchanged: true
+  rtol: {float16: 0.004, bfloat16: 0.015}
+  atol: {float16: 0.004, bfloat16: 0.015}
+benchmark: {warmup: 20, measurement_batches: 7, target_batch_time_ms: 200, maximum_cv: 0.05}
+restrictions: {allow_multiple_triton_kernels: true, allow_torch_allocation: true, allow_torch_compute: false, allow_cpu_fallback: false, allow_file_io: false, allow_network: false, allow_subprocess: false}

@@ -1,0 +1,17 @@
+id: k09_gemm
+version: 1
+name: GEMM
+description: Multiply A[M,K] by B[K,N] with FP32 accumulation and return the input dtype.
+entry_point: custom_op
+inputs:
+  - {name: a, shape: [M, K], dtypes: [float16, bfloat16], layout: contiguous}
+  - {name: b, shape: [K, N], dtypes: [float16, bfloat16], layout: contiguous}
+outputs:
+  - {name: output, shape: [M, N], dtype: same_as_a, layout: contiguous}
+semantics: {formula: "A @ B", a_shape: "[M,K]", b_shape: "[K,N]", accumulation_dtype: float32, output_dtype: same_as_a}
+correctness:
+  check_input_unchanged: true
+  rtol: {float16: 0.015, bfloat16: 0.035}
+  atol: {float16: 0.015, bfloat16: 0.035}
+benchmark: {warmup: 20, measurement_batches: 7, target_batch_time_ms: 200, maximum_cv: 0.05}
+restrictions: {allow_multiple_triton_kernels: true, allow_torch_allocation: true, allow_torch_compute: false, allow_cpu_fallback: false, allow_file_io: false, allow_network: false, allow_subprocess: false, bounded_autotune_configs: 32}
