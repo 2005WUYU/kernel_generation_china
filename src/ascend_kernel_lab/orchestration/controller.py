@@ -362,78 +362,44 @@ class ExperimentController:
         if task_record.state in {TaskState.TASK_FINISHED, TaskState.TASK_FAILED}:
             return self._run_final(task)
 
-        # ``maximum_repair_rounds == 0`` preserves the original fixed-round
-        # protocol for existing configurations.  A positive repair budget
-        # changes the semantics deliberately: repair rounds continue only
-        # until the first source/compile/correctness-passing seed, then five
-        # (or the configured count of) optimization rounds start at index 1.
-        # Round numbers remain consecutive, so crash recovery and queue
-        # idempotency do not need placeholder/skipped rounds.
-        if self.config.maximum_repair_rounds == 0:
-            for round_number in range(1, self.config.rounds_per_task + 1):
-                self._run_round(
-                    task,
-                    round_number,
-                    phase="optimization",
-                    phase_index=round_number,
-                )
-            return self._run_final(task)
-
-        round_number = 1
+        # The configured round count is the total number of model generations.
+        # A repair consumes the next one of those rounds; it never expands the
+        # trajectory beyond the requested five calls.
         repair_count = 0
-        seed_round: int | None = None
-        while repair_count < self.config.maximum_repair_rounds:
-            self._run_round(
-                task,
-                round_number,
-                phase="repair",
-                phase_index=repair_count + 1,
-            )
-            repair_count += 1
-            evaluation = self._round_evaluation(task, round_number)
-            if self._repair_seed_ready(evaluation):
-                seed_round = round_number
-                break
-            round_number += 1
-
-        if seed_round is None:
-            return self._finish_repair_exhausted(task, repair_count)
-
         optimization_count = 0
-        round_number = seed_round + 1
-        while optimization_count < self.config.rounds_per_task:
-            # A completed repair seed or optimization round may prove that the
-            # immutable launch path dominates end-to-end latency.  In that
-            # case another Kernel-body model call would add no useful signal.
-            if self._optimization_stop_recommended(
-                task, round_number - 1
-            ):
-                break
-            self._run_round(
-                task,
-                round_number,
-                phase="optimization",
-                phase_index=optimization_count + 1,
-                repair_attempt=0,
-            )
-            optimization_count += 1
-            evaluation = self._round_evaluation(task, round_number)
-            repair_attempt = 0
-            while (
-                not self._repair_seed_ready(evaluation)
-                and repair_attempt < self.config.maximum_repair_rounds
+        active_optimization = 0
+        repair_attempt = 0
+        seed_ready = False
+        previous_evaluation: Mapping[str, Any] | None = None
+        for round_number in range(1, self.config.rounds_per_task + 1):
+            if not seed_ready:
+                repair_count += 1
+                phase = "repair"
+                phase_index = repair_count
+                repair_attempt = 0
+            elif (
+                previous_evaluation is not None
+                and not self._repair_seed_ready(previous_evaluation)
             ):
                 repair_attempt += 1
-                round_number += 1
-                self._run_round(
-                    task,
-                    round_number,
-                    phase="optimization_repair",
-                    phase_index=optimization_count,
-                    repair_attempt=repair_attempt,
-                )
-                evaluation = self._round_evaluation(task, round_number)
-            round_number += 1
+                phase = "optimization_repair"
+                phase_index = active_optimization
+            else:
+                optimization_count += 1
+                active_optimization = optimization_count
+                repair_attempt = 0
+                phase = "optimization"
+                phase_index = active_optimization
+            self._run_round(
+                task,
+                round_number,
+                phase=phase,
+                phase_index=phase_index,
+                repair_attempt=repair_attempt,
+            )
+            previous_evaluation = self._round_evaluation(task, round_number)
+            if self._repair_seed_ready(previous_evaluation):
+                seed_ready = True
         return self._run_final(task)
 
     def _trajectory_counts(self, task: TaskSpec) -> tuple[int, int]:
@@ -1161,11 +1127,7 @@ class ExperimentController:
         phase_index: int,
         repair_attempt: int = 0,
     ) -> ModelRequest:
-        maximum_rounds = (
-            self.config.maximum_repair_rounds
-            + self.config.rounds_per_task
-            * (self.config.maximum_repair_rounds + 1)
-        )
+        maximum_rounds = self.config.rounds_per_task
         task_baseline = self.baseline.get(task.id)
         baseline_snapshot = (
             task_baseline if isinstance(task_baseline, Mapping) else self.baseline

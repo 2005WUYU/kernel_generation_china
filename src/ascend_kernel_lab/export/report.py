@@ -74,9 +74,7 @@ class ReportExporter:
             and isinstance(repair_budget, int)
             and repair_budget >= 0
         ):
-            maximum_physical_rounds = repair_budget + optimization_budget * (
-                repair_budget + 1
-            )
+            maximum_physical_rounds = optimization_budget
         return {
             "actual_physical_rounds": len(rounds),
             "maximum_physical_rounds": maximum_physical_rounds,

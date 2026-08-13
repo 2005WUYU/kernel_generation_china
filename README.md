@@ -293,21 +293,16 @@ akg experiment run -c configs/experiment_910c_deepseek_v4_pro.yaml
 八个独立 Worker 领取、执行和提交 NPU 阶段，同一任务的轮次依然按顺序迭代。必须先启动上一节的
 八个 Worker；不要给生产 controller 加 `--direct` 或 `--with-local-worker`。
 
-每个任务先进入 Repair 阶段，最多请求 3 轮，直到得到同时通过
-source check、compile 和 correctness 的 seed Kernel。seed 所在轮属于 Repair，
-不计入后续 5 个 Optimization proposal slot。修复成功后才开始计算这 5 个性能提案；
-每个提案如果发生模型格式、source、compile 或 correctness 失败，可以沿该失败候选继续做最多
-3 次 `optimization_repair`，这些修复使用连续的持久轮号，但不占用下一个 Optimization slot。
-因此“五轮优化”表示五个性能提案，而不是最多五次模型调用。
-若公开评测有效的候选被识别为 host-bound，Optimization 可以提前停止，
-随后仍按正常流程选择公开最佳并只对最终候选执行隐藏评测。
+每个任务总共只进行 5 次模型生成。source、compile 或 correctness 失败后的 Repair 直接占用
+下一轮，不会在五轮之外追加模型调用。五轮结束后从已经产生的公开 BEST 中选择最终候选，
+并且只对该候选执行隐藏评测。
 
 每次反馈都落入明确的 A/B/C/D 状态，不把“修代码”和“性能提案”混成同一种 Prompt：
 
 - **A — 首次生成**：提供任务、PyTorch eager baseline、source checker 契约和 compact hardware，
   要求返回完整 Kernel 与模型原生 `optimization_summary`。
-- **B — 失败修复**：模型格式、source、compile 或 correctness 失败时，保留同一 repair/proposal
-  上下文；有失败源码时从该源码修复，并附原始失败证据，不把修复算作新的性能提案。
+- **B — 失败修复**：模型格式、source、compile 或 correctness 失败时，有失败源码就从该源码
+  修复并附原始失败证据；该修复直接占用下一轮。
 - **C — BEST 前进**：首个公开可比较候选成为 `INITIAL_BEST`；后续候选只有被判为
   `NEW_BEST` 才替换 BEST，下一次提案从新 BEST 继续。
 - **D — 回到 BEST**：`REGRESSION` 不替换 BEST，下一次提案回到 BEST，并携带失败方案的模型原生

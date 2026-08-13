@@ -87,11 +87,8 @@ def _trajectory_phase_counts(
 def _maximum_physical_rounds(
     optimization_rounds: int, maximum_repair_rounds: int
 ) -> int:
-    if maximum_repair_rounds == 0:
-        return optimization_rounds
-    return maximum_repair_rounds + optimization_rounds * (
-        maximum_repair_rounds + 1
-    )
+    del maximum_repair_rounds
+    return optimization_rounds
 
 
 class RunVerifier:

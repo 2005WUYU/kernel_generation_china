@@ -95,20 +95,14 @@ def _cold_start_sft_strategy(
     return {
         "purpose": "cold_start_sft",
         "cold_start_sft": True,
-        "repair_then_optimize": maximum_repair_rounds > 0,
-        "maximum_repair_rounds": maximum_repair_rounds,
-        "optimization_round_count": optimization_rounds,
-        # Each performance proposal may need its own bounded repair chain.
-        # The initial repair seed and those per-slot repairs use consecutive
-        # durable round numbers and therefore all count toward the maximum.
-        "maximum_total_rounds": maximum_repair_rounds
-        + optimization_rounds * (maximum_repair_rounds + 1),
+        "total_round_count": optimization_rounds,
+        "maximum_total_rounds": optimization_rounds,
+        "repair_rounds_count_toward_total": True,
         "target_speedup": None,
         "comparison_baseline": "pytorch_eager",
         "policy": (
-            f"先用最多 {maximum_repair_rounds} 轮得到 source/compile/correctness "
-            f"全通过的起点, 再采集 {optimization_rounds} 轮性能优化轨迹; "
-            "Repair 不计入 Optimization 轮数, 且不设硬性加速比门槛"
+            f"总共只生成 {optimization_rounds} 轮; source/compile/correctness "
+            "失败后的 Repair 直接占用下一轮, 不增加总轮数; 不设硬性加速比门槛"
         ),
     }
 

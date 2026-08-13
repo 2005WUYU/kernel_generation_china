@@ -173,13 +173,9 @@ done
 
 `start-workers` 为八张物理卡各启动一个 Worker；每个容器内部仍使用 `npu:0`。Controller
 把十个任务并发提交到 SQLite durable queue，NPU 阶段由八个 Worker 自然限流到最多八路并行，
-同一任务的各轮保持顺序。每个任务先进行最多 3 轮 Repair，直到得到同时通过
-source check、compile 和 correctness 的 seed Kernel；seed 轮不计入随后的
-5 个 Optimization proposal slot。每个性能提案若发生模型格式、source、compile 或 correctness
-失败，可沿失败候选做最多 3 次 `optimization_repair`；修复轮使用连续的持久轮号，但不会消耗下一个
-Optimization slot。因此五个 slot 是五次性能提案，不是五次模型调用的总上限。公开评测有效的候选
-若被归类为 host-bound，Optimization
-可提前结束，然后仍按正常流程选择公开最佳并只评测一个最终候选。
+同一任务的各轮保持顺序。每个任务总共只进行 5 次模型生成；模型格式、source、compile 或
+correctness 失败后的 Repair 直接占用下一轮，不会在五轮之外追加调用。五轮完成后选择公开 BEST，
+然后只评测一个最终候选。
 
 controller 的反馈状态机是：
 

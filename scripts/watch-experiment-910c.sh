@@ -136,9 +136,7 @@ if manifest_path.is_file():
         manifest = manifest_document.get("experiment", {})
         optimization_budget = int(manifest.get("rounds_per_task", 5))
         repair_budget = int(manifest.get("maximum_repair_rounds", 0))
-        maximum_rounds = repair_budget + optimization_budget * (
-            repair_budget + 1
-        )
+        maximum_rounds = optimization_budget
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         optimization_budget = 5
         repair_budget = 0
