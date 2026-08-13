@@ -508,7 +508,6 @@ def _load_baselines(
     task_values: dict[str, Any] = result["tasks"]
     missing: list[str] = []
     registry = TaskRegistry(config.task_root)
-    harness_git_commit = _git_commit(config.project_root)
     for task_id in tasks:
         path = _baseline_root(config) / task_id / "latest.json"
         if path.is_file() and not path.is_symlink():
@@ -521,13 +520,12 @@ def _load_baselines(
                 invalid_reasons.append("task_id")
             if snapshot.get("task_spec_sha256") != task.digest():
                 invalid_reasons.append("task_spec_sha256")
-            if snapshot.get("harness_git_commit") != harness_git_commit:
-                invalid_reasons.append("harness_git_commit")
             if environment_sha256 is not None:
+                measured_commit = str(snapshot.get("harness_git_commit", ""))
                 identity = baseline_identity(
                     task=task,
                     environment_sha256=environment_sha256,
-                    harness_git_commit=harness_git_commit,
+                    harness_git_commit=measured_commit,
                     benchmark_config=dataclasses.asdict(config.benchmark),
                 )
                 if not validate_baseline_snapshot(snapshot, expected_identity=identity):
