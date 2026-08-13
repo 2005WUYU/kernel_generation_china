@@ -671,6 +671,29 @@ class QueueEvaluationBackend(Backend):
                 error=terminal_error,
             )
         if stored.status is JobStatus.DEAD:
+            if (
+                terminal_error is not None
+                and terminal_error.get("type") == "StageTimeout"
+            ):
+                # Older workers dead-lettered a valid timeout StageResult after
+                # its final retry.  Materialize that known stage outcome so a
+                # durable Controller resume can finish the round and retain the
+                # timeout in its trajectory.  Other dead letters remain hard
+                # transport failures.
+                return StageResult(
+                    stage=expected_stage,
+                    status=StageStatus.TIMEOUT,
+                    started_at=stored.updated_at,
+                    finished_at=stored.updated_at,
+                    details={
+                        "recovered_from_dead": True,
+                        "attempt_count": stored.attempt_count,
+                        "max_attempts": stored.max_attempts,
+                        "queue_status": stored.status.value,
+                    },
+                    error={str(key): value for key, value in terminal_error.items()},
+                    retryable=False,
+                )
             raise QueueJobFailed(
                 stored.job_id,
                 status=stored.status,

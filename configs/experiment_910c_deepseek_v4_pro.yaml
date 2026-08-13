@@ -45,13 +45,13 @@ worker:
   heartbeat_seconds: 10
   lease_seconds: 120
   poll_seconds: 1
-  maximum_job_attempts: 3
+  maximum_job_attempts: 1
 
 timeouts:
   source_check_seconds: 10
   compile_seconds: 180
   correctness_case_seconds: 30
-  benchmark_seconds: 300
+  benchmark_seconds: 180
   profile_seconds: 180
 
 benchmark:

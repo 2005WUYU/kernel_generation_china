@@ -472,6 +472,34 @@ class QueueEvaluationBackendTests(unittest.TestCase):
         self.assertEqual(raised.exception.error["type"], "WorkerCrashed")
         self.assert_worker_ok(thread, observed)
 
+    def test_legacy_dead_stage_timeout_resumes_as_timeout_result(self) -> None:
+        def timeout_job(leased: LeasedEvaluationJob) -> None:
+            self.queue.fail(
+                leased.job_id,
+                "test-worker",
+                leased.lease_token,
+                {
+                    "type": "StageTimeout",
+                    "message": "benchmark stage exceeded its wall-clock timeout",
+                },
+                retryable=False,
+            )
+            return None
+
+        thread, observed = self.worker_once(timeout_job)
+        result = self.backend(maximum_job_attempts=1).source_check(
+            self.candidate_path,
+            self.task,
+        )
+
+        self.assertEqual(result.status.value, "timeout")
+        self.assertFalse(result.retryable)
+        self.assertEqual(result.error["type"], "StageTimeout")
+        self.assertTrue(result.details["recovered_from_dead"])
+        self.assertEqual(result.details["attempt_count"], 1)
+        self.assertEqual(result.details["max_attempts"], 1)
+        self.assert_worker_ok(thread, observed)
+
     def test_changed_candidate_is_rejected_before_enqueue(self) -> None:
         self.candidate_path.write_text(
             "def custom_op(x, y):\n    return y\n", encoding="utf-8"

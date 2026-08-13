@@ -32,6 +32,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.profile.optional_groups, ())
         self.assertTrue(config.profile.run_for_final_best)
         self.assertFalse(config.profile.full_profile_for_final_best)
+        self.assertEqual(config.worker.maximum_job_attempts, 1)
+        self.assertEqual(config.timeouts.benchmark_seconds, 180)
 
     def test_loads_full_config_and_resolves_paths(self) -> None:
         config = load_config(CONFIG)

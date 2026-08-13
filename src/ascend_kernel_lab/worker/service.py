@@ -679,6 +679,7 @@ class WorkerService:
         result: Mapping[str, Any] | None = None
         error: dict[str, Any] | None = None
         retryable = False
+        retryable_stage_result = False
         private_job = "case_set" in job.payload
         try:
             result = self._execute(job)
@@ -693,6 +694,7 @@ class WorkerService:
                     StageStatus.TIMEOUT.value,
                 }
                 if retryable:
+                    retryable_stage_result = True
                     raw_error = result.get("error")
                     error = (
                         {str(key): value for key, value in raw_error.items()}
@@ -724,14 +726,29 @@ class WorkerService:
         except LeaseLostError:
             return True
         if error is not None:
-            self.queue.fail(
-                job.job_id,
-                self.worker_id,
-                job.lease_token,
-                error,
-                retryable=retryable,
-                retry_delay_seconds=self.retry_delay_seconds if retryable else 0.0,
-            )
+            if retryable_stage_result and job.attempt_count >= job.max_attempts:
+                assert result is not None
+                # The worker transport succeeded and returned a valid stage
+                # outcome.  Once retries are exhausted, persist that outcome
+                # for the Controller instead of turning it into an opaque dead
+                # letter that leaves the round without evaluation_result.json.
+                self.queue.complete(
+                    job.job_id,
+                    self.worker_id,
+                    job.lease_token,
+                    result,
+                )
+            else:
+                self.queue.fail(
+                    job.job_id,
+                    self.worker_id,
+                    job.lease_token,
+                    error,
+                    retryable=retryable,
+                    retry_delay_seconds=(
+                        self.retry_delay_seconds if retryable else 0.0
+                    ),
+                )
         else:
             assert result is not None
             self.queue.complete(job.job_id, self.worker_id, job.lease_token, result)

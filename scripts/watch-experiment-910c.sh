@@ -20,21 +20,6 @@ k08_rope
 k09_gemm
 k10_gemm_bias_gelu'
 
-round_stage() {
-    round_root=$1
-    if [ -f "$round_root/feedback.json" ] || [ -f "$round_root/evaluation_result.json" ]; then
-        printf '%s' '完成'
-    elif [ -f "$round_root/candidate.py" ]; then
-        printf '%s' 'NPU评测'
-    elif [ -f "$round_root/model_response.json" ]; then
-        printf '%s' '模型已返回'
-    elif [ -f "$round_root/prompt.json" ]; then
-        printf '%s' '等待模型'
-    else
-        printf '%s' '未开始'
-    fi
-}
-
 worker_counts() {
     running=0
     healthy=0
@@ -63,18 +48,130 @@ claude_count() {
 }
 
 task_snapshot() {
-    for task_id in $TASKS; do
-        task_root=$RUN_ROOT/tasks/$task_id
-        line=$task_id
-        round=1
-        while [ "$round" -le 5 ]; do
-            round_name=$(printf 'round_%02d' "$round")
-            stage=$(round_stage "$task_root/$round_name")
-            line="$line R$(printf '%02d' "$round")=$stage"
-            round=$((round + 1))
-        done
-        printf '%s\n' "$line"
-    done
+    python3 - "$PROJECT_ROOT/runs/metadata.db" "$RUN_ROOT" "$EXPERIMENT_ID" $TASKS <<'PY'
+import json
+import pathlib
+import sqlite3
+import sys
+
+database_path = pathlib.Path(sys.argv[1])
+run_root = pathlib.Path(sys.argv[2])
+experiment_id = sys.argv[3]
+task_ids = sys.argv[4:]
+
+stage_rank = {
+    "SOURCE_CHECK": 1,
+    "COMPILE": 2,
+    "CORRECTNESS": 3,
+    "BENCHMARK": 4,
+    "PROFILE": 5,
+}
+stage_label = {
+    "SOURCE_CHECK": "SOURCE",
+    "COMPILE": "COMPILE",
+    "CORRECTNESS": "CORRECTNESS",
+    "BENCHMARK": "BENCHMARK",
+    "PROFILE": "PROFILE",
+}
+latest = {}
+
+if database_path.is_file():
+    connection = sqlite3.connect(
+        f"file:{database_path}?mode=ro", uri=True, timeout=2.0
+    )
+    try:
+        rows = connection.execute(
+            """
+            SELECT task_id, round_number, stage, status,
+                   last_error_json, result_json
+            FROM evaluation_jobs
+            WHERE experiment_id = ?
+              AND stage IN (
+                  'SOURCE_CHECK', 'COMPILE', 'CORRECTNESS',
+                  'BENCHMARK', 'PROFILE'
+              )
+            """,
+            (experiment_id,),
+        )
+        for row in rows:
+            key = (str(row[0]), int(row[1]))
+            stage = str(row[2])
+            if stage_rank[stage] >= stage_rank.get(latest.get(key, (None,))[0], 0):
+                latest[key] = (
+                    stage,
+                    str(row[3]),
+                    row[4],
+                    row[5],
+                )
+    finally:
+        connection.close()
+
+
+def json_object(raw):
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def queue_stage(task_id, round_number):
+    value = latest.get((task_id, round_number))
+    if value is None:
+        return "NPU排队"
+    stage, status, raw_error, raw_result = value
+    label = stage_label[stage]
+    error = json_object(raw_error)
+    result = json_object(raw_result)
+    error_type = str(error.get("type", ""))
+    result_status = str(result.get("status", ""))
+    result_error = result.get("error")
+    if isinstance(result_error, dict) and not error_type:
+        error_type = str(result_error.get("type", ""))
+
+    if error_type == "StageTimeout" or result_status == "timeout":
+        return f"{label}超时"
+    if status == "QUEUED":
+        return f"{label}排队"
+    if status == "LEASED":
+        return f"{label}执行中"
+    if status == "RETRY_WAIT":
+        return f"{label}重试"
+    if status == "DEAD":
+        return f"{label}失败"
+    if status == "CANCELLED":
+        return f"{label}取消"
+    if status == "SUCCEEDED":
+        if result_status in {"error", "unavailable"}:
+            return f"{label}失败"
+        return f"{label}完成"
+    return f"{label}:{status}"
+
+
+for task_id in task_ids:
+    fields = [task_id]
+    for round_number in range(1, 6):
+        round_root = (
+            run_root / "tasks" / task_id / f"round_{round_number:02d}"
+        )
+        if (
+            (round_root / "feedback.json").is_file()
+            or (round_root / "evaluation_result.json").is_file()
+        ):
+            stage = "完成"
+        elif (round_root / "candidate.py").is_file():
+            stage = queue_stage(task_id, round_number)
+        elif (round_root / "model_response.json").is_file():
+            stage = "模型已返回"
+        elif (round_root / "prompt.json").is_file():
+            stage = "等待模型"
+        else:
+            stage = "未开始"
+        fields.append(f"R{round_number:02d}={stage}")
+    print(" ".join(fields))
+PY
 }
 
 final_count() {

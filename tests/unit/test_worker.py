@@ -284,6 +284,25 @@ class WorkerServiceTests(unittest.TestCase):
         assert stored.last_error is not None
         self.assertEqual(stored.last_error["type"], "BackendError")
 
+    def test_retryable_stage_result_is_committed_after_last_attempt(self) -> None:
+        self._enqueue(max_attempts=1)
+        timeout = StageResult.infrastructure_error(
+            EvaluationStage.SOURCE_CHECK,
+            message="stage timed out",
+            error_type="StageTimeout",
+            retryable=True,
+            timed_out=True,
+        )
+        backend = FakeBackend({EvaluationStage.SOURCE_CHECK: [timeout]})
+
+        self.assertTrue(self._service(backend).run_once())
+
+        stored = self._stored()
+        self.assertEqual(stored.status, JobStatus.SUCCEEDED)
+        assert stored.result is not None
+        self.assertEqual(stored.result["status"], "timeout")
+        self.assertEqual(stored.result["error"]["type"], "StageTimeout")
+
     def test_failed_health_check_quarantines_worker_and_stops_claiming(self) -> None:
         self._enqueue(max_attempts=2)
         second_payload = self._payload(artifact_dir="jobs/second")
