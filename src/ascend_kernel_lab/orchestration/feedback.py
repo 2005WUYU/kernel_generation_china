@@ -406,6 +406,12 @@ def build_feedback(
         "correctness_failed",
     }:
         next_prompt_mode = "REPAIR_FAILED_CANDIDATE"
+    elif overall in {
+        "benchmark_failed",
+        "anti_bypass_failed",
+        "profile_unavailable",
+    }:
+        next_prompt_mode = "RETURN_TO_BEST_AFTER_INVALID_PERFORMANCE_EVIDENCE"
     elif performance_decision in {"INITIAL_BEST", "NEW_BEST"}:
         next_prompt_mode = "CONTINUE_FROM_NEW_BEST"
     elif performance_decision == "REGRESSION":

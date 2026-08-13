@@ -170,7 +170,7 @@ def _profile_summary(profile: Mapping[str, Any] | None) -> Mapping[str, Any]:
 
 
 def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -> EvaluationResult:
-    """Run evaluation, short-circuiting only before public correctness passes."""
+    """Run compile, correctness, benchmark, then quick profile in order."""
     request.artifact_dir.mkdir(parents=True, exist_ok=True)
     source_stage = backend.source_check(request.candidate_path, request.task)
     source = _stage_dict(source_stage)
@@ -210,7 +210,7 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
     benchmark_passed = benchmark_stage.passed
 
     profile: dict[str, Any] | None = None
-    if request.run_profile:
+    if request.run_profile and benchmark_passed:
         profile_stage = backend.profile(
             request.candidate_path,
             request.task,
@@ -222,7 +222,14 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
     profile_summary = _profile_summary(profile)
     coverage = _number(profile_summary, "candidate_kernel_coverage")
     kernel_count = int(profile_summary.get("kernel_count", 0) or 0)
-    if not request.run_profile:
+    if not benchmark_passed:
+        anti_bypass = {
+            "passed": False,
+            "status": "not_evaluated",
+            "reason": "benchmark_failed",
+            "coverage": None,
+        }
+    elif not request.run_profile:
         anti_bypass = {"passed": not request.profile_coverage_required, "status": "not_run", "coverage": None}
     elif profile is None or not _passed(profile):
         anti_bypass = {"passed": not request.profile_coverage_required, "status": "not_verifiable", "coverage": coverage}

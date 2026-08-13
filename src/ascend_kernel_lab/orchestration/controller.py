@@ -1226,6 +1226,17 @@ class ExperimentController:
                     "保留其模型原生 optimization_summary, 并只依据原始错误修改。"
                     if candidate["role"] == "failed_candidate_under_repair"
                     else (
+                        "刚才的候选虽然通过 source/compile/correctness, 但没有形成可信的 "
+                        "benchmark/smoke-profile 性能证据; 该候选不能替换 BEST。"
+                        "丢弃该分支并从 BEST 完整实现重新出发, 依据 failed_candidate 中的 "
+                        "模型原生优化思路、代码差异、失败证据和实测指标尝试新方案。"
+                        if previous_overall
+                        in {
+                            "benchmark_failed",
+                            "anti_bypass_failed",
+                            "profile_unavailable",
+                        }
+                        else (
                         "刚才的尝试造成确定性性能倒退; BEST 保持不变。"
                         "从 BEST 完整实现重新出发, 不要沿倒退候选继续优化。"
                         if previous_feedback.get("performance_decision")
@@ -1243,6 +1254,7 @@ class ExperimentController:
                                     "请从它继续并取得 benchmark 和 smoke profile。"
                                 )
                             )
+                        )
                         )
                     )
                 )
@@ -1300,6 +1312,26 @@ class ExperimentController:
                 ),
             }
         elif best is not None and previous_code and int(best["round"]) != round_number - 1:
+            failed_stage = next(
+                (
+                    name
+                    for name in ("benchmark", "profile", "anti_bypass")
+                    if previous_overall
+                    in {
+                        "benchmark_failed",
+                        "profile_unavailable",
+                        "anti_bypass_failed",
+                    }
+                    and isinstance(previous_evaluation.get(name), Mapping)
+                    and not _passed_stage(previous_evaluation.get(name))
+                ),
+                None,
+            )
+            stage_result = (
+                previous_evaluation.get(failed_stage)
+                if failed_stage is not None
+                else None
+            )
             failed_candidate = {
                 "round": round_number - 1,
                 "candidate_generation_intent": previous_intent,
@@ -1311,6 +1343,17 @@ class ExperimentController:
                 ),
                 "system_computed_metric_and_profile_delta": previous_feedback.get(
                     "comparison_with_best"
+                ),
+                "invalid_performance_evidence": (
+                    {
+                        "stage": failed_stage,
+                        "status": stage_result.get("status"),
+                        "passed": stage_result.get("passed"),
+                        "error": stage_result.get("error"),
+                        "maximum_cv": stage_result.get("maximum_cv"),
+                    }
+                    if isinstance(stage_result, Mapping)
+                    else None
                 ),
             }
         repair_prompt = candidate["role"] == "failed_candidate_under_repair"
