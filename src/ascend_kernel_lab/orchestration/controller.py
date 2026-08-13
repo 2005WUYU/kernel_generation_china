@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import subprocess
+import threading
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
@@ -276,6 +277,9 @@ class ExperimentController:
         self.profile_coverage_required = profile_coverage_required
         self.experiment_id = config.id
         self.harness_commit = _git_commit(config.project_root)
+        self._model_request_slots = threading.BoundedSemaphore(
+            config.model_request_concurrency
+        )
 
     @property
     def experiment_root(self) -> Path:
@@ -533,6 +537,73 @@ class ExperimentController:
                 count += 1
         return count
 
+    def _search_profile_attempt_fingerprint(self, task: TaskSpec) -> str:
+        payload = {
+            "task_id": task.id,
+            "profile_cases": [case.to_dict() for case in task.profile_cases],
+            "profile": asdict(self.config.profile),
+        }
+        return hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _profile_failure_fingerprint(
+        evaluation: Mapping[str, Any],
+    ) -> str | None:
+        profile = evaluation.get("profile")
+        if not isinstance(profile, Mapping) or _passed_stage(profile):
+            return None
+        error = profile.get("error")
+        details = profile.get("details")
+        facts = {
+            "status": profile.get("status"),
+            "failure_origin": profile.get("failure_origin"),
+            "failure_type": profile.get("failure_type"),
+            "unavailable_reason": profile.get("unavailable_reason"),
+            "missing_mandatory_groups": profile.get("missing_mandatory_groups"),
+            "error_type": error.get("type") if isinstance(error, Mapping) else None,
+            "details_failure_type": (
+                details.get("failure_type") if isinstance(details, Mapping) else None
+            ),
+        }
+        return hashlib.sha256(
+            json.dumps(
+                facts,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def _search_profile_failure_seen(
+        self,
+        task: TaskSpec,
+        *,
+        before_round: int,
+        attempt_fingerprint: str,
+    ) -> bool:
+        for round_number in range(1, before_round):
+            path = self._artifact_path(
+                task.id, round_number, "evaluation_result.json"
+            )
+            if not path.is_file():
+                continue
+            search_profile = _read_json(path).get("search_profile")
+            if (
+                isinstance(search_profile, Mapping)
+                and search_profile.get("attempt_fingerprint")
+                == attempt_fingerprint
+                and search_profile.get("failure_fingerprint")
+            ):
+                return True
+        return False
+
     @staticmethod
     def _repair_seed_ready(evaluation: Mapping[str, Any]) -> bool:
         return all(
@@ -747,6 +818,7 @@ class ExperimentController:
             "correctness": correctness_summary,
             "benchmark_vs_pytorch_eager": benchmark_summary,
             "quick_profile": profile_summary,
+            "search_profile": evaluation.get("search_profile"),
         }
 
     @staticmethod
@@ -862,10 +934,6 @@ class ExperimentController:
             return None
         code_path = self._artifact_path(task.id, best.round_number, "candidate.py")
         evaluation_path = self._artifact_path(task.id, best.round_number, "evaluation_result.json")
-        response_path = self._artifact_path(
-            task.id, best.round_number, "model_response.json"
-        )
-        response = _read_json(response_path) if response_path.is_file() else {}
         return {
             "round": best.round_number,
             "candidate_id": best.candidate_id,
@@ -875,10 +943,8 @@ class ExperimentController:
             "candidate_kernel_coverage": best.candidate_kernel_coverage,
             "stability_cv": best.stability_cv,
             "score": asdict(best),
-            "optimization_summary": list(
-                response.get(
-                    "optimization_summary", response.get("change_summary", [])
-                )
+            "candidate_generation_intent": self._candidate_intent(
+                task, best.round_number
             ),
             "evaluation": _read_json(evaluation_path) if evaluation_path.is_file() else {},
         }
@@ -1089,9 +1155,12 @@ class ExperimentController:
         )
         if not response_path.is_file():
             return {
-                "source": "model_response.optimization_summary",
-                "optimization_summary": [],
-                "expected_effect": [],
+                "schema_version": "ascend_candidate_generation_intent_v2",
+                "changes": [],
+                "evidence": [],
+                "hypotheses": [],
+                "predictions": [],
+                "source": "missing_model_response",
                 "model_authored": False,
             }
         response = _read_json(response_path)
@@ -1100,24 +1169,45 @@ class ExperimentController:
         )
         if model_failure_path.is_file():
             return {
+                "schema_version": "ascend_candidate_generation_intent_v2",
                 "source": "synthetic_model_failure_sentinel",
-                "optimization_summary": [],
-                "expected_effect": [],
+                "changes": [],
+                "evidence": [],
+                "hypotheses": [],
+                "predictions": [],
                 "model_authored": False,
             }
+        if all(
+            field in response
+            for field in ("changes", "evidence", "hypotheses", "predictions")
+        ):
+            return {
+                "schema_version": "ascend_candidate_generation_intent_v2",
+                "source": "model_response",
+                "changes": list(response["changes"]),
+                "evidence": list(response["evidence"]),
+                "hypotheses": list(response["hypotheses"]),
+                "predictions": list(response["predictions"]),
+                "model_authored": True,
+            }
+        summary_field = (
+            "optimization_summary"
+            if "optimization_summary" in response
+            else "change_summary"
+        )
         return {
-            "source": (
-                "model_response.optimization_summary"
-                if "optimization_summary" in response
-                else "model_response.change_summary"
-            ),
-            "optimization_summary": list(
-                response.get(
-                    "optimization_summary", response.get("change_summary", [])
-                )
-            ),
-            "expected_effect": list(response.get("expected_effect", [])),
-            "model_authored": True,
+            "schema_version": "ascend_candidate_generation_intent_v2",
+            "source": f"model_response.{summary_field}",
+            "changes": [],
+            "evidence": [],
+            "hypotheses": [],
+            "predictions": [],
+            "legacy_intent": {
+                summary_field: list(response.get(summary_field, [])),
+                "expected_effect": list(response.get("expected_effect", [])),
+                "assumptions": list(response.get("assumptions", [])),
+            },
+            "model_authored": bool(response.get(summary_field, [])),
         }
 
     @staticmethod
@@ -1153,9 +1243,9 @@ class ExperimentController:
                 {
                     "round": round_number,
                     "decision": feedback.get("performance_decision"),
-                    "optimization_summary": feedback.get(
+                    "candidate_generation_intent": feedback.get(
                         "candidate_generation_intent", {}
-                    ).get("optimization_summary", []),
+                    ),
                     "geomean_speedup_vs_pytorch_eager": (
                         feedback.get("benchmark", {}).get(
                             "geomean_speedup_vs_eager"
@@ -1221,7 +1311,7 @@ class ExperimentController:
         if _model_unevaluated(previous_evaluation):
             feedback_instruction = (
                 "刚才的模型响应没有通过结构化响应校验; 不要沿用内部失败占位源码。"
-                "请从当前任务或 BEST 重新生成完整 Kernel 和模型原生 optimization_summary。"
+                "请从当前任务或 BEST 重新生成完整 Kernel 和模型原生四层证据响应。"
             )
         elif _infrastructure_retry(previous_evaluation):
             feedback_instruction = (
@@ -1231,7 +1321,8 @@ class ExperimentController:
         elif candidate["role"] == "failed_candidate_under_repair":
             feedback_instruction = (
                 "刚才的候选未通过 compile/correctness; 必须从该失败候选继续修复, "
-                "保留其模型原生 optimization_summary, 并只依据原始错误修改。"
+                "保留其模型原生 changes/evidence/hypotheses/predictions, "
+                "并只依据原始错误修改。"
             )
         elif (
             isinstance(
@@ -1291,9 +1382,12 @@ class ExperimentController:
                     _read_json(failure_path) if failure_path.is_file() else None
                 ),
                 "candidate_generation_intent": {
+                    "schema_version": "ascend_candidate_generation_intent_v2",
                     "source": "synthetic_model_failure_sentinel",
-                    "optimization_summary": [],
-                    "expected_effect": [],
+                    "changes": [],
+                    "evidence": [],
+                    "hypotheses": [],
+                    "predictions": [],
                     "model_authored": False,
                 },
             }
@@ -1417,12 +1511,9 @@ class ExperimentController:
                     "metrics": self._follow_up_metrics(
                         prompt_best["evaluation"]
                     ),
-                    "candidate_generation_intent": {
-                        "source": "model_response.optimization_summary",
-                        "optimization_summary": prompt_best[
-                            "optimization_summary"
-                        ],
-                    },
+                    "candidate_generation_intent": prompt_best[
+                        "candidate_generation_intent"
+                    ],
                 }
                 if prompt_best is not None
                 else None
@@ -1552,8 +1643,8 @@ class ExperimentController:
             round_number=round_number,
         )
         # This internal failure sentinel is deliberately not represented as a
-        # model-authored optimization_summary.  ``change_summary`` is reserved
-        # here solely for the legacy-compatible sentinel/read path; live model
+        # model-authored four-layer intent. ``change_summary`` is reserved here
+        # solely for the legacy-compatible sentinel/read path; live model
         # completions are always validated against the current strict schema.
         synthetic_response = {
             "status": "candidate",
@@ -1582,15 +1673,16 @@ class ExperimentController:
         return response
 
     def _call_and_commit_model(self, task: TaskSpec, round_number: int, request: ModelRequest) -> ModelResponse:
-        validated = complete_model_response(
-            self.model_gateway,
-            request,
-            expected_round=round_number,
-            maximum_format_repair_retries=self.config.model.maximum_format_repair_retries,
-        )
+        with self._model_request_slots:
+            validated = complete_model_response(
+                self.model_gateway,
+                request,
+                expected_round=round_number,
+                maximum_format_repair_retries=self.config.model.maximum_format_repair_retries,
+            )
         response = validated.response
         exchange = {
-            "schema_version": "ascend_model_exchange_v1",
+            "schema_version": "ascend_model_exchange_v2",
             "round": round_number,
             "repair_attempts": validated.repair_attempts,
             "attempts": [
@@ -1867,6 +1959,23 @@ class ExperimentController:
                 if reused is not None:
                     evaluation_mapping, score = reused
                 else:
+                    profile_attempt_fingerprint = (
+                        self._search_profile_attempt_fingerprint(task)
+                    )
+                    profiles_run = self._search_profiles_run(
+                        task, before_round=round_number
+                    )
+                    repeated_profile_failure = self._search_profile_failure_seen(
+                        task,
+                        before_round=round_number,
+                        attempt_fingerprint=profile_attempt_fingerprint,
+                    )
+                    search_profile_enabled = (
+                        self.config.profile.run_after_correctness
+                        and profiles_run
+                        < self.config.profile.search_profile_budget_per_task
+                        and not repeated_profile_failure
+                    )
                     evaluation = evaluate_candidate(
                         self.backend,
                         EvaluationRequest(
@@ -1886,18 +1995,37 @@ class ExperimentController:
                             combine_candidate_stages=(
                                 not self.config.worker.fresh_process_per_stage
                             ),
-                            run_profile=(
-                                self.config.profile.run_after_correctness
-                                and self._search_profiles_run(
-                                    task, before_round=round_number
-                                )
-                                < self.config.profile.search_profile_budget_per_task
-                            ),
+                            run_profile=search_profile_enabled,
                             search_profile_policy=True,
                             profile_coverage_required=self.profile_coverage_required,
                         ),
                     )
                     evaluation_mapping = evaluation.to_dict()
+                    failure_fingerprint = self._profile_failure_fingerprint(
+                        evaluation_mapping
+                    )
+                    profile_attempted = isinstance(
+                        evaluation_mapping.get("profile"), Mapping
+                    )
+                    evaluation_mapping["search_profile"] = {
+                        "attempted": profile_attempted,
+                        "attempt_fingerprint": profile_attempt_fingerprint,
+                        "failure_fingerprint": failure_fingerprint,
+                        "budget_before_round": profiles_run,
+                        "budget_limit": (
+                            self.config.profile.search_profile_budget_per_task
+                        ),
+                        "selection": (
+                            "FIRST_COMPARABLE_OR_NEW_BEST"
+                            if profile_attempted
+                            else "SKIPPED_PREVIOUS_SAME_FAILURE"
+                            if repeated_profile_failure
+                            else "SKIPPED_BUDGET_EXHAUSTED"
+                            if profiles_run
+                            >= self.config.profile.search_profile_budget_per_task
+                            else "SKIPPED_NOT_FIRST_OR_NEW_BEST"
+                        ),
+                    }
                     score = evaluation.score
             evaluation_mapping["trajectory_phase"] = phase
             evaluation_mapping["phase_index"] = phase_index
@@ -2240,7 +2368,7 @@ class ExperimentController:
         if task_record.state is TaskState.SELECT_BEST_CANDIDATE:
             task_record = self.store.transition_task(self.experiment_id, task.id, TaskState.HIDDEN_CORRECTNESS_TEST)
         assert task.root is not None
-        hidden = hidden_cases_from_template(task.root, secret_seed=self.hidden_seed)
+        hidden = hidden_cases_from_template(task, secret_seed=self.hidden_seed)
         hidden_correctness = tuple(case for case in hidden if case.kind == "correctness")
         hidden_benchmark = tuple(case for case in hidden if case.kind == "benchmark")
         final_eval_relative = self._relative(

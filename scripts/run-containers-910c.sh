@@ -118,8 +118,8 @@ case "$DEVICE_ID" in
         ;;
 esac
 case "$TASK_ID" in
-    ""|k[0-9][0-9]_[a-z0-9_]*) ;;
-    *) echo "error: AKG_TASK_ID must be empty or a task ID such as k01_vector_add" >&2; exit 2 ;;
+    ""|k[0-9][0-9]_[a-z0-9_]*|k[0-9][0-9][0-9]_[a-z0-9_]*) ;;
+    *) echo "error: AKG_TASK_ID must be empty or an ID such as k01_vector_add or k001_vector_add" >&2; exit 2 ;;
 esac
 case "$EXPERIMENT_ID" in
     ""|[A-Za-z0-9][A-Za-z0-9._-]*) ;;

@@ -7,40 +7,98 @@ from typing import Any
 
 MODEL_RESPONSE_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "https://ascend-kernel-lab.local/schemas/model-response-v2.json",
+    "$id": "https://ascend-kernel-lab.local/schemas/model-response-v3.json",
     "title": "Ascend Kernel Candidate",
     "type": "object",
     "additionalProperties": False,
     "required": [
         "status",
         "round",
-        "optimization_summary",
-        "expected_effect",
-        "assumptions",
+        "changes",
+        "evidence",
+        "hypotheses",
+        "predictions",
         "code",
     ],
     "properties": {
         "status": {"type": "string", "enum": ["candidate", "no_change"]},
         "round": {"type": "integer", "minimum": 1},
-        "optimization_summary": {
+        "changes": {
             "type": "array",
-            "items": {"type": "string"},
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["target", "before", "after"],
+                "properties": {
+                    "target": {"type": "string", "minLength": 1},
+                    "before": {},
+                    "after": {},
+                },
+            },
             "minItems": 1,
             "maxItems": 32,
             "description": (
-                "The model's contemporaneous summary of the concrete candidate "
-                "generation or optimization choices embodied in code. This is "
-                "returned by the model, never inferred after evaluation."
+                "Concrete model-authored changes embodied in code. These are "
+                "returned with the candidate and are never inferred by the evaluator."
             ),
         },
-        "expected_effect": {
+        "evidence": {
             "type": "array",
-            "items": {"type": "string"},
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["fact", "source"],
+                "properties": {
+                    "fact": {"type": "string", "minLength": 1},
+                    "source": {"type": "string", "minLength": 1},
+                },
+            },
+            "minItems": 1,
             "maxItems": 32,
         },
-        "assumptions": {
+        "hypotheses": {
             "type": "array",
-            "items": {"type": "string"},
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["claim", "confidence", "evidence_refs"],
+                "properties": {
+                    "claim": {"type": "string", "minLength": 1},
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                    },
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 0},
+                        "minItems": 1,
+                        "maxItems": 32,
+                        "uniqueItems": True,
+                    },
+                },
+            },
+            "minItems": 1,
+            "maxItems": 32,
+        },
+        "predictions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["metric", "expected_direction", "reason"],
+                "properties": {
+                    "metric": {"type": "string", "minLength": 1},
+                    "expected_direction": {
+                        "type": "string",
+                        "enum": ["increase", "decrease", "unchanged"],
+                    },
+                    "reason": {
+                        "type": "string",
+                        "pattern": "^hypothesis\\[[0-9]+\\]$",
+                    },
+                },
+            },
+            "minItems": 1,
             "maxItems": 32,
         },
         "code": {"type": "string", "minLength": 1, "maxLength": 262_144},

@@ -365,7 +365,7 @@ def build_feedback(
         next_prompt_mode = "CONTINUE_FROM_LAST_CORRECT_CANDIDATE"
 
     return {
-        "evaluation_protocol": "ascend_kernel_feedback_v2",
+        "evaluation_protocol": "ascend_kernel_feedback_v3",
         "task_id": task_id,
         "round": round_number,
         "overall_status": overall,

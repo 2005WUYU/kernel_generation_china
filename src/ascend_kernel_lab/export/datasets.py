@@ -160,34 +160,64 @@ def candidate_generation_intent(
     legacy field is accepted solely so older committed runs remain exportable.
     """
 
-    source_field = "model_response.optimization_summary"
-    summary = response.get("optimization_summary")
-    if summary is None and "change_summary" in response:
-        source_field = "model_response.change_summary"
-        summary = response.get("change_summary")
-    optimization_summary = (
-        [str(item) for item in summary]
-        if isinstance(summary, list) and all(isinstance(item, str) for item in summary)
-        else []
-    )
-    expected = response.get("expected_effect")
-    expected_effect = (
-        [str(item) for item in expected]
-        if isinstance(expected, list) and all(isinstance(item, str) for item in expected)
-        else []
-    )
     assumptions = response.get("assumptions")
     synthetic_model_failure = (
         isinstance(assumptions, list)
         and "Model output failed structured-response validation." in assumptions
     )
+    if all(
+        field in response
+        for field in ("changes", "evidence", "hypotheses", "predictions")
+    ):
+        return {
+            "schema_version": "ascend_candidate_generation_intent_v2",
+            "changes": list(response["changes"]),
+            "evidence": list(response["evidence"]),
+            "hypotheses": list(response["hypotheses"]),
+            "predictions": list(response["predictions"]),
+            "source": "model_response",
+            "model_authored": True,
+            "candidate_response_provenance": "model_response",
+        }
+
+    summary_field = (
+        "optimization_summary"
+        if "optimization_summary" in response
+        else "change_summary"
+    )
+    summary = response.get(summary_field)
+    legacy_summary = (
+        list(summary)
+        if isinstance(summary, list)
+        and all(isinstance(item, str) for item in summary)
+        else []
+    )
+    expected = response.get("expected_effect")
+    expected_effect = (
+        list(expected)
+        if isinstance(expected, list)
+        and all(isinstance(item, str) for item in expected)
+        else []
+    )
+    legacy_assumptions = (
+        list(assumptions)
+        if isinstance(assumptions, list)
+        and all(isinstance(item, str) for item in assumptions)
+        else []
+    )
     return {
-        "schema_version": "ascend_candidate_generation_intent_v1",
-        "optimization_summary": optimization_summary,
-        "expected_effect": expected_effect,
-        "source_field": source_field,
-        "optimization_summary_model_authored": bool(optimization_summary)
-        and not synthetic_model_failure,
+        "schema_version": "ascend_candidate_generation_intent_v2",
+        "changes": [],
+        "evidence": [],
+        "hypotheses": [],
+        "predictions": [],
+        "legacy_intent": {
+            summary_field: legacy_summary,
+            "expected_effect": expected_effect,
+            "assumptions": legacy_assumptions,
+        },
+        "source": f"model_response.{summary_field}",
+        "model_authored": bool(legacy_summary) and not synthetic_model_failure,
         "candidate_response_provenance": (
             "synthetic_model_failure_sentinel"
             if synthetic_model_failure
@@ -197,17 +227,9 @@ def candidate_generation_intent(
 
 
 def _training_model_response(response: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize a legacy response to the schema required from new models."""
+    """Keep the exact model-authored protocol instead of synthesizing intent."""
 
-    normalized = dict(response)
-    legacy_summary = normalized.get("change_summary")
-    if (
-        "optimization_summary" not in normalized
-        and isinstance(legacy_summary, list)
-        and bool(legacy_summary)
-    ):
-        normalized["optimization_summary"] = normalized.pop("change_summary")
-    return normalized
+    return dict(response)
 
 
 def _speedup(item: RoundArtifacts) -> float | None:

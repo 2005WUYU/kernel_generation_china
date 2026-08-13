@@ -6,6 +6,8 @@ PROJECT_ROOT=${AKG_PROJECT_ROOT:-/opt/ascend-kernel-lab}
 CONTROLLER_NAME=${AKG_CONTROLLER_CONTAINER:-ascend-kernel-controller}
 WORKER_PREFIX=${AKG_WORKER_CONTAINER_PREFIX:-ascend-kernel-worker}
 DEVICE_IDS=${AKG_DEVICE_IDS:-0,2,4,6,8,10,12,14}
+CONFIG_REQUESTED=${AKG_CONFIG_PATH:-}
+DETAIL_LIMIT=${AKG_WATCH_DETAIL_LIMIT:-24}
 RUN_ROOT=$PROJECT_ROOT/runs/$EXPERIMENT_ID
 START_EPOCH=$(date +%s)
 
@@ -21,7 +23,9 @@ k09_gemm
 k10_gemm_bias_gelu'
 
 task_ids() {
-    python3 - "$PROJECT_ROOT/runs/metadata.db" "$RUN_ROOT" "$EXPERIMENT_ID" $DEFAULT_TASKS <<'PY'
+    python3 - "$PROJECT_ROOT/runs/metadata.db" "$RUN_ROOT" "$EXPERIMENT_ID" \
+        "$CONFIG_REQUESTED" "$PROJECT_ROOT/task_specs/catalog_112.json" \
+        $DEFAULT_TASKS <<'PY'
 import json
 import pathlib
 import sqlite3
@@ -30,7 +34,9 @@ import sys
 database_path = pathlib.Path(sys.argv[1])
 run_root = pathlib.Path(sys.argv[2])
 experiment_id = sys.argv[3]
-fallback = sys.argv[4:]
+config_requested = sys.argv[4]
+catalog_path = pathlib.Path(sys.argv[5])
+fallback = sys.argv[6:]
 selected = []
 
 if database_path.is_file():
@@ -66,6 +72,17 @@ if not selected:
     except (OSError, TypeError, json.JSONDecodeError):
         selected = []
 
+if not selected and "deepseek_112" in config_requested and catalog_path.is_file():
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        selected = [
+            str(task["id"])
+            for task in catalog.get("tasks", [])
+            if isinstance(task, dict) and isinstance(task.get("id"), str)
+        ]
+    except (OSError, TypeError, KeyError, json.JSONDecodeError):
+        selected = []
+
 for task_id in selected or fallback:
     print(task_id)
 PY
@@ -93,13 +110,14 @@ worker_counts() {
     printf '%s/%s running %s/%s healthy' "$running" "$total" "$healthy" "$total"
 }
 
-claude_count() {
-    docker top "$CONTROLLER_NAME" -eo comm 2>/dev/null |
-        awk '$1 == "claude" { count += 1 } END { print count + 0 }'
+model_active_count() {
+    docker top "$CONTROLLER_NAME" -eo args 2>/dev/null |
+        awk 'NR > 1 && /(^|[ /])claude([ ]|$)/ { count += 1 } END { print count + 0 }'
 }
 
 task_snapshot() {
-    python3 - "$PROJECT_ROOT/runs/metadata.db" "$RUN_ROOT" "$EXPERIMENT_ID" "$@" <<'PY'
+    python3 - "$PROJECT_ROOT/runs/metadata.db" "$RUN_ROOT" "$EXPERIMENT_ID" \
+        "$DETAIL_LIMIT" "$@" <<'PY'
 import json
 import pathlib
 import re
@@ -109,7 +127,8 @@ import sys
 database_path = pathlib.Path(sys.argv[1])
 run_root = pathlib.Path(sys.argv[2])
 experiment_id = sys.argv[3]
-task_ids = sys.argv[4:]
+detail_limit = int(sys.argv[4])
+task_ids = sys.argv[5:]
 
 stage_rank = {
     "SOURCE_CHECK": 1,
@@ -265,6 +284,16 @@ def queue_stage(task_id, round_number):
     return f"{label}:{status}"
 
 
+rows = []
+counts = {
+    "final": 0,
+    "failed_stage": 0,
+    "npu": 0,
+    "model": 0,
+    "active": 0,
+    "unstarted": 0,
+}
+
 for task_id in task_ids:
     final_path = run_root / "tasks" / task_id / "final_result.json"
     final_rounds = None
@@ -303,6 +332,10 @@ for task_id in task_ids:
             )
         )
     display_rounds = max(maximum_rounds, max(round_numbers, default=0))
+    waiting_model = False
+    npu_active = False
+    stage_failed = False
+    started = bool(round_numbers)
     for round_number in range(1, display_rounds + 1):
         round_root = (
             run_root / "tasks" / task_id / f"round_{round_number:02d}"
@@ -341,8 +374,46 @@ for task_id in task_ids:
             stage = "等待模型"
         else:
             stage = "未开始"
+        started = started or prompt_exists or stage != "未开始"
+        waiting_model = waiting_model or stage == "等待模型"
+        npu_active = npu_active or "排队" in stage or "执行中" in stage
+        stage_failed = stage_failed or "失败" in stage
         fields.append(f"R{round_number:02d}{phase}={stage}")
-    print(" ".join(fields))
+    row = " ".join(fields)
+    if final_rounds is not None:
+        counts["final"] += 1
+        priority = 0 if final_status and "failed" in final_status else 6
+    elif stage_failed:
+        counts["failed_stage"] += 1
+        priority = 0
+    elif npu_active:
+        counts["npu"] += 1
+        priority = 1
+    elif waiting_model:
+        counts["model"] += 1
+        priority = 2
+    elif started:
+        counts["active"] += 1
+        priority = 3
+    else:
+        counts["unstarted"] += 1
+        priority = 4
+    rows.append((priority, task_id, row))
+
+if detail_limit <= 0 or len(rows) <= detail_limit:
+    selected_rows = rows
+else:
+    selected_rows = sorted(rows)[:detail_limit]
+
+print(
+    f"TASKS total={len(rows)} final={counts['final']} "
+    f"failed_stage={counts['failed_stage']} npu={counts['npu']} "
+    f"waiting_model={counts['model']} active={counts['active']} "
+    f"unstarted={counts['unstarted']} "
+    f"DETAIL={len(selected_rows)}/{len(rows)}"
+)
+for _, _, row in selected_rows:
+    print(row)
 PY
 }
 
@@ -424,12 +495,12 @@ while :; do
     selected_tasks=$(task_ids)
     task_total=$(printf '%s\n' "$selected_tasks" | awk 'NF { count += 1 } END { print count + 0 }')
     workers=$(worker_counts)
-    claude=$(claude_count)
+    model_active=$(model_active_count)
     finals=$(final_count $selected_tasks)
     tasks=$(task_snapshot $selected_tasks)
     controller_running=$(docker container inspect --format '{{.State.Running}}' \
         "$CONTROLLER_NAME" 2>/dev/null || true)
-    snapshot="WORKERS=$workers CLAUDE=$claude FINAL=$finals/$task_total CONTROLLER=${controller_running:-absent}
+    snapshot="WORKERS=$workers MODEL_ACTIVE=$model_active FINAL=$finals/$task_total CONTROLLER=${controller_running:-absent}
 $tasks"
 
     if [ "$snapshot" != "$last_snapshot" ]; then

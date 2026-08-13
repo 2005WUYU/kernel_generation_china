@@ -404,7 +404,7 @@ class WorkerService:
         if task.root is None:
             raise WorkerPayloadError("hidden evaluation requires a registry-backed task root")
         derived = hidden_cases_from_template(
-            task.root,
+            task,
             secret_seed=secret_seed,
             count_correctness=20,
             count_benchmark=6,

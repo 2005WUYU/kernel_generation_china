@@ -327,6 +327,7 @@ class ExperimentConfig:
     storage: StorageConfig
     security: SecurityConfig = field(default_factory=SecurityConfig)
     task_concurrency: int = 1
+    model_request_concurrency: int = 8
     maximum_repair_rounds: int = 0
     config_path: Path = field(default=Path("<memory>"), repr=False, compare=False)
     project_root: Path = field(default_factory=Path.cwd, repr=False, compare=False)
@@ -335,6 +336,7 @@ class ExperimentConfig:
         _nonempty("experiment.id", self.id)
         _positive("rounds_per_task", self.rounds_per_task)
         _positive("task_concurrency", self.task_concurrency)
+        _positive("model_request_concurrency", self.model_request_concurrency)
         if (
             type(self.maximum_repair_rounds) is not int
             or self.maximum_repair_rounds < 0

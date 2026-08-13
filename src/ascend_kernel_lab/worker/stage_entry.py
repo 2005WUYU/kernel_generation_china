@@ -272,6 +272,14 @@ def _unchanged(torch: Any, current: Sequence[Any], originals: Sequence[Any]) -> 
     )
 
 
+def _tensor_output(torch: Any, output: Any) -> bool:
+    if isinstance(output, torch.Tensor):
+        return True
+    return isinstance(output, (tuple, list)) and bool(output) and all(
+        isinstance(item, torch.Tensor) for item in output
+    )
+
+
 def _compile(
     torch: Any,
     triton: Any,
@@ -279,6 +287,7 @@ def _compile(
     task: TaskSpec,
     cases: Sequence[CaseSpec],
     device: str,
+    prepared_case: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     began = time.perf_counter()
     case_results: list[dict[str, Any]] = []
@@ -289,10 +298,19 @@ def _compile(
         with _candidate_guard(torch):
             output = entry(*generated.args)
         _sync(torch)
-        if not isinstance(output, torch.Tensor):
-            raise TypeError(f"case {case.id}: custom_op did not return a Tensor")
+        if not _tensor_output(torch, output):
+            raise TypeError(f"case {case.id}: custom_op did not return Tensor output(s)")
         if not _unchanged(torch, generated.args, originals):
             raise RuntimeError(f"case {case.id}: candidate modified an input Tensor")
+        if prepared_case is not None and not prepared_case:
+            prepared_case.update(
+                {
+                    "case": case,
+                    "args": generated.args,
+                    "originals": originals,
+                    "actual": output,
+                }
+            )
         case_results.append(
             {
                 "case_id": case.id,
@@ -316,16 +334,31 @@ def _correctness(
     task: TaskSpec,
     cases: Sequence[CaseSpec],
     device: str,
+    prepared_case: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
+    compile_probe_reused = False
     for case in cases:
-        generated = generate_inputs(task, case, torch, device)
-        originals = tuple(value.clone() for value in generated.args)
-        reference_args = tuple(value.clone() for value in generated.args)
+        reuse = (
+            prepared_case
+            if prepared_case is not None and prepared_case.get("case") == case
+            else None
+        )
+        if reuse is None:
+            generated = generate_inputs(task, case, torch, device)
+            args = generated.args
+            originals = tuple(value.clone() for value in args)
+            actual = None
+        else:
+            compile_probe_reused = True
+            args = tuple(reuse["args"])
+            originals = tuple(reuse["originals"])
+            actual = reuse["actual"]
+        reference_args = tuple(value.clone() for value in args)
         expected = reference(task, reference_args, torch)
-        _sync(torch)
-        with _candidate_guard(torch):
-            actual = entry(*generated.args)
+        if reuse is None:
+            with _candidate_guard(torch):
+                actual = entry(*args)
         _sync(torch)
         validation = validate_output(
             task,
@@ -333,14 +366,16 @@ def _correctness(
             actual,
             expected,
             torch,
-            inputs=generated.args,
+            inputs=args,
         )
-        inputs_unchanged = _unchanged(torch, generated.args, originals)
+        inputs_unchanged = _unchanged(torch, args, originals)
         validation["inputs_unchanged"] = inputs_unchanged
         if not inputs_unchanged:
             validation["passed"] = False
             validation["error"] = "candidate modified an input Tensor"
         results.append(validation)
+        if not bool(validation.get("passed")):
+            break
     passed = all(bool(item.get("passed")) for item in results)
     absolute = [
         float(item["maximum_absolute_error"])
@@ -359,6 +394,7 @@ def _correctness(
         "maximum_absolute_error": max(absolute, default=None),
         "maximum_relative_error": max(relative, default=None),
         "case_results": results,
+        "compile_probe_reused": compile_probe_reused,
     }
 
 
@@ -880,6 +916,7 @@ def _candidate_evaluation(
     settings: Mapping[str, Any],
     incumbent_entry: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
+    prepared_case: dict[str, Any] = {}
     compile_result = _candidate_stage(
         "compile",
         lambda: _compile(
@@ -889,6 +926,7 @@ def _candidate_evaluation(
             task,
             correctness_cases[:1],
             device,
+            prepared_case,
         ),
     )
     if not bool(compile_result["passed"]):
@@ -910,8 +948,10 @@ def _candidate_evaluation(
             task,
             correctness_cases,
             device,
+            prepared_case,
         ),
     )
+    prepared_case.clear()
     if not bool(correctness_result["passed"]):
         return {
             "passed": False,
@@ -952,6 +992,7 @@ def _candidate_evaluation(
 
 def _profile(
     torch: Any,
+    torch_npu: Any,
     entry: Callable[..., Any],
     task: TaskSpec,
     cases: Sequence[CaseSpec],
@@ -967,12 +1008,17 @@ def _profile(
         with _candidate_guard(torch):
             entry(*args)
     _sync(torch)
-    for _ in range(iterations):
-        with _candidate_guard(torch):
-            output = entry(*args)
+    stream = torch_npu.npu.current_stream()
+    range_id = torch_npu.npu.mstx.range_start("akg_candidate", stream)
+    try:
+        for _ in range(iterations):
+            with _candidate_guard(torch):
+                output = entry(*args)
+    finally:
+        torch_npu.npu.mstx.range_end(range_id)
     _sync(torch)
-    if not isinstance(output, torch.Tensor):
-        raise TypeError("custom_op did not return a Tensor")
+    if not _tensor_output(torch, output):
+        raise TypeError("custom_op did not return Tensor output(s)")
     if not _unchanged(torch, args, originals):
         raise RuntimeError("candidate modified an input Tensor during profiling")
     return {
@@ -980,6 +1026,7 @@ def _profile(
         "case_id": case.id,
         "warmup": warmup,
         "iterations": iterations,
+        "attribution_range": "akg_candidate",
     }
 
 
@@ -1132,7 +1179,7 @@ def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(settings_raw, Mapping):
         raise ValueError("stage settings must be an object")
     try:
-        torch, _torch_npu, triton = _runtime()
+        torch, torch_npu, triton = _runtime()
         device_index = int(device.removeprefix("npu:"))
         torch.npu.set_device(device_index)
     except BaseException as exc:
@@ -1166,7 +1213,9 @@ def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
             incumbent_entry,
         )
     elif stage == "profile":
-        details = _profile(torch, entry, task, cases, device, settings_raw)
+        details = _profile(
+            torch, torch_npu, entry, task, cases, device, settings_raw
+        )
     if bool(settings_raw.get("redact_case_details", False)):
         details = _redact_details(stage, details)
     return {

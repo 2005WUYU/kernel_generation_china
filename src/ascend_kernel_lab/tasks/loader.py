@@ -10,7 +10,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-_TASK_ID = re.compile(r"^k(0[1-9]|10)_[a-z0-9_]+$")
+_TASK_ID = re.compile(r"^k(?:0[1-9]|10|(?:0(?:0[1-9]|[1-9][0-9])|1(?:0[0-9]|1[0-2])))_[a-z0-9_]+$")
 _CASE_KINDS = frozenset({"correctness", "benchmark", "profile"})
 _DTYPES = frozenset({"float16", "bfloat16", "float32"})
 _DISTRIBUTIONS = frozenset({"normal", "near_zero", "large", "zeros", "repeated"})
@@ -25,6 +25,7 @@ _TRUSTED_TASK_FILES = (
     "reference.py",
     "task.yaml",
 )
+_CATALOG_FILE = "catalog_112.json"
 
 
 class TaskSpecError(ValueError):
@@ -194,6 +195,9 @@ class TaskSpec:
 
         if self.root is None:
             raise TaskSpecError("task bundle digest requires a registry-backed root")
+        catalog = self.root / _CATALOG_FILE
+        if catalog.is_file():
+            return hashlib.sha256(catalog.read_bytes()).hexdigest()
         digest = hashlib.sha256(b"ascend-task-bundle-v1\0")
         for name in _TRUSTED_TASK_FILES:
             path = self.root / name
@@ -247,14 +251,46 @@ class TaskRegistry:
     def ids(self) -> tuple[str, ...]:
         if not self.root.is_dir():
             return ()
-        return tuple(sorted(path.name for path in self.root.iterdir() if (path / "task.yaml").is_file()))
+        directory_ids = {
+            path.name for path in self.root.iterdir() if (path / "task.yaml").is_file()
+        }
+        catalog_path = self.root / _CATALOG_FILE
+        if catalog_path.is_file():
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            directory_ids.update(str(item["id"]) for item in catalog["tasks"])
+        return tuple(sorted(directory_ids))
 
     def load(self, task_id: str) -> TaskSpec:
         if not _TASK_ID.fullmatch(task_id):
             raise TaskSpecError(f"invalid task id: {task_id!r}")
         task_root = (self.root / task_id).resolve()
         if task_root.parent != self.root or not task_root.is_dir():
-            raise TaskSpecError(f"unknown task: {task_id}")
+            catalog_path = self.root / _CATALOG_FILE
+            if not catalog_path.is_file():
+                raise TaskSpecError(f"unknown task: {task_id}")
+            catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            item = next(
+                (value for value in catalog["tasks"] if value.get("id") == task_id),
+                None,
+            )
+            if item is None:
+                raise TaskSpecError(f"unknown task: {task_id}")
+            cases = tuple(CaseSpec.from_dict(value) for value in item["public_cases"])
+            return TaskSpec(
+                id=task_id,
+                version=int(item.get("version", 1)),
+                name=str(item["name"]),
+                description=str(item["description"]),
+                entry_point="custom_op",
+                inputs=tuple(item["inputs"]),
+                outputs=tuple(item["outputs"]),
+                semantics=dict(item["semantics"]),
+                correctness=dict(item["correctness"]),
+                benchmark=dict(item["benchmark"]),
+                restrictions=dict(item["restrictions"]),
+                public_cases=cases,
+                root=self.root,
+            )
         raw = _load_yaml(task_root / "task.yaml")
         allowed = {
             "id", "version", "name", "description", "entry_point", "inputs", "outputs",

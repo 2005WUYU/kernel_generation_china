@@ -31,7 +31,12 @@ SYSTEM_PROMPT = """你负责生成可在华为昇腾 Triton-Ascend 环境运行�
 14. 不要在候选源码中实现 cache、warmup、benchmark、计时、异常捕获或任何运行时探测; 这些由评测框架负责。
 15. Triton Kernel 名称必须是有效 Python 标识符; custom_op 是普通 Python host wrapper, 不能用 @triton.jit 装饰。
 16. 对每个公开用例, launch grid 的 program 总数(coreDim)必须小于等于 65535; 不要为每个元素或每行盲目启动一个 program, 应通过 BLOCK/tiling 让每个 program 处理多个元素。
-17. optimization_summary 必须在生成候选时同步概括 code 中实际采用的具体修改或初始实现选择; 不得留给评测系统事后推断, expected_effect 则单独写预期影响。
+17. changes 必须在生成候选时同步记录 code 中实际采用的具体修改或初始实现选择; 优化思路必须由你给出, 不得留给 evaluator 根据源码或结果事后猜测。
+18. 对优化原因进行严格证据分级。evidence.fact 只能来自用户提供的硬件信息、当前源码、编译错误、正确性结果、benchmark 或 profiler; evidence.source 必须指出对应字段路径, 源码事实使用 current_code。
+19. 无法由上述证据直接证明的性能原因必须写入 hypotheses, 使用 low/medium/high confidence 并引用 evidence_refs; 禁止把 hypothesis 写成 fact, 禁止对 hypothesis 使用确定口吻。
+20. 不得根据常见 GPU/NPU 经验补充未提供的硬件参数或硬件行为, 包括 UB 容量、原生 tile、缓存层级、流水线和调度行为。
+21. 所有定量结论必须显示计算依据; 对证据中已有数值可引用精确 source, 派生数值必须在文字中写出输入值和算式; 无法计算时不要给出数字。
+22. predictions 只能描述可由下一次 compile/correctness/benchmark/profiler 验证的指标方向, reason 必须引用 hypothesis[index]。
 """
 
 
@@ -86,6 +91,47 @@ SOURCE_CHECKER_CONTRACT: dict[str, Any] = {
         "tile multiple elements or rows per program instead of launching one program per element when the grid can reach 65536",
     ],
     "legal_structure_template": LEGAL_SOURCE_TEMPLATE,
+}
+
+
+EVIDENCE_PROTOCOL: dict[str, Any] = {
+    "response_layers": ["changes", "evidence", "hypotheses", "predictions"],
+    "source_reference": (
+        "Use a string path to the exact prompt field containing the fact; "
+        "use current_code for a fact directly visible in the candidate source."
+    ),
+    "direct_fact_source_paths": {
+        "user_hardware_facts": ["environment.<present compact leaf path>"],
+        "source_code": ["current_code"],
+        "baseline": ["baseline.<present field path>"],
+        "compile": [
+            "round_context.previous_round.key_metrics.compile.<present field path>",
+            "failed_candidate.raw_stage_result.<present field path>",
+            "best_candidate.metrics.compile.<present field path>",
+        ],
+        "correctness": [
+            "round_context.previous_round.key_metrics.correctness.<present field path>",
+            "failed_candidate.raw_stage_result.<present field path>",
+            "best_candidate.metrics.correctness.<present field path>",
+        ],
+        "benchmark": [
+            "round_context.previous_round.key_metrics.benchmark_vs_pytorch_eager.<present field path>",
+            "failed_candidate.candidate_metrics.benchmark_vs_pytorch_eager.<present field path>",
+            "best_candidate.metrics.benchmark_vs_pytorch_eager.<present field path>",
+        ],
+        "profiler": [
+            "round_context.previous_round.key_metrics.quick_profile.<present field path>",
+            "failed_candidate.candidate_metrics.quick_profile.<present field path>",
+            "best_candidate.metrics.quick_profile.<present field path>",
+        ],
+    },
+    "rules": [
+        "Only cite paths and values actually present in this prompt.",
+        "A missing, unknown, or null hardware value is not evidence for a hardware claim.",
+        "Do not promote an inference from benchmark or profiler data into evidence.fact.",
+        "Put every inferred performance mechanism in hypotheses and link it with evidence_refs.",
+        "For a derived number, include the source input values and arithmetic in fact or claim.",
+    ],
 }
 
 
@@ -227,7 +273,7 @@ class PromptBuilder:
         self,
         *,
         system_prompt: str = SYSTEM_PROMPT,
-        protocol_version: str = "ascend_kernel_generation_v1",
+        protocol_version: str = "ascend_kernel_generation_v2",
     ) -> None:
         if not system_prompt.strip() or not protocol_version.strip():
             raise ValueError("system_prompt and protocol_version must not be empty")
@@ -278,6 +324,7 @@ class PromptBuilder:
             "environment": _prompt_environment(environment),
             "baseline": baseline,
             "source_checker_contract": SOURCE_CHECKER_CONTRACT,
+            "evidence_protocol": EVIDENCE_PROTOCOL,
             "round_context": {
                 "round": 1,
                 "maximum_rounds": maximum_rounds,
@@ -388,6 +435,7 @@ class PromptBuilder:
             "environment": _prompt_environment(environment or {}),
             "baseline": baseline or {},
             "source_checker_contract": SOURCE_CHECKER_CONTRACT,
+            "evidence_protocol": EVIDENCE_PROTOCOL,
             "round_context": round_context,
             "feedback_state": feedback_state or {},
             "best_candidate": best_candidate,

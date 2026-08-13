@@ -613,9 +613,29 @@ def custom_op(x):
     return {
         "status": "candidate",
         "round": round_number,
-        "optimization_summary": ["deterministic offline pipeline candidate"],
-        "expected_effect": ["exercise every recoverable controller checkpoint"],
-        "assumptions": ["FakeBackend is used; no hardware result is claimed"],
+        "changes": [
+            {"target": "BLOCK_SIZE", "before": None, "after": 256}
+        ],
+        "evidence": [
+            {
+                "fact": "The candidate code processes 256 adjacent elements per program",
+                "source": "current_code",
+            }
+        ],
+        "hypotheses": [
+            {
+                "claim": "The blocked copy should exercise the offline pipeline candidate path",
+                "confidence": "high",
+                "evidence_refs": [0],
+            }
+        ],
+        "predictions": [
+            {
+                "metric": "correctness.passed",
+                "expected_direction": "increase",
+                "reason": "hypothesis[0]",
+            }
+        ],
         "code": source,
     }
 

@@ -209,6 +209,36 @@ class AscendTritonBackend(Backend):
         return attempt, work, env
 
     @staticmethod
+    def _seed_triton_cache(
+        artifact_dir: Path,
+        work: Path,
+        predecessor_stages: Sequence[str],
+    ) -> str | None:
+        requested = Path(artifact_dir).resolve()
+        worker_jobs = requested.parent.parent
+        for stage_name in predecessor_stages:
+            sources = (
+                tuple(
+                    worker_jobs.glob(
+                        f"*/attempt_*/published/{stage_name}*/triton-cache"
+                    )
+                )
+                if worker_jobs.name == "worker_jobs"
+                else tuple(
+                    (requested / "published").glob(
+                        f"{stage_name}*/triton-cache"
+                    )
+                )
+            )
+            if sources:
+                source = max(sources, key=lambda path: path.stat().st_mtime_ns)
+                shutil.copytree(
+                    source, work / "triton-cache", dirs_exist_ok=True
+                )
+                return str(source)
+        return None
+
+    @staticmethod
     def _payload(
         stage_name: str,
         task: TaskSpec,
@@ -574,6 +604,13 @@ class AscendTritonBackend(Backend):
             attempt, work, env = self._prepare(
                 artifact_dir, stage_name, candidate_path, incumbent_path
             )
+            cache_predecessors = {
+                "correctness": ("compile",),
+                "benchmark": ("correctness", "compile"),
+            }.get(stage_name, ())
+            cache_seed = self._seed_triton_cache(
+                artifact_dir, work, cache_predecessors
+            )
             if compile_debug:
                 env.update({"TRITON_DEBUG": "1", "TRITON_ALWAYS_COMPILE": "1"})
             private_cases = bool(cases) and all(
@@ -608,7 +645,7 @@ class AscendTritonBackend(Backend):
                     env=env,
                     timeout_seconds=timeout_seconds,
                 )
-            return self._process_result(
+            result = self._process_result(
                 stage,
                 stage_name,
                 started,
@@ -616,6 +653,18 @@ class AscendTritonBackend(Backend):
                 attempt,
                 work,
                 private_cases=private_cases,
+            )
+            if cache_seed is None:
+                return result
+            return StageResult(
+                stage=result.stage,
+                status=result.status,
+                started_at=result.started_at,
+                finished_at=result.finished_at,
+                details={**result.details, "triton_cache_seeded_from": cache_seed},
+                artifacts=result.artifacts,
+                error=result.error,
+                retryable=result.retryable,
             )
         except DeviceLockTimeout as exc:
             return StageResult.infrastructure_error(
@@ -856,6 +905,11 @@ class AscendTritonBackend(Backend):
                 candidate_kernel_pattern(name) for name in kernel_names
             )
             attempt, work, env = self._prepare(artifact_dir, "profile", candidate_path)
+            cache_seed = self._seed_triton_cache(
+                artifact_dir,
+                work,
+                ("candidate_evaluation", "benchmark", "correctness", "compile"),
+            )
             private_cases = bool(cases) and all(
                 case.id.startswith("hidden_") for case in cases
             )
@@ -928,7 +982,12 @@ class AscendTritonBackend(Backend):
                 output_root=raw_root,
                 python_executable=self.python_executable,
                 script=driver,
-                kernel_name=kernel_names[0],
+                kernel_name=None,
+                extra_args=(
+                    "--mstx=on",
+                    "--mstx-include=akg_candidate",
+                    f"--launch-count={profile_iterations}",
+                ),
             )
             with self._lock():
                 run = self.runner.run(
@@ -1019,6 +1078,10 @@ class AscendTritonBackend(Backend):
             summary_dict["collection_warmup"] = profile_warmup
             summary_dict["collection_iterations"] = profile_iterations
             summary_dict["collection_duration_seconds"] = run.duration_seconds
+            summary_dict["attribution_method"] = (
+                "mstx_candidate_range_then_exact_source_match"
+            )
+            summary_dict["declared_candidate_kernels"] = list(kernel_names)
             missing_groups = self._missing_profile_groups(
                 summary_dict, mandatory_groups
             )
@@ -1040,6 +1103,7 @@ class AscendTritonBackend(Backend):
                 "mandatory_groups": list(mandatory_groups),
                 "requested_groups": list(requested_groups),
                 "missing_mandatory_groups": list(missing_groups),
+                "triton_cache_seeded_from": cache_seed,
             }
             if not summary.profile_available or missing_groups:
                 return StageResult(

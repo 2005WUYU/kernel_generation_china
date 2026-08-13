@@ -526,6 +526,9 @@ class QueueEvaluationBackend(Backend):
             incumbent_relative=incumbent_relative,
             incumbent_sha256=incumbent_sha256,
         )
+        maximum_attempts = (
+            1 if stage is EvaluationStage.PROFILE else self.maximum_job_attempts
+        )
         request_identity = {
             "protocol_version": JOB_PROTOCOL_VERSION,
             "namespace": self.idempotency_namespace,
@@ -536,7 +539,7 @@ class QueueEvaluationBackend(Backend):
             "stage": stage.value,
             "payload": payload,
             "priority": self.priority,
-            "maximum_job_attempts": self.maximum_job_attempts,
+            "maximum_job_attempts": maximum_attempts,
         }
         digest = hashlib.sha256(
             canonical_json_dumps(request_identity).encode("utf-8")
@@ -550,7 +553,7 @@ class QueueEvaluationBackend(Backend):
             stage=stage,
             payload=payload,
             priority=self.priority,
-            max_attempts=self.maximum_job_attempts,
+            max_attempts=maximum_attempts,
             available_at=_READY_AT,
             idempotency_key=f"akg-eval-v1:{digest}",
         )

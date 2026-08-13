@@ -1,0 +1,219 @@
+experiment:
+  id: exp_910c_deepseek_112_v1
+  # Each task receives exactly five model generations. Failed candidates consume
+  # one of those five slots instead of opening a separate repair budget.
+  maximum_repair_rounds: 0
+  rounds_per_task: 5
+  task_concurrency: 112
+  model_request_concurrency: 16
+  tasks:
+    - k001_vector_add
+    - k002_vector_sub
+    - k003_elementwise_mul
+    - k004_elementwise_div
+    - k005_square
+    - k006_reciprocal
+    - k007_exp
+    - k008_log
+    - k009_relu
+    - k010_sigmoid
+    - k011_tanh
+    - k012_gelu
+    - k013_silu
+    - k014_leaky_relu
+    - k015_clamp
+    - k016_add_plus_relu
+    - k017_bias_add
+    - k018_bias_plus_gelu
+    - k019_bias_plus_silu
+    - k020_affine
+    - k021_where
+    - k022_masked_fill
+    - k023_elementwise_maximum
+    - k024_addcmul
+    - k025_row_sum
+    - k026_column_sum
+    - k027_row_mean
+    - k028_row_max
+    - k029_row_min
+    - k030_argmax
+    - k031_argmin
+    - k032_l2_norm
+    - k033_variance
+    - k034_logsumexp
+    - k035_softmax
+    - k036_logsoftmax
+    - k037_scaled_softmax
+    - k038_masked_softmax
+    - k039_causal_softmax
+    - k040_scale_plus_mask_plus_softmax
+    - k041_rmsnorm
+    - k042_layernorm
+    - k043_groupnorm
+    - k044_l2_normalize
+    - k045_batchnorm_inference
+    - k046_residual_plus_rmsnorm
+    - k047_residual_plus_layernorm
+    - k048_rmsnorm_plus_scale
+    - k049_matrix_transpose
+    - k050_batched_transpose
+    - k051_strided_copy
+    - k052_transposed_to_contiguous
+    - k053_slice_copy
+    - k054_concatenate_two_tensors
+    - k055_padding
+    - k056_flip
+    - k057_index_select
+    - k058_gather
+    - k059_take_along_dim
+    - k060_scatter
+    - k061_scatter_add
+    - k062_index_add
+    - k063_embedding_lookup
+    - k064_embedding_bag_sum
+    - k065_cumulative_sum
+    - k066_cumulative_max
+    - k067_prefix_sum
+    - k068_row_sort
+    - k069_argsort
+    - k070_top_k_values
+    - k071_top_k_values_plus_indices
+    - k072_top_k_plus_softmax
+    - k073_gemm_nn
+    - k074_gemm_nt
+    - k075_gemm_tn
+    - k076_gemm_tt
+    - k077_small_m_gemm
+    - k078_small_n_gemm
+    - k079_large_k_gemm
+    - k080_batched_gemm
+    - k081_gemm_plus_bias
+    - k082_gemm_plus_relu
+    - k083_gemm_plus_gelu
+    - k084_gemm_plus_silu
+    - k085_gemm_plus_bias_plus_gelu
+    - k086_gemm_plus_bias_plus_silu
+    - k087_gemm_plus_residual
+    - k088_gemm_plus_bias_plus_residual
+    - k089_swiglu
+    - k090_geglu
+    - k091_rope_neox_layout
+    - k092_rope_interleaved_layout
+    - k093_qkv_split
+    - k094_qkv_split_plus_rope
+    - k095_kv_cache_write
+    - k096_kv_cache_gather
+    - k097_qk_attention_score
+    - k098_scaled_qk
+    - k099_qk_plus_mask
+    - k100_qk_plus_causal_mask
+    - k101_attention_probability_x_v
+    - k102_full_attention_forward
+    - k103_causal_attention_forward
+    - k104_gqa_decode_attention
+    - k105_router_softmax
+    - k106_router_top_k
+    - k107_router_top_k_plus_softmax
+    - k108_expert_token_count
+    - k109_token_to_expert_permute
+    - k110_expert_to_token_unpermute
+    - k111_expert_weighted_sum
+    - k112_fused_moe_routing_plus_permute
+
+model:
+  provider: claude_cli
+  model: deepseek-v4-pro
+  reasoning_effort: high
+  structured_output: true
+  request_timeout_seconds: 1800
+  claude_capability_timeout_seconds: 15
+  maximum_request_bytes: 4194304
+  maximum_response_bytes: 4194304
+  maximum_error_bytes: 65536
+  maximum_format_repair_retries: 0
+  claude_executable: claude
+  claude_extra_args: []
+  anthropic_base_url_env: ANTHROPIC_BASE_URL
+  anthropic_auth_token_env: ANTHROPIC_AUTH_TOKEN
+  anthropic_model_env: ANTHROPIC_MODEL
+  retry:
+    maximum_attempts: 4
+    initial_backoff_seconds: 1
+    maximum_backoff_seconds: 20
+    maximum_retry_after_seconds: 120
+    multiplier: 2
+    jitter_fraction: 0.1
+
+worker:
+  device: npu:0
+  exclusive_device: true
+  fresh_process_per_stage: false
+  heartbeat_seconds: 10
+  lease_seconds: 120
+  poll_seconds: 1
+  maximum_job_attempts: 2
+
+timeouts:
+  source_check_seconds: 10
+  compile_seconds: 180
+  correctness_case_seconds: 30
+  benchmark_seconds: 180
+  profile_seconds: 180
+
+benchmark:
+  comparison_baseline: pytorch_eager
+  search_warmup: 5
+  search_measurement_batches: 3
+  search_target_batch_time_ms: 40
+  search_rerun_if_unstable: false
+  warmup: 20
+  measurement_batches: 7
+  target_batch_time_ms: 200
+  maximum_cv: 0.05
+  rerun_if_unstable: true
+
+profile:
+  mode: quick
+  run_after_correctness: true
+  run_for_final_best: true
+  search_profile_budget_per_task: 2
+  warmup: 1
+  iterations: 1
+  mandatory_groups:
+    - task_time
+    - pipe_utilization
+  optional_groups: []
+  full_profile_for_final_best: false
+
+storage:
+  database: sqlite:///runs/metadata.db
+  artifact_root: runs
+  task_root: task_specs
+
+security:
+  allowed_import_roots:
+    - torch
+    - triton
+  forbidden_import_roots:
+    - ctypes
+    - http
+    - multiprocessing
+    - os
+    - pathlib
+    - requests
+    - shutil
+    - socket
+    - subprocess
+    - urllib
+  forbidden_call_prefixes:
+    - torch.matmul
+    - torch.mm
+    - torch.bmm
+    - torch.softmax
+    - torch.sum
+    - torch.nn
+    - torch.nn.functional
+    - torch.compile
+    - torch.ops
+  maximum_source_bytes: 262144
+  required_entrypoint: custom_op
