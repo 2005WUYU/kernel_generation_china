@@ -109,6 +109,10 @@ Controller 文件填写 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、
 任何 `ANTHROPIC_`、`KIMI_`、`OPENAI_` 或 `AIPING_` 变量，也不要 source 宿主 CANN。
 环境文件必须是普通文件且权限为 `0600` 或 `0400`。
 
+冷启动 SFT 调度不改变这条模型通路：仍使用 AIPing Anthropic-compatible 端点、
+`model.provider: claude_cli` 和当前 DeepSeek thinking/reasoning 行为，不切换 provider，
+也不关闭或改写 thinking 设置。
+
 两个容器使用不同的专用数字 UID，并加入同一个共享数字 GID 来写 SQLite、WAL 和
 artifact。把远端 `runs/` 设为共享组、setgid、other 无权限；启动前分别用两个镜像执行
 一次文件创建/读取探针。不要对候选 attempt 私有目录递归放宽权限。
@@ -164,7 +168,14 @@ done
 
 `start-workers` 为八张物理卡各启动一个 Worker；每个容器内部仍使用 `npu:0`。Controller
 把十个任务并发提交到 SQLite durable queue，NPU 阶段由八个 Worker 自然限流到最多八路并行，
-同一任务的五轮保持顺序。
+同一任务的各轮保持顺序。每个任务先进行最多 3 轮 Repair，直到得到同时通过
+source check、compile 和 correctness 的 seed Kernel；seed 轮不计入随后的
+5 轮 Optimization。公开评测有效的候选若被归类为 host-bound，Optimization
+可提前结束，然后仍按正常流程选择公开最佳并只评测一个最终候选。
+
+后续 Prompt 只保留固定任务描述和约束、当前候选代码、上一轮紧凑的关键指标/
+失败原因/下一轮建议，以及历史的短成绩表；不重复携带完整 evaluation、
+全量日志或 profiler 原始内容。
 
 Worker 启动会强制验证：没有模型变量、隐藏 seed 合法、只暴露一张 NPU、
 `torch.npu.is_available()` 为真、clean Git clone。它使用 `--runtime=ascend`、
@@ -174,7 +185,8 @@ Worker 启动会强制验证：没有模型变量、隐藏 seed 合法、只暴�
 `probe` 会执行真实 Triton JIT、NPU feature smoke、计时和 profiler 能力探测；
 `baseline` 会对配置中的全部任务生成环境绑定的 PyTorch eager NPU 基线；不再测
 `torch.compile` 或官方/手写实现。实验轨迹用于冷启动 SFT，不设置硬加速目标，benchmark
-只报告候选相对 PyTorch eager 的耗时与 speedup。任何一步非零退出都停止。
+报告候选相对 PyTorch eager 的耗时与 speedup，并直接记录 device latency、
+end-to-end latency、host overhead 和 bottleneck 类型。任何一步非零退出都停止。
 `probe` 使用可执行的临时 Triton cache、验证子进程恰好只能看到一张 NPU，并要求所有必需
 feature、计时方法和 profiler 指标通过；固定输出目录必须为空，避免旧 profiler 数据混入。
 维护期间若项目 Worker 正在运行会直接拒绝。
@@ -189,6 +201,13 @@ fi
 profile 使用 quick 模式，只做一次 warmup、一次采集，保留 task time、pipe utilization、
 kernel 数和候选 kernel coverage 等短时间可取信息，不运行 full profile。
 
+轨迹导出时，默认 `akg export sft` 只保留公开评测有效的
+`initial_correct_candidate`、`successful_repair` 和 `high_quality_optimization` 三类样本；
+失败、性能回退、host-bound 和后续无提升样本不进入默认 SFT 集。
+`akg export sft --all-samples` 导出全量样本并保留每条质量分类标签。
+RL 导出同样保留全量样本和标签，便于将 source failure、性能回退、host-bound、
+后续无提升与高质量优化区分处理。
+
 检查 `runs/probe/` 和 baseline 证据后，再按验收指南完成板端验收。八个 Worker 状态都变成
 `healthy` 后运行：
 
@@ -197,7 +216,7 @@ kernel 数和候选 kernel coverage 等短时间可取信息，不运行 full pr
 ./scripts/watch-experiment-910c.sh "$AKG_EXPERIMENT_ID"
 ```
 
-观察脚本在前台每五秒采样，只在状态变化时打印十个任务的五轮进度、八个 Worker 健康数和
+观察脚本在前台每五秒采样，只在状态变化时打印十个任务的分阶段轮次进度、八个 Worker 健康数和
 当前模型请求数；SSH 断开只会终止观察脚本，重新登录后执行同一条命令即可继续观察，容器内
 实验不受影响。
 

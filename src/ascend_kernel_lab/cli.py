@@ -908,8 +908,16 @@ def _cmd_export(args: argparse.Namespace) -> int:
     root = Path(args.experiment_root).expanduser().resolve()
     if args.export_kind == "sft":
         output = Path(args.output or root / "exports/sft.jsonl")
-        count = DatasetExporter(root).export_sft(output, main_only=not args.all_samples)
-        report = {"schema_version": "ascend_export_result_v1", "kind": "sft", "rows": count, "output": str(output.resolve())}
+        exporter = DatasetExporter(root)
+        count = exporter.export_sft(output, main_only=not args.all_samples)
+        report = {
+            "schema_version": "ascend_export_result_v1",
+            "kind": "sft",
+            "rows": count,
+            "output": str(output.resolve()),
+            "selection": "all_samples" if args.all_samples else "curated",
+            "trajectory_quality_summary": exporter.quality_summary(),
+        }
     elif args.export_kind == "rl":
         output = Path(args.output or root / "exports/rl.jsonl")
         count = DatasetExporter(root).export_rl(output)
@@ -917,12 +925,15 @@ def _cmd_export(args: argparse.Namespace) -> int:
     else:
         output = Path(args.output or root / "exports/report.json")
         markdown = Path(args.markdown or root / "exports/report.md")
-        ReportExporter(root).write(output, markdown)
+        experiment_report = ReportExporter(root).write(output, markdown)
         report = {
             "schema_version": "ascend_export_result_v1",
             "kind": "report",
             "output": str(output.resolve()),
             "markdown": str(markdown.resolve()),
+            "trajectory_quality_summary": experiment_report[
+                "trajectory_quality_summary"
+            ],
         }
     _print_json(report)
     return 0
@@ -1087,7 +1098,11 @@ def build_parser() -> argparse.ArgumentParser:
     sft = export_commands.add_parser("sft", help="export curated supervised trajectories")
     sft.add_argument("--experiment-root", required=True)
     sft.add_argument("-o", "--output")
-    sft.add_argument("--all-samples", action="store_true")
+    sft.add_argument(
+        "--all-samples",
+        action="store_true",
+        help="include failed, regressed, host-bound, and other non-curated rounds with labels",
+    )
     sft.set_defaults(handler=_cmd_export)
     rl = export_commands.add_parser("rl", help="export all RL transitions")
     rl.add_argument("--experiment-root", required=True)

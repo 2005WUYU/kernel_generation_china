@@ -189,15 +189,50 @@ class PromptTests(unittest.TestCase):
         followup_payload = json.loads(followup.user_prompt)
         self.assertNotIn("DO_NOT_LEAK", followup.user_prompt)
         self.assertEqual(
-            followup_payload["round_context"]["last_candidate_code"],
+            followup_payload["round_context"]["current_candidate"]["code"],
             "def custom_op(x):\n    return x\n",
         )
         self.assertNotIn("environment", followup_payload)
         self.assertNotIn("baseline", followup_payload)
-        self.assertNotIn("task_contract", followup_payload)
-        self.assertNotIn("history_summary", followup_payload["round_context"])
+        self.assertIn("source_checker_contract", followup_payload)
+        self.assertIn("legal_structure_template", followup_payload["source_checker_contract"])
+        self.assertEqual(followup_payload["task_contract"], {})
+        self.assertEqual(followup_payload["round_context"]["history_summary"], [])
         self.assertNotIn("best_candidate", followup.user_prompt)
         self.assertNotIn("last_evaluation", followup.user_prompt)
+
+    def test_repair_followup_is_bounded_and_phase_aware(self) -> None:
+        request = PromptBuilder().build_follow_up(
+            round_number=3,
+            maximum_rounds=8,
+            phase="repair",
+            phase_index=3,
+            optimization_rounds=5,
+            maximum_repair_rounds=3,
+            task_contract={"task_id": "k01", "description": "add"},
+            candidate_round=2,
+            candidate_role="latest_repair_candidate",
+            last_candidate_code="def custom_op(x):\n    return x\n",
+            key_metrics={"source": {"status": "fail"}},
+            failure_reasons=["source[forbidden_call]: getattr is forbidden"],
+            next_round_suggestions=["remove getattr"],
+            history_summary=[
+                {"round": 1, "status": "source_failed"},
+                {"round": 2, "status": "source_failed"},
+            ],
+        )
+        payload = json.loads(request.user_prompt)
+        self.assertEqual(payload["phase"]["name"], "repair")
+        self.assertEqual(payload["phase"]["index"], 3)
+        self.assertEqual(request.metadata["phase"], "repair")
+        self.assertGreater(request.metadata["user_prompt_utf8_bytes"], 0)
+        self.assertGreater(request.metadata["system_prompt_utf8_bytes"], 0)
+        self.assertEqual(
+            payload["round_context"]["current_candidate"]["round"], 2
+        )
+        self.assertEqual(len(payload["round_context"]["history_summary"]), 2)
+        self.assertNotIn("environment", payload)
+        self.assertNotIn("baseline", payload)
 
 
 class ProviderSafetyTests(unittest.TestCase):

@@ -285,6 +285,7 @@ class ExperimentConfig:
     storage: StorageConfig
     security: SecurityConfig = field(default_factory=SecurityConfig)
     task_concurrency: int = 1
+    maximum_repair_rounds: int = 0
     config_path: Path = field(default=Path("<memory>"), repr=False, compare=False)
     project_root: Path = field(default_factory=Path.cwd, repr=False, compare=False)
 
@@ -292,6 +293,11 @@ class ExperimentConfig:
         _nonempty("experiment.id", self.id)
         _positive("rounds_per_task", self.rounds_per_task)
         _positive("task_concurrency", self.task_concurrency)
+        if (
+            type(self.maximum_repair_rounds) is not int
+            or self.maximum_repair_rounds < 0
+        ):
+            raise ValueError("maximum_repair_rounds must be a non-negative integer")
         if not self.tasks:
             raise ValueError("experiment.tasks must not be empty")
         if len(set(self.tasks)) != len(self.tasks):

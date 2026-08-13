@@ -1,5 +1,8 @@
 experiment:
   id: exp_910c_deepseek_v4_pro_cold_sft_v1
+  # Repair rounds establish a source/compile/correctness-passing seed and do
+  # not consume the five optimization rounds below.
+  maximum_repair_rounds: 3
   rounds_per_task: 5
   task_concurrency: 10
   tasks:

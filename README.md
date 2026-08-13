@@ -1,7 +1,7 @@
 # Ascend Kernel Lab
 
 Ascend Kernel Lab 是面向华为 Ascend 910C 与 Triton-Ascend 的完整 Kernel 生成、评测和
-五轮优化流水线。模型只返回完整候选源码；Prompt、状态推进、编译、正确性、计时、
+分阶段优化流水线。模型只返回完整候选源码；Prompt、状态推进、编译、正确性、计时、
 `msprof`、历史最佳选择、隐藏评测和训练数据导出全部由本地程序控制。冷启动 SFT 采集配置
 使用 DeepSeek V4 Pro；轨迹不设硬加速目标，性能只与 PyTorch eager NPU 比较。
 
@@ -26,10 +26,10 @@ Ascend Kernel Lab 是面向华为 Ascend 910C 与 Triton-Ascend 的完整 Kernel
 
 ## 设计边界
 
-- 控制端持有模型凭据，构建 Prompt、调用模型、推进每个任务五轮并选择历史最佳。十个任务可同时请求模型；同一任务的五轮保持顺序，后续轮只携带候选代码、关键指标、失败原因和下一轮建议。
+- 控制端持有模型凭据，构建 Prompt、调用模型、分阶段推进每个任务并选择历史最佳。十个任务可同时请求模型；同一任务内的各轮保持顺序。
 - Worker 不加载模型凭据。八个 Worker 各独占一张 NPU，并在全新、受限的子进程中执行每个评测阶段；NPU 阶段并行上限为八。
 - 候选必须通过 AST 策略、真实 JIT 编译和公开正确性，才会进入 benchmark；profiler 使用独立进程，避免污染计时。
-- 五轮只能看到公开用例。隐藏用例从部署端私有 seed 生成，只在最终候选上运行，失败后不使用隐藏集挑选其他轮次。
+- Repair 与 Optimization 轮次只能看到公开用例。隐藏用例从部署端私有 seed 生成，只在最终候选上运行，失败后不使用隐藏集挑选其他轮次。
 - SQLite 保存权威状态和事件；artifact 使用临时文件、`fsync` 与原子 rename 提交。进程中断后从最后一个已提交状态恢复。
 - 每张卡同时只允许一个候选运行。首版不依赖 Redis 或 PostgreSQL。
 
@@ -42,7 +42,7 @@ configs/                       实验、profiler 与源码安全策略
 task_specs/                    十个版本化 Kernel 任务
 src/ascend_kernel_lab/
   backend/ascend/              真实 Triton-Ascend 执行后端
-  orchestration/               五轮控制器、baseline、结构化反馈
+  orchestration/               分阶段控制器、baseline、结构化反馈
   worker/                      独立阶段子进程、资源限制、设备锁与健康检查
   probe/                       环境、能力、计时与 profiler 探测
   profiling/                   msprof 调用和跨版本字段归一化
@@ -159,6 +159,10 @@ DeepSeek 与旧的 Kimi 配置都使用 `model.provider: claude_cli`。Claude CL
 - 临时 HOME、临时工作目录和独立配置目录；
 - API/传输失败采用有界退避重试，格式修复次数独立受限。
 
+本轮冷启动 SFT 只改变控制器的 Prompt 内容和轮次调度：DeepSeek 仍使用上述
+`claude_cli` provider、AIPing Anthropic-compatible 端点和现有 thinking 行为，不切换
+provider，也不关闭或改写 thinking/reasoning 设置。
+
 先按 AIPing 租户提供的信息准备控制端专用环境文件。不要把真实值写入仓库或命令历史：
 
 ```dotenv
@@ -262,7 +266,7 @@ akg worker run -c configs/experiment_910c_deepseek_v4_pro.yaml --once
 
 Worker 入口脚本会在启动前拒绝常见模型密钥变量。每个阶段还有独立子进程、清理后的环境、超时、输出上限、进程组终止、私有临时目录、设备独占锁和健康检查。
 
-### 5. 启动或恢复五轮实验
+### 5. 启动或恢复 Repair + Optimization 实验
 
 控制端 shell 必须有 AIPing 凭据和 `AKG_HIDDEN_SEED`：
 
@@ -271,8 +275,18 @@ akg experiment run -c configs/experiment_910c_deepseek_v4_pro.yaml
 ```
 
 生产默认使用持久 SQLite 队列：controller 以 `task_concurrency: 10` 同时推进十个任务，
-八个独立 Worker 领取、执行和提交 NPU 阶段，五轮在各自任务内部顺序迭代。必须先启动上一节的
+八个独立 Worker 领取、执行和提交 NPU 阶段，同一任务的轮次依然按顺序迭代。必须先启动上一节的
 八个 Worker；不要给生产 controller 加 `--direct` 或 `--with-local-worker`。
+
+每个任务先进入 Repair 阶段，最多请求 3 轮，直到得到同时通过
+source check、compile 和 correctness 的 seed Kernel。seed 所在轮属于 Repair，
+不计入后续 5 轮 Optimization。修复成功后才开始计算这 5 轮性能优化；
+若公开评测有效的候选被识别为 host-bound，Optimization 可以提前停止，
+随后仍按正常流程选择公开最佳并只对最终候选执行隐藏评测。
+
+首轮 Prompt 提供任务与环境起点。后续 Prompt 只保留固定任务描述和约束、
+当前候选代码、上一轮的紧凑关键指标/失败原因/下一轮建议，以及历史轮次的
+短成绩表；不再重复追加完整 evaluation、全量日志或 profiler 原始内容。
 
 只跑指定任务：
 
@@ -299,7 +313,11 @@ akg experiment status \
   --experiment-id <same-safe-id>
 ```
 
-传输失败不会消耗优化轮；结构化输出经有限修复仍失败时，才记录为该轮模型失败。相同源码会复用已提交评测。第五轮不覆盖历史最佳。
+传输失败不会消耗业务轮次；结构化输出经有限修复仍失败时，才记录为该轮模型失败。相同源码会复用已提交评测。最后一轮不覆盖历史最佳。
+
+benchmark 在与 PyTorch eager NPU 对比的同时，直接记录 device latency、
+end-to-end latency、host overhead 和 bottleneck 类型。独立 profiler 仍采用
+quick 模式只收集短时间内可取的 kernel 执行与归属信息，不改为 full profiling。
 
 ### 6. 独立评测候选
 
@@ -318,9 +336,14 @@ akg evaluate \
 akg verify-run --experiment-root runs/exp_910c_deepseek_v4_pro_cold_sft_v1
 
 akg export sft \
-  --all-samples \
   --experiment-root runs/exp_910c_deepseek_v4_pro_cold_sft_v1 \
   -o runs/exports/exp_910c_deepseek_v4_pro_cold_sft_v1.sft.jsonl
+
+# 可选：导出全部轮次，包含失败和回退样本，每条保留质量标签
+akg export sft \
+  --all-samples \
+  --experiment-root runs/exp_910c_deepseek_v4_pro_cold_sft_v1 \
+  -o runs/exports/exp_910c_deepseek_v4_pro_cold_sft_v1.sft.all.jsonl
 
 akg export rl \
   --experiment-root runs/exp_910c_deepseek_v4_pro_cold_sft_v1 \
@@ -331,9 +354,12 @@ akg export report \
   -o runs/exports/exp_910c_deepseek_v4_pro_cold_sft_v1.report.json
 ```
 
-导出器只读取已提交 artifact，并拒绝疑似凭据、hidden seed 或隐藏 case 细节。冷启动 SFT
-使用 `akg export sft --all-samples` 导出五轮轨迹，不以达到某个 speedup 作为采集前提；
-RL 轨迹明确记录最终采用的轮次。
+导出器只读取已提交 artifact，并拒绝疑似凭据、hidden seed 或隐藏 case 细节。
+默认 `akg export sft` 只导出公开评测有效的 `initial_correct_candidate`、
+`successful_repair` 和 `high_quality_optimization` 三类样本；失败、性能回退、
+host-bound 和后续无提升样本不进入默认 SFT 集。
+`akg export sft --all-samples` 才导出所有轮次，并为 source failure、性能回退等样本保留质量分类标签。
+RL 导出始终保留全量轮次及其质量标签，并明确记录最终采用的轮次。
 
 ## Artifact 结构
 

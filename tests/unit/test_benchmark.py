@@ -4,7 +4,10 @@ import math
 import unittest
 
 from ascend_kernel_lab.evaluation.benchmark import (
+    bottleneck_summary,
+    classify_bottleneck,
     speedup_summary,
+    summarize_latency_breakdown,
     summarize_samples,
     weighted_geometric_mean,
 )
@@ -36,6 +39,49 @@ class BenchmarkLogicTests(unittest.TestCase):
             summarize_samples([])
         with self.assertRaises(ValueError):
             weighted_geometric_mean([1.0, 0.0])
+
+    def test_latency_breakdown_identifies_host_dispatch(self) -> None:
+        result = summarize_latency_breakdown(
+            [
+                {"device_latency_us": 2.0, "end_to_end_latency_us": 12.0},
+                {"device_latency_us": 2.2, "end_to_end_latency_us": 11.0},
+                {"device_latency_us": 1.8, "end_to_end_latency_us": 13.0},
+            ]
+        )
+
+        self.assertEqual(result["device_latency_us"], 2.0)
+        self.assertEqual(result["end_to_end_latency_us"], 12.0)
+        self.assertEqual(result["host_overhead_us"], 10.0)
+        self.assertEqual(result["bottleneck_type"], "host_dispatch")
+        self.assertEqual(
+            classify_bottleneck(
+                device_latency_us=8.0,
+                end_to_end_latency_us=10.0,
+            ),
+            "device_execution",
+        )
+
+    def test_bottleneck_summary_requires_clear_case_majority(self) -> None:
+        result = bottleneck_summary(
+            [
+                {
+                    "weight": 3.0,
+                    "candidate": {
+                        "latency_breakdown": {"bottleneck_type": "host_dispatch"}
+                    },
+                },
+                {
+                    "weight": 1.0,
+                    "candidate": {
+                        "latency_breakdown": {"bottleneck_type": "device_execution"}
+                    },
+                },
+            ]
+        )
+
+        self.assertEqual(result["bottleneck_type"], "host_dispatch")
+        self.assertTrue(result["host_dispatch_limited"])
+        self.assertEqual(result["host_dispatch_case_weight_fraction"], 0.75)
 
 
 if __name__ == "__main__":

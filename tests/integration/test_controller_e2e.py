@@ -94,15 +94,15 @@ class ControllerIntegrationTests(unittest.TestCase):
             self.assertEqual(summaries[0].best_round, 2)
             self.assertEqual(len(gateway.requests), 3)
             follow_up = json.loads(gateway.requests[1].user_prompt)
-            self.assertIn("last_candidate_code", follow_up["round_context"])
+            self.assertIn("current_candidate", follow_up["round_context"])
             self.assertNotIn("environment", follow_up)
             self.assertNotIn("baseline", follow_up)
             self.assertNotIn("best_candidate", follow_up["round_context"])
             self.assertNotIn("last_evaluation", follow_up["round_context"])
-            self.assertNotIn("task_contract", follow_up)
+            self.assertIn("task_contract", follow_up)
             self.assertNotIn("collection_strategy", follow_up)
             self.assertNotIn("objective", follow_up)
-            self.assertNotIn("history_summary", follow_up["round_context"])
+            self.assertEqual(len(follow_up["round_context"]["history_summary"]), 1)
             self.assertNotIn("measurement_attempts", gateway.requests[1].user_prompt)
             for round_number in range(1, 4):
                 round_record = store.get_round(
@@ -150,7 +150,10 @@ class ControllerIntegrationTests(unittest.TestCase):
                 registry=TaskRegistry(config.task_root),
                 model_gateway=gateway,
                 backend=backend,
-                environment={},
+                environment={
+                    "schema_version": "ascend_fake_environment_v1",
+                    "notice": "offline phase verification",
+                },
                 hidden_seed=77,
                 allow_insecure_hidden_seed_for_testing=True,
             )
@@ -198,6 +201,165 @@ class ControllerIntegrationTests(unittest.TestCase):
             resumed = controller.run()
             self.assertEqual(resumed[0].status, "passed")
             self.assertEqual(len(gateway.requests), 1)
+
+    def test_repair_seed_does_not_consume_optimization_rounds(self) -> None:
+        backend = FakeBackend(
+            {
+                EvaluationStage.SOURCE_CHECK: [
+                    StageResult.failure(
+                        EvaluationStage.SOURCE_CHECK,
+                        details={
+                            "findings": [
+                                {
+                                    "code": "forbidden_call",
+                                    "message": "getattr is forbidden",
+                                }
+                            ]
+                        },
+                    ),
+                    StageResult.success(
+                        EvaluationStage.SOURCE_CHECK,
+                        details={"passed": True, "syntax_ok": True},
+                    ),
+                ]
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                self._config(root, rounds=2),
+                maximum_repair_rounds=3,
+            )
+            gateway = FakeGateway(
+                lambda request: candidate(int(request.metadata["round"]))
+            )
+            store = SQLiteStateStore(config.db_path)
+            controller = ExperimentController(
+                config=config,
+                store=store,
+                artifacts=AtomicArtifactStore(config.artifact_root),
+                registry=TaskRegistry(config.task_root),
+                model_gateway=gateway,
+                backend=backend,
+                environment={
+                    "schema_version": "ascend_fake_environment_v1",
+                    "notice": "offline phase verification",
+                },
+                hidden_seed=12345,
+                allow_insecure_hidden_seed_for_testing=True,
+            )
+
+            summary = controller.run()[0]
+
+            self.assertEqual(summary.final_result["repair_rounds"], 2)
+            self.assertEqual(summary.final_result["optimization_rounds"], 2)
+            self.assertEqual(len(gateway.requests), 4)
+            self.assertEqual(
+                [request.metadata["phase"] for request in gateway.requests],
+                ["repair", "repair", "optimization", "optimization"],
+            )
+            second = json.loads(gateway.requests[1].user_prompt)
+            self.assertIn("source[forbidden_call]", repr(second))
+            third = json.loads(gateway.requests[2].user_prompt)
+            self.assertEqual(third["phase"]["index"], 1)
+            self.assertEqual(
+                third["round_context"]["current_candidate"]["role"],
+                "best_public_candidate",
+            )
+            verification = RunVerifier(
+                controller.experiment_root, database_path=config.db_path
+            ).verify()
+            self.assertTrue(verification["passed"], verification["issues"])
+
+    def test_repair_exhaustion_finishes_without_optimization(self) -> None:
+        backend = FakeBackend(
+            {
+                EvaluationStage.SOURCE_CHECK: [
+                    StageResult.failure(EvaluationStage.SOURCE_CHECK)
+                    for _ in range(3)
+                ]
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                self._config(root, rounds=5), maximum_repair_rounds=3
+            )
+            gateway = FakeGateway(
+                lambda request: candidate(int(request.metadata["round"]))
+            )
+            store = SQLiteStateStore(config.db_path)
+            controller = ExperimentController(
+                config=config,
+                store=store,
+                artifacts=AtomicArtifactStore(config.artifact_root),
+                registry=TaskRegistry(config.task_root),
+                model_gateway=gateway,
+                backend=backend,
+                environment={},
+                hidden_seed=12345,
+                allow_insecure_hidden_seed_for_testing=True,
+            )
+
+            summary = controller.run()[0]
+
+            self.assertEqual(summary.status, "repair_exhausted")
+            self.assertEqual(summary.final_result["repair_rounds"], 3)
+            self.assertEqual(summary.final_result["optimization_rounds"], 0)
+            self.assertEqual(len(gateway.requests), 3)
+            verification = RunVerifier(
+                controller.experiment_root, database_path=config.db_path
+            ).verify()
+            self.assertTrue(verification["passed"], verification["issues"])
+
+    def test_host_dispatch_seed_stops_before_optimization_model_call(self) -> None:
+        host_bound = StageResult.success(
+            EvaluationStage.BENCHMARK,
+            details={
+                "status": "stable",
+                "per_case": [],
+                "geomean_speedup_vs_eager": 0.9,
+                "minimum_speedup_vs_eager": 0.8,
+                "bottleneck_type": "host_dispatch",
+                "host_dispatch_limited": True,
+                "bottleneck": {
+                    "bottleneck_type": "host_dispatch",
+                    "host_dispatch_limited": True,
+                },
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                self._config(root, rounds=5), maximum_repair_rounds=3
+            )
+            gateway = FakeGateway(
+                lambda request: candidate(int(request.metadata["round"]))
+            )
+            store = SQLiteStateStore(config.db_path)
+            controller = ExperimentController(
+                config=config,
+                store=store,
+                artifacts=AtomicArtifactStore(config.artifact_root),
+                registry=TaskRegistry(config.task_root),
+                model_gateway=gateway,
+                backend=FakeBackend(
+                    {EvaluationStage.BENCHMARK: [host_bound]}
+                ),
+                environment={},
+                hidden_seed=12345,
+                allow_insecure_hidden_seed_for_testing=True,
+            )
+
+            summary = controller.run()[0]
+
+            self.assertEqual(len(gateway.requests), 1)
+            self.assertEqual(summary.final_result["repair_rounds"], 1)
+            self.assertEqual(summary.final_result["optimization_rounds"], 0)
+            self.assertEqual(
+                summary.final_result["termination_reason"],
+                "host_dispatch_limited",
+            )
 
     def test_complete_ten_task_five_round_offline_pipeline(self) -> None:
         """Exercise the production state graph at its full configured cardinality."""

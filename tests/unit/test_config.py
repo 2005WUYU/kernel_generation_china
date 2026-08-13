@@ -24,6 +24,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.model.provider, "claude_cli")
         self.assertEqual(config.model.model, "deepseek-v4-pro")
         self.assertEqual(config.rounds_per_task, 5)
+        self.assertEqual(config.maximum_repair_rounds, 3)
         self.assertEqual(config.task_concurrency, 10)
         self.assertEqual(len(config.tasks), 10)
         self.assertEqual(config.benchmark.comparison_baseline, "pytorch_eager")

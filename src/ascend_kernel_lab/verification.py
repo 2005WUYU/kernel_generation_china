@@ -282,6 +282,13 @@ class RunVerifier:
             if isinstance(expected_rounds, int) and expected_rounds > 0
             else None
         )
+        maximum_repair_rounds = manifest.get("maximum_repair_rounds", 0)
+        maximum_repair_rounds = (
+            int(maximum_repair_rounds)
+            if isinstance(maximum_repair_rounds, int)
+            and maximum_repair_rounds >= 0
+            else 0
+        )
         tasks = {str(row["task_id"]): row for row in task_rows}
         if sorted(tasks) != sorted(expected_tasks):
             self._add(
@@ -305,14 +312,80 @@ class RunVerifier:
                     f"task {task_id} has durable state {state!r}",
                 )
             durable_rounds = rounds_by_task.get(task_id, [])
-            if rounds_per_task is not None and (
-                len(durable_rounds) != rounds_per_task
-                or int(row["current_round"]) != rounds_per_task
-            ):
+            final_path = self.root / "tasks" / task_id / "final_result.json"
+            final = _json(final_path)
+            actual_rounds = len(durable_rounds)
+            expected_actual = (
+                int(final.get("repair_rounds", 0))
+                + int(final.get("optimization_rounds", 0))
+                if isinstance(final, Mapping)
+                else None
+            )
+            repair_actual = (
+                int(final.get("repair_rounds", 0))
+                if isinstance(final, Mapping)
+                else None
+            )
+            optimization_actual = (
+                int(final.get("optimization_rounds", 0))
+                if isinstance(final, Mapping)
+                else None
+            )
+            final_status = str(final.get("status", "")) if isinstance(final, Mapping) else ""
+            termination_reason = (
+                str(final.get("termination_reason", ""))
+                if isinstance(final, Mapping)
+                else ""
+            )
+            fixed_protocol = maximum_repair_rounds == 0
+            invalid_round_count = (
+                rounds_per_task is not None
+                and (
+                    int(row["current_round"]) != actual_rounds
+                    or (
+                        fixed_protocol
+                        and actual_rounds != rounds_per_task
+                    )
+                    or (
+                        not fixed_protocol
+                        and (
+                            actual_rounds < 1
+                            or actual_rounds
+                            > rounds_per_task + maximum_repair_rounds
+                            or expected_actual != actual_rounds
+                            or repair_actual is None
+                            or repair_actual < 1
+                            or repair_actual > maximum_repair_rounds
+                            or optimization_actual is None
+                            or optimization_actual < 0
+                            or optimization_actual > rounds_per_task
+                            or (
+                                final_status == "repair_exhausted"
+                                and (
+                                    repair_actual != maximum_repair_rounds
+                                    or optimization_actual != 0
+                                )
+                            )
+                            or (
+                                final_status != "repair_exhausted"
+                                and termination_reason
+                                == "optimization_round_budget_completed"
+                                and optimization_actual != rounds_per_task
+                            )
+                            or (
+                                final_status != "repair_exhausted"
+                                and optimization_actual < rounds_per_task
+                                and termination_reason != "host_dispatch_limited"
+                            )
+                        )
+                    )
+                )
+            )
+            if invalid_round_count:
                 self._add(
                     "error",
                     "durable_round_count_mismatch",
-                    f"task {task_id} did not durably finish {rounds_per_task} rounds",
+                    f"task {task_id} has an invalid dynamic repair/optimization round count",
                 )
             if any(str(round_row["state"]) != "ROUND_FINISHED" for round_row in durable_rounds):
                 self._add(
@@ -320,8 +393,6 @@ class RunVerifier:
                     "round_not_finished",
                     f"task {task_id} contains a non-terminal durable round",
                 )
-            final_path = self.root / "tasks" / task_id / "final_result.json"
-            final = _json(final_path)
             if final is None:
                 continue
             final_passed = str(final.get("status", "")).lower().startswith("passed")
@@ -453,6 +524,7 @@ class RunVerifier:
         manifest = experiment.get("experiment")
         configured_tasks: list[str] = []
         expected_rounds: int | None = None
+        maximum_repair_rounds = 0
         if isinstance(manifest, dict):
             tasks = manifest.get("tasks")
             if isinstance(tasks, list) and all(isinstance(item, str) for item in tasks):
@@ -460,6 +532,9 @@ class RunVerifier:
             rounds = manifest.get("rounds_per_task")
             if isinstance(rounds, int) and rounds > 0:
                 expected_rounds = rounds
+            repair_rounds = manifest.get("maximum_repair_rounds", 0)
+            if isinstance(repair_rounds, int) and repair_rounds >= 0:
+                maximum_repair_rounds = repair_rounds
         tasks_root = self.root / "tasks"
         if not tasks_root.is_dir() or tasks_root.is_symlink():
             self._add("error", "tasks_root_missing", "run has no safe tasks directory", tasks_root)
@@ -474,11 +549,76 @@ class RunVerifier:
                 self._add("error", "task_artifacts_missing", f"task {task_id} is missing", task_root)
                 continue
             rounds = sorted(task_root.glob("round_[0-9][0-9]"))
-            if expected_rounds is not None and len(rounds) != expected_rounds:
+            final = _json(task_root / "final_result.json")
+            actual_expected = (
+                int(final.get("repair_rounds", 0))
+                + int(final.get("optimization_rounds", 0))
+                if isinstance(final, Mapping)
+                else None
+            )
+            repair_actual = (
+                int(final.get("repair_rounds", 0))
+                if isinstance(final, Mapping)
+                else None
+            )
+            optimization_actual = (
+                int(final.get("optimization_rounds", 0))
+                if isinstance(final, Mapping)
+                else None
+            )
+            final_status = str(final.get("status", "")) if isinstance(final, Mapping) else ""
+            termination_reason = (
+                str(final.get("termination_reason", ""))
+                if isinstance(final, Mapping)
+                else ""
+            )
+            invalid_count = (
+                expected_rounds is not None
+                and (
+                    (
+                        maximum_repair_rounds == 0
+                        and len(rounds) != expected_rounds
+                    )
+                    or (
+                        maximum_repair_rounds > 0
+                        and (
+                            len(rounds) < 1
+                            or len(rounds)
+                            > expected_rounds + maximum_repair_rounds
+                            or actual_expected != len(rounds)
+                            or repair_actual is None
+                            or repair_actual < 1
+                            or repair_actual > maximum_repair_rounds
+                            or optimization_actual is None
+                            or optimization_actual < 0
+                            or optimization_actual > expected_rounds
+                            or (
+                                final_status == "repair_exhausted"
+                                and (
+                                    repair_actual != maximum_repair_rounds
+                                    or optimization_actual != 0
+                                )
+                            )
+                            or (
+                                final_status != "repair_exhausted"
+                                and termination_reason
+                                == "optimization_round_budget_completed"
+                                and optimization_actual != expected_rounds
+                            )
+                            or (
+                                final_status != "repair_exhausted"
+                                and optimization_actual < expected_rounds
+                                and termination_reason != "host_dispatch_limited"
+                            )
+                        )
+                    )
+                )
+            )
+            if invalid_count:
                 self._add(
                     "error",
                     "incomplete_round_set",
-                    f"task has {len(rounds)} rounds; expected {expected_rounds}",
+                    "task has an invalid repair/optimization round set",
                     task_root,
                 )
             for round_root in rounds:
@@ -490,11 +630,11 @@ class RunVerifier:
                     "feedback.json",
                 ):
                     self._check_formal_file(round_root / name, name)
-            final = task_root / "final_result.json"
-            if final.is_file() and not final.is_symlink():
-                value = _json(final)
+            final_path = task_root / "final_result.json"
+            if final_path.is_file() and not final_path.is_symlink():
+                value = _json(final_path)
                 if value is None:
-                    self._add("error", "final_result_invalid", "final result is not a JSON object", final)
+                    self._add("error", "final_result_invalid", "final result is not a JSON object", final_path)
                 elif value.get("best_round") is not None:
                     best_round = int(value["best_round"])
                     selected = task_root / f"round_{best_round:02d}" / "candidate.py"
@@ -510,7 +650,7 @@ class RunVerifier:
                     "error",
                     "final_result_missing",
                     "completed task has no final_result.json",
-                    final,
+                    final_path,
                 )
 
     def _verify_filesystem_hygiene(self) -> None:

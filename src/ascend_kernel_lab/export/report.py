@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .datasets import ExportError, assert_export_clean
+from .datasets import DatasetExporter, ExportError, assert_export_clean
 
 
 class ReportExporter:
@@ -83,11 +83,16 @@ class ReportExporter:
             "task_count": len(tasks),
             "passed_task_count": passed,
             "tasks": tasks,
+            "trajectory_quality_summary": DatasetExporter(
+                self.root
+            ).quality_summary(),
             "environment": environment,
             "baseline": self._read(self.root / "baseline_snapshot.json"),
         }
 
-    def write(self, json_path: Path | str, markdown_path: Path | str | None = None) -> None:
+    def write(
+        self, json_path: Path | str, markdown_path: Path | str | None = None
+    ) -> dict[str, Any]:
         report = self.build()
         self._atomic(Path(json_path), json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
         if markdown_path is not None:
@@ -107,7 +112,23 @@ class ReportExporter:
                     f"{public_best.get('geomean_speedup_vs_eager', '-')} | "
                     f"{public_best.get('candidate_kernel_coverage', '-')} |"
                 )
+            quality = report["trajectory_quality_summary"]
+            lines.extend(
+                [
+                    "",
+                    "## Trajectory quality",
+                    "",
+                    f"Default SFT rows: {quality['default_sft_row_count']} / "
+                    f"{quality['round_count']}",
+                    "",
+                    "| Quality class | Rounds |",
+                    "| --- | ---: |",
+                ]
+            )
+            for label, count in quality["counts"].items():
+                lines.append(f"| {label} | {count} |")
             self._atomic(Path(markdown_path), "\n".join(lines) + "\n")
+        return report
 
     @staticmethod
     def _atomic(path: Path, text: str) -> None:

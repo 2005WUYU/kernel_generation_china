@@ -23,7 +23,9 @@ from types import ModuleType
 from typing import Any
 
 from ascend_kernel_lab.evaluation.benchmark import (
+    bottleneck_summary,
     speedup_summary,
+    summarize_latency_breakdown,
     summarize_samples,
 )
 from ascend_kernel_lab.tasks import CaseSpec, TaskSpec
@@ -360,6 +362,7 @@ def _measure_batch(
     repeats: int,
     *,
     observe_output: Callable[[Any], None] | None = None,
+    timing_sink: list[dict[str, Any]] | None = None,
 ) -> float:
     if repeats < 1:
         raise ValueError("measurement repeats must be positive")
@@ -368,11 +371,13 @@ def _measure_batch(
         try:
             start = event_type(enable_timing=True)
             end = event_type(enable_timing=True)
+            wall_started = time.perf_counter_ns()
             start.record()
             for _ in range(repeats):
                 output = function()
             end.record()
             _sync(torch)
+            wall_elapsed_us = (time.perf_counter_ns() - wall_started) / 1000.0 / repeats
             elapsed_ms = float(start.elapsed_time(end))
         except (AttributeError, RuntimeError, TypeError, ValueError):
             _sync(torch)
@@ -380,7 +385,17 @@ def _measure_batch(
             if math.isfinite(elapsed_ms) and elapsed_ms > 0:
                 if observe_output is not None:
                     observe_output(output)
-                return elapsed_ms * 1000.0 / repeats
+                device_latency_us = elapsed_ms * 1000.0 / repeats
+                if timing_sink is not None:
+                    timing_sink.append(
+                        {
+                            "device_latency_us": device_latency_us,
+                            "end_to_end_latency_us": max(
+                                wall_elapsed_us, device_latency_us
+                            ),
+                        }
+                    )
+                return device_latency_us
     _sync(torch)
     started = time.perf_counter_ns()
     for _ in range(repeats):
@@ -389,6 +404,13 @@ def _measure_batch(
     elapsed_us = (time.perf_counter_ns() - started) / 1000.0 / repeats
     if observe_output is not None:
         observe_output(output)
+    if timing_sink is not None:
+        timing_sink.append(
+            {
+                "device_latency_us": None,
+                "end_to_end_latency_us": elapsed_us,
+            }
+        )
     return elapsed_us
 
 
@@ -402,7 +424,9 @@ def _measurement_session(
     candidate_context: Callable[[], contextlib.AbstractContextManager[None]],
     observe_candidate_output: Callable[[Any], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
-    def measure_candidate(repeats: int) -> float:
+    def measure_candidate(
+        repeats: int, *, timing_sink: list[dict[str, Any]] | None = None
+    ) -> float:
         last_output: Any = None
 
         def tracked_candidate() -> Any:
@@ -411,15 +435,17 @@ def _measurement_session(
             return last_output
 
         with candidate_context():
-            latency = _measure_batch(torch, tracked_candidate, repeats)
+            latency = _measure_batch(
+                torch,
+                tracked_candidate,
+                repeats,
+                timing_sink=timing_sink,
+            )
         if observe_candidate_output is not None:
             observe_candidate_output(last_output)
         return latency
 
-    candidate_once = max(
-        measure_candidate(1),
-        1e-3,
-    )
+    candidate_once = max(measure_candidate(1), 1e-3)
     baseline_once = max(_measure_batch(torch, baseline, 1), 1e-3)
     repeats = max(
         1,
@@ -430,18 +456,42 @@ def _measurement_session(
     )
     candidate_samples: list[float] = []
     baseline_samples: list[float] = []
+    candidate_batch_timings: list[dict[str, Any]] = []
+    baseline_batch_timings: list[dict[str, Any]] = []
     for batch in range(batches):
         if batch % 2 == 0:
-            baseline_samples.append(_measure_batch(torch, baseline, repeats))
-            candidate_samples.append(measure_candidate(repeats))
+            baseline_samples.append(
+                _measure_batch(
+                    torch,
+                    baseline,
+                    repeats,
+                    timing_sink=baseline_batch_timings,
+                )
+            )
+            candidate_samples.append(
+                measure_candidate(repeats, timing_sink=candidate_batch_timings)
+            )
         else:
-            candidate_samples.append(measure_candidate(repeats))
-            baseline_samples.append(_measure_batch(torch, baseline, repeats))
-    return (
-        summarize_samples(candidate_samples).to_dict(),
-        summarize_samples(baseline_samples).to_dict(),
-        repeats,
+            candidate_samples.append(
+                measure_candidate(repeats, timing_sink=candidate_batch_timings)
+            )
+            baseline_samples.append(
+                _measure_batch(
+                    torch,
+                    baseline,
+                    repeats,
+                    timing_sink=baseline_batch_timings,
+                )
+            )
+    candidate_statistics = summarize_samples(candidate_samples).to_dict()
+    candidate_statistics["latency_breakdown"] = summarize_latency_breakdown(
+        candidate_batch_timings
     )
+    baseline_statistics = summarize_samples(baseline_samples).to_dict()
+    baseline_statistics["latency_breakdown"] = summarize_latency_breakdown(
+        baseline_batch_timings
+    )
+    return candidate_statistics, baseline_statistics, repeats
 
 
 def _benchmark(
@@ -557,9 +607,22 @@ def _benchmark(
                 "measurement_attempts": attempts,
                 "repeats_per_batch": repeats,
                 "timed_output_validation": True,
+                "device_latency_us": candidate_stats["latency_breakdown"][
+                    "device_latency_us"
+                ],
+                "end_to_end_latency_us": candidate_stats["latency_breakdown"][
+                    "end_to_end_latency_us"
+                ],
+                "host_overhead_us": candidate_stats["latency_breakdown"][
+                    "host_overhead_us"
+                ],
+                "bottleneck_type": candidate_stats["latency_breakdown"][
+                    "bottleneck_type"
+                ],
             }
         )
     summary = speedup_summary(per_case)
+    bottleneck = bottleneck_summary(per_case)
     stable = all(bool(item["stable"]) for item in per_case)
     observed_cvs = [
         max(float(item["candidate"]["cv"]), float(item["baseline_eager"]["cv"]))
@@ -570,6 +633,9 @@ def _benchmark(
         "status": "stable" if stable else "unstable",
         "per_case": per_case,
         "maximum_cv": max(observed_cvs, default=0.0),
+        "bottleneck": bottleneck,
+        "bottleneck_type": bottleneck["bottleneck_type"],
+        "host_dispatch_limited": bottleneck["host_dispatch_limited"],
         **summary,
     }
 
@@ -710,6 +776,8 @@ def _redact_details(stage: str, details: Mapping[str, Any]) -> dict[str, Any]:
             "minimum_speedup_vs_eager": details.get("minimum_speedup_vs_eager"),
             "maximum_speedup_vs_eager": details.get("maximum_speedup_vs_eager"),
             "maximum_cv": details.get("maximum_cv"),
+            "bottleneck_type": details.get("bottleneck_type"),
+            "host_dispatch_limited": details.get("host_dispatch_limited"),
             "measured_case_count": len(details.get("per_case", ())),
             "case_details_redacted": True,
         }

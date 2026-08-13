@@ -74,6 +74,17 @@ stage_label = {
     "PROFILE": "PROFILE",
 }
 latest = {}
+maximum_rounds = 5
+manifest_path = run_root / "experiment.json"
+if manifest_path.is_file():
+    try:
+        manifest_document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = manifest_document.get("experiment", {})
+        optimization_rounds = int(manifest.get("rounds_per_task", 5))
+        repair_rounds = int(manifest.get("maximum_repair_rounds", 0))
+        maximum_rounds = optimization_rounds + repair_rounds
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        maximum_rounds = 5
 
 if database_path.is_file():
     connection = sqlite3.connect(
@@ -152,11 +163,36 @@ def queue_stage(task_id, round_number):
 
 for task_id in task_ids:
     fields = [task_id]
-    for round_number in range(1, 6):
+    final_path = run_root / "tasks" / task_id / "final_result.json"
+    final_rounds = None
+    if final_path.is_file():
+        try:
+            final_value = json.loads(final_path.read_text(encoding="utf-8"))
+            final_rounds = int(final_value.get("repair_rounds", 0)) + int(
+                final_value.get("optimization_rounds", 0)
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            final_rounds = None
+    for round_number in range(1, maximum_rounds + 1):
         round_root = (
             run_root / "tasks" / task_id / f"round_{round_number:02d}"
         )
-        if (
+        phase = ""
+        prompt_path = round_root / "prompt.json"
+        if prompt_path.is_file():
+            try:
+                prompt = json.loads(prompt_path.read_text(encoding="utf-8"))
+                metadata = prompt.get("metadata", {})
+                phase_name = metadata.get("phase")
+                phase_index = metadata.get("phase_index")
+                if phase_name in {"repair", "optimization"}:
+                    short = "REP" if phase_name == "repair" else "OPT"
+                    phase = f"[{short}{phase_index}]"
+            except (OSError, json.JSONDecodeError):
+                pass
+        if final_rounds is not None and round_number > final_rounds:
+            stage = "未运行(预算未用或早停)"
+        elif (
             (round_root / "feedback.json").is_file()
             or (round_root / "evaluation_result.json").is_file()
         ):
@@ -165,11 +201,11 @@ for task_id in task_ids:
             stage = queue_stage(task_id, round_number)
         elif (round_root / "model_response.json").is_file():
             stage = "模型已返回"
-        elif (round_root / "prompt.json").is_file():
+        elif prompt_path.is_file():
             stage = "等待模型"
         else:
             stage = "未开始"
-        fields.append(f"R{round_number:02d}={stage}")
+        fields.append(f"R{round_number:02d}{phase}={stage}")
     print(" ".join(fields))
 PY
 }

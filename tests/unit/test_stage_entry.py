@@ -109,6 +109,7 @@ class StageEntryTimingTests(unittest.TestCase):
     def test_measurement_observes_last_materialized_output_outside_timer(self) -> None:
         calls = 0
         observed: list[Any] = []
+        timing: list[dict[str, Any]] = []
 
         def function() -> int:
             nonlocal calls
@@ -120,11 +121,15 @@ class StageEntryTimingTests(unittest.TestCase):
             function,
             4,
             observe_output=observed.append,
+            timing_sink=timing,
         )
 
         self.assertGreater(latency, 0)
         self.assertEqual(calls, 4)
         self.assertEqual(observed, [4])
+        self.assertEqual(len(timing), 1)
+        self.assertIsNone(timing[0]["device_latency_us"])
+        self.assertGreater(timing[0]["end_to_end_latency_us"], 0)
 
     def test_measurement_rejects_zero_repeats(self) -> None:
         with self.assertRaisesRegex(ValueError, "repeats"):
@@ -167,7 +172,7 @@ class StageEntryTimingTests(unittest.TestCase):
             self.assertFalse(active)
             observations += 1
 
-        _measurement_session(
+        candidate_stats, baseline_stats, _repeats = _measurement_session(
             _TorchWithEvents(),
             candidate,
             baseline,
@@ -182,6 +187,18 @@ class StageEntryTimingTests(unittest.TestCase):
         self.assertEqual(candidate_calls, 5)
         self.assertEqual(baseline_calls, 5)
         self.assertEqual(observations, entries)
+        self.assertEqual(
+            candidate_stats["latency_breakdown"]["bottleneck_type"],
+            "device_execution",
+        )
+        self.assertEqual(
+            candidate_stats["latency_breakdown"]["sample_count"], 2
+        )
+        self.assertEqual(
+            candidate_stats["latency_breakdown"]["method"],
+            "calibrated_batch_latency_breakdown_v1",
+        )
+        self.assertIn("latency_breakdown", baseline_stats)
 
 
 if __name__ == "__main__":

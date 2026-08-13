@@ -359,11 +359,173 @@ class ExperimentController:
             task_record = self.store.transition_task(self.experiment_id, task.id, TaskState.ROUNDS_RUNNING)
         if task_record.state in {TaskState.TASK_FINISHED, TaskState.TASK_FAILED}:
             return self._run_final(task)
-        for round_number in range(1, self.config.rounds_per_task + 1):
-            # Finished rounds are replayed read-only to verify/repair any
-            # filesystem-first artifact registration left by a crash.
-            self._run_round(task, round_number)
+
+        # ``maximum_repair_rounds == 0`` preserves the original fixed-round
+        # protocol for existing configurations.  A positive repair budget
+        # changes the semantics deliberately: repair rounds continue only
+        # until the first source/compile/correctness-passing seed, then five
+        # (or the configured count of) optimization rounds start at index 1.
+        # Round numbers remain consecutive, so crash recovery and queue
+        # idempotency do not need placeholder/skipped rounds.
+        if self.config.maximum_repair_rounds == 0:
+            for round_number in range(1, self.config.rounds_per_task + 1):
+                self._run_round(
+                    task,
+                    round_number,
+                    phase="optimization",
+                    phase_index=round_number,
+                )
+            return self._run_final(task)
+
+        round_number = 1
+        repair_count = 0
+        seed_round: int | None = None
+        while repair_count < self.config.maximum_repair_rounds:
+            self._run_round(
+                task,
+                round_number,
+                phase="repair",
+                phase_index=repair_count + 1,
+            )
+            repair_count += 1
+            evaluation = self._round_evaluation(task, round_number)
+            if self._repair_seed_ready(evaluation):
+                seed_round = round_number
+                break
+            round_number += 1
+
+        if seed_round is None:
+            return self._finish_repair_exhausted(task, repair_count)
+
+        optimization_count = 0
+        round_number = seed_round + 1
+        while optimization_count < self.config.rounds_per_task:
+            # A completed repair seed or optimization round may prove that the
+            # immutable launch path dominates end-to-end latency.  In that
+            # case another Kernel-body model call would add no useful signal.
+            if self._optimization_stop_recommended(
+                task, round_number - 1
+            ):
+                break
+            self._run_round(
+                task,
+                round_number,
+                phase="optimization",
+                phase_index=optimization_count + 1,
+            )
+            optimization_count += 1
+            round_number += 1
         return self._run_final(task)
+
+    def _trajectory_counts(self, task: TaskSpec) -> tuple[int, int]:
+        repair = 0
+        optimization = 0
+        task_record = self.store.get_task(self.experiment_id, task.id)
+        maximum = task_record.current_round if task_record is not None else 0
+        for round_number in range(1, maximum + 1):
+            evaluation_path = self._artifact_path(
+                task.id, round_number, "evaluation_result.json"
+            )
+            if not evaluation_path.is_file():
+                continue
+            phase = _read_json(evaluation_path).get("trajectory_phase")
+            if phase == "repair":
+                repair += 1
+            elif phase == "optimization":
+                optimization += 1
+        return repair, optimization
+
+    def _trajectory_termination_reason(self, task: TaskSpec) -> str:
+        _repair_rounds, optimization_rounds = self._trajectory_counts(task)
+        if optimization_rounds >= self.config.rounds_per_task:
+            return "optimization_round_budget_completed"
+        task_record = self.store.get_task(self.experiment_id, task.id)
+        if task_record is None or task_record.current_round < 1:
+            return "optimization_round_budget_completed"
+        if self._optimization_stop_recommended(task, task_record.current_round):
+            return "host_dispatch_limited"
+        return "optimization_round_budget_completed"
+
+    def _round_evaluation(
+        self, task: TaskSpec, round_number: int
+    ) -> dict[str, Any]:
+        path = self._artifact_path(task.id, round_number, "evaluation_result.json")
+        if not path.is_file():
+            raise ControllerError(
+                f"finished round {round_number} is missing evaluation_result.json"
+            )
+        return _read_json(path)
+
+    @staticmethod
+    def _repair_seed_ready(evaluation: Mapping[str, Any]) -> bool:
+        return all(
+            _passed_stage(evaluation.get(stage))
+            for stage in ("source", "compile", "correctness")
+        )
+
+    def _optimization_stop_recommended(
+        self, task: TaskSpec, round_number: int
+    ) -> bool:
+        evaluation = self._round_evaluation(task, round_number)
+        feedback_path = self._artifact_path(task.id, round_number, "feedback.json")
+        feedback = _read_json(feedback_path) if feedback_path.is_file() else {}
+        if feedback.get("stop_recommended") is not True:
+            return False
+        benchmark = evaluation.get("benchmark")
+        if not isinstance(benchmark, Mapping):
+            return False
+        score = evaluation.get("score")
+        if not isinstance(score, Mapping) or not all(
+            score.get(key) is True
+            for key in (
+                "compile_passed",
+                "correctness_passed",
+                "anti_bypass_passed",
+            )
+        ):
+            return False
+        if (
+            score.get("geomean_speedup") is None
+            or score.get("minimum_speedup") is None
+            or not _passed_stage(benchmark)
+            or str(benchmark.get("status", "")).lower() not in {"pass", "stable"}
+        ):
+            return False
+        bottleneck = benchmark.get("bottleneck")
+        return bool(
+            benchmark.get("host_dispatch_limited") is True
+            or (
+                isinstance(bottleneck, Mapping)
+                and bottleneck.get("host_dispatch_limited") is True
+            )
+        )
+
+    def _finish_repair_exhausted(
+        self, task: TaskSpec, repair_count: int
+    ) -> TaskRunSummary:
+        final = {
+            "schema_version": "ascend_final_result_v1",
+            "experiment_id": self.experiment_id,
+            "task_id": task.id,
+            "status": "repair_exhausted",
+            "best_round": None,
+            "best_candidate_id": None,
+            "repair_rounds": repair_count,
+            "optimization_rounds": 0,
+            "termination_reason": "repair_exhausted",
+            "reason": "no source/compile/correctness-passing seed within repair budget",
+        }
+        self._commit_json(
+            self._relative(task.id, name="final_result.json"),
+            final,
+            task_id=task.id,
+        )
+        task_record = self.store.get_task(self.experiment_id, task.id)
+        if task_record is not None and task_record.state is TaskState.ROUNDS_RUNNING:
+            self.store.transition_task(
+                self.experiment_id, task.id, TaskState.TASK_FAILED
+            )
+        return TaskRunSummary(task.id, str(final["status"]), None, None, final)
 
     @staticmethod
     def _follow_up_metrics(evaluation: Mapping[str, Any]) -> dict[str, Any]:
@@ -408,6 +570,12 @@ class ExperimentController:
                         ),
                         "speedup_vs_pytorch_eager": value.get("speedup_vs_eager"),
                         "stable": value.get("stable"),
+                        "device_latency_us": value.get("device_latency_us"),
+                        "end_to_end_latency_us": value.get(
+                            "end_to_end_latency_us"
+                        ),
+                        "host_overhead_us": value.get("host_overhead_us"),
+                        "bottleneck_type": value.get("bottleneck_type"),
                     })
             benchmark_summary = {
                 **(stage_status("benchmark") or {}),
@@ -418,6 +586,11 @@ class ExperimentController:
                     "minimum_speedup_vs_eager"
                 ),
                 "maximum_cv": benchmark.get("maximum_cv"),
+                "bottleneck": benchmark.get("bottleneck"),
+                "bottleneck_type": benchmark.get("bottleneck_type"),
+                "host_dispatch_limited": benchmark.get(
+                    "host_dispatch_limited"
+                ),
                 "cases": cases,
             }
 
@@ -446,9 +619,20 @@ class ExperimentController:
                 "total_device_execution_us": scheduling.get(
                     "total_device_execution_us"
                 ),
-                "pipeline_utilization": dict(pipeline),
-                "memory": dict(memory),
-                "observations": summary.get("observations", []),
+                "host_overhead_us": scheduling.get(
+                    "host_overhead_us", scheduling.get("host_enqueue_us")
+                ),
+                "pipeline_utilization": {
+                    str(key): value
+                    for key, value in list(pipeline.items())[:8]
+                },
+                "memory": {
+                    str(key): value for key, value in list(memory.items())[:4]
+                },
+                "observations": list(summary.get("observations", []))[:3]
+                if isinstance(summary.get("observations"), Sequence)
+                and not isinstance(summary.get("observations"), (str, bytes))
+                else [],
             }
 
         return {
@@ -475,6 +659,19 @@ class ExperimentController:
             error = stage.get("error")
             if isinstance(error, Mapping) and error.get("message"):
                 reasons.append(f"{stage_name}: {error['message']}")
+            if stage_name == "source":
+                findings = stage.get("findings")
+                details = stage.get("details")
+                if findings is None and isinstance(details, Mapping):
+                    findings = details.get("findings")
+                if isinstance(findings, Sequence) and not isinstance(
+                    findings, (str, bytes)
+                ):
+                    for finding in findings[:8]:
+                        if isinstance(finding, Mapping):
+                            code = finding.get("code", "source_check")
+                            message = finding.get("message", "rejected")
+                            reasons.append(f"source[{code}]: {message}")
         focus = feedback.get("next_round_requirement")
         if len(reasons) == 1 and isinstance(focus, Mapping):
             suggestions = focus.get("focus")
@@ -516,12 +713,100 @@ class ExperimentController:
             "evaluation": _read_json(evaluation_path) if evaluation_path.is_file() else {},
         }
 
-    def _build_prompt(self, task: TaskSpec, round_number: int) -> ModelRequest:
+    def _prompt_candidate_context(
+        self, task: TaskSpec, *, before_round: int
+    ) -> dict[str, Any]:
+        best = self._best_context(task, before_round=before_round)
+        if best is not None:
+            return {
+                "round": best["round"],
+                "role": "best_public_candidate",
+                "code": best["code"],
+            }
+        scores = sorted(
+            (
+                score
+                for score in self.store.list_candidate_scores(
+                    self.experiment_id, task.id
+                )
+                if score.round_number < before_round
+                and score.compile_passed
+                and score.correctness_passed
+            ),
+            key=lambda score: score.round_number,
+            reverse=True,
+        )
+        candidate_round = scores[0].round_number if scores else before_round - 1
+        candidate_path = self._artifact_path(
+            task.id, candidate_round, "candidate.py"
+        )
+        if not candidate_path.is_file():
+            raise ControllerError(
+                f"round {candidate_round} candidate is missing while building follow-up"
+            )
+        return {
+            "round": candidate_round,
+            "role": (
+                "latest_correct_seed" if scores else "latest_repair_candidate"
+            ),
+            "code": candidate_path.read_text(encoding="utf-8"),
+        }
+
+    def _history_scorecard(
+        self, task: TaskSpec, *, before_round: int
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for previous_round in range(1, before_round):
+            path = self._artifact_path(
+                task.id, previous_round, "evaluation_result.json"
+            )
+            if not path.is_file():
+                continue
+            evaluation = _read_json(path)
+            benchmark = evaluation.get("benchmark")
+            benchmark = benchmark if isinstance(benchmark, Mapping) else {}
+            rows.append(
+                {
+                    "round": previous_round,
+                    "phase": evaluation.get("trajectory_phase", "unknown"),
+                    "phase_index": evaluation.get("phase_index"),
+                    "status": evaluation.get("overall_status"),
+                    "source": _passed_stage(evaluation.get("source")),
+                    "compile": _passed_stage(evaluation.get("compile")),
+                    "correctness": _passed_stage(
+                        evaluation.get("correctness")
+                    ),
+                    "geomean_speedup_vs_pytorch_eager": benchmark.get(
+                        "geomean_speedup_vs_eager"
+                    ),
+                    "minimum_speedup_vs_pytorch_eager": benchmark.get(
+                        "minimum_speedup_vs_eager"
+                    ),
+                    "bottleneck_type": benchmark.get("bottleneck_type"),
+                }
+            )
+        return rows
+
+    def _build_prompt(
+        self,
+        task: TaskSpec,
+        round_number: int,
+        *,
+        phase: str,
+        phase_index: int,
+    ) -> ModelRequest:
+        maximum_rounds = (
+            self.config.rounds_per_task + self.config.maximum_repair_rounds
+        )
         common = {
             "task": task.public_prompt_view(),
             "environment": self.environment,
             "baseline": self.baseline.get(task.id, self.baseline),
-            "maximum_rounds": self.config.rounds_per_task,
+            "maximum_rounds": maximum_rounds,
+            "phase": phase,
+            "phase_index": phase_index,
+            "optimization_rounds": self.config.rounds_per_task,
+            "maximum_repair_rounds": self.config.maximum_repair_rounds,
             "model": self.config.model.model,
             "timeout_seconds": self.config.model.request_timeout_seconds,
         }
@@ -535,18 +820,28 @@ class ExperimentController:
         previous_feedback = (
             _read_json(previous_feedback_path) if previous_feedback_path.is_file() else {}
         )
-        previous_code = self._artifact_path(
-            task.id, round_number - 1, "candidate.py"
-        ).read_text(encoding="utf-8")
+        candidate = self._prompt_candidate_context(
+            task, before_round=round_number
+        )
         return self.prompt_builder.build_follow_up(
             round_number=round_number,
-            maximum_rounds=self.config.rounds_per_task,
-            last_candidate_code=previous_code,
+            maximum_rounds=maximum_rounds,
+            last_candidate_code=str(candidate["code"]),
             key_metrics=self._follow_up_metrics(previous_evaluation),
             failure_reasons=self._follow_up_failure_reasons(
                 previous_evaluation, previous_feedback
             ),
             next_round_suggestions=self._follow_up_suggestions(previous_feedback),
+            task_contract=task.public_prompt_view(),
+            candidate_round=int(candidate["round"]),
+            candidate_role=str(candidate["role"]),
+            history_summary=self._history_scorecard(
+                task, before_round=round_number
+            ),
+            phase=phase,
+            phase_index=phase_index,
+            optimization_rounds=self.config.rounds_per_task,
+            maximum_repair_rounds=self.config.maximum_repair_rounds,
             model=self.config.model.model,
             timeout_seconds=self.config.model.request_timeout_seconds,
         )
@@ -705,12 +1000,24 @@ class ExperimentController:
             task, round_number, exchange
         )
 
-    def _run_round(self, task: TaskSpec, round_number: int) -> None:
+    def _run_round(
+        self,
+        task: TaskSpec,
+        round_number: int,
+        *,
+        phase: str,
+        phase_index: int,
+    ) -> None:
         record = self.store.get_round(self.experiment_id, task.id, round_number)
         if record is None:
             record = self.store.create_round(self.experiment_id, task.id, round_number)
         if record.state is RoundState.ROUND_CREATED:
-            request = self._build_prompt(task, round_number)
+            request = self._build_prompt(
+                task,
+                round_number,
+                phase=phase,
+                phase_index=phase_index,
+            )
             self._commit_json(
                 self._relative(task.id, round_number, "prompt.json"),
                 {
@@ -851,6 +1158,15 @@ class ExperimentController:
                 round_number=round_number,
             )
             score = _score_from_mapping(evaluation_mapping["score"])
+            committed_phase = evaluation_mapping.get("trajectory_phase")
+            committed_phase_index = evaluation_mapping.get("phase_index")
+            if committed_phase not in {None, phase} or committed_phase_index not in {
+                None,
+                phase_index,
+            }:
+                raise ControllerError(
+                    "committed evaluation trajectory phase disagrees with replay"
+                )
             if model_failure_path.is_file() and score.is_publicly_valid:
                 raise ControllerError(
                     "model-failure evaluation cannot contain an eligible score"
@@ -918,6 +1234,8 @@ class ExperimentController:
                     )
                     evaluation_mapping = evaluation.to_dict()
                     score = evaluation.score
+            evaluation_mapping["trajectory_phase"] = phase
+            evaluation_mapping["phase_index"] = phase_index
             self._commit_json(
                 self._relative(task.id, round_number, "evaluation_result.json"),
                 evaluation_mapping,
@@ -1143,6 +1461,7 @@ class ExperimentController:
                 )
             best = self.store.get_candidate_score(task_record.best_candidate_id)
         if best is None:
+            repair_rounds, optimization_rounds = self._trajectory_counts(task)
             final = {
                 "schema_version": "ascend_final_result_v1",
                 "experiment_id": self.experiment_id,
@@ -1150,6 +1469,9 @@ class ExperimentController:
                 "status": "failed_no_valid_candidate",
                 "best_round": None,
                 "best_candidate_id": None,
+                "repair_rounds": repair_rounds,
+                "optimization_rounds": optimization_rounds,
+                "termination_reason": self._trajectory_termination_reason(task),
             }
             self._commit_json(final_relative, final, task_id=task.id)
             if task_record.state is TaskState.ROUNDS_RUNNING:
@@ -1247,6 +1569,14 @@ class ExperimentController:
             "minimum_speedup": benchmark.get("minimum_speedup_vs_eager"),
             "final_evaluation": final_evaluation,
         }
+        repair_rounds, optimization_rounds = self._trajectory_counts(task)
+        final.update(
+            {
+                "repair_rounds": repair_rounds,
+                "optimization_rounds": optimization_rounds,
+                "termination_reason": self._trajectory_termination_reason(task),
+            }
+        )
         self._commit_json(final_relative, final, task_id=task.id)
         if status == "failed_hidden_correctness":
             if task_record.state is TaskState.HIDDEN_CORRECTNESS_TEST:
