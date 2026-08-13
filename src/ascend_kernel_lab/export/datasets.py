@@ -151,6 +151,65 @@ def _score(item: RoundArtifacts) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def candidate_generation_intent(
+    response: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project only the model's original structured candidate intent.
+
+    No evaluation, feedback, or source-code analysis is used here.  The
+    legacy field is accepted solely so older committed runs remain exportable.
+    """
+
+    source_field = "model_response.optimization_summary"
+    summary = response.get("optimization_summary")
+    if summary is None and "change_summary" in response:
+        source_field = "model_response.change_summary"
+        summary = response.get("change_summary")
+    optimization_summary = (
+        [str(item) for item in summary]
+        if isinstance(summary, list) and all(isinstance(item, str) for item in summary)
+        else []
+    )
+    expected = response.get("expected_effect")
+    expected_effect = (
+        [str(item) for item in expected]
+        if isinstance(expected, list) and all(isinstance(item, str) for item in expected)
+        else []
+    )
+    assumptions = response.get("assumptions")
+    synthetic_model_failure = (
+        isinstance(assumptions, list)
+        and "Model output failed structured-response validation." in assumptions
+    )
+    return {
+        "schema_version": "ascend_candidate_generation_intent_v1",
+        "optimization_summary": optimization_summary,
+        "expected_effect": expected_effect,
+        "source_field": source_field,
+        "optimization_summary_model_authored": bool(optimization_summary)
+        and not synthetic_model_failure,
+        "candidate_response_provenance": (
+            "synthetic_model_failure_sentinel"
+            if synthetic_model_failure
+            else "model_response"
+        ),
+    }
+
+
+def _training_model_response(response: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize a legacy response to the schema required from new models."""
+
+    normalized = dict(response)
+    legacy_summary = normalized.get("change_summary")
+    if (
+        "optimization_summary" not in normalized
+        and isinstance(legacy_summary, list)
+        and bool(legacy_summary)
+    ):
+        normalized["optimization_summary"] = normalized.pop("change_summary")
+    return normalized
+
+
 def _speedup(item: RoundArtifacts) -> float | None:
     score = _score(item)
     value = _number(score.get("geomean_speedup"))
@@ -303,10 +362,18 @@ class DatasetExporter:
         for task_root in sorted(path for path in tasks_root.iterdir() if path.is_dir()):
             if task_root.is_symlink():
                 raise ExportError(f"refusing to traverse symlinked task directory {task_root}")
-            for round_root in sorted(task_root.glob("round_[0-9][0-9]")):
-                match = re.fullmatch(r"round_(\d+)", round_root.name)
-                if not match:
-                    continue
+            round_roots = sorted(
+                (
+                    (int(match.group(1)), round_root)
+                    for round_root in task_root.iterdir()
+                    if (
+                        (match := re.fullmatch(r"round_(\d+)", round_root.name))
+                        is not None
+                    )
+                ),
+                key=lambda value: value[0],
+            )
+            for round_id, round_root in round_roots:
                 if round_root.is_symlink():
                     raise ExportError(
                         f"refusing to traverse symlinked round directory {round_root}"
@@ -325,7 +392,7 @@ class DatasetExporter:
                 reward = _read_json(round_root / "reward.json", evaluation.get("reward_vector", {}))
                 items.append(RoundArtifacts(
                     task_id=task_root.name,
-                    round_id=int(match.group(1)),
+                    round_id=round_id,
                     root=round_root,
                     prompt=prompt,
                     response=response,
@@ -525,13 +592,15 @@ class DatasetExporter:
                 self.root / "tasks" / item.task_id / "final_result.json", {}
             )
             score = item.evaluation.get("score", {})
+            intent = candidate_generation_intent(item.response)
             rows.append({
-                "schema_version": "ascend_kernel_sft_v1",
+                "schema_version": "ascend_kernel_sft_v2",
                 "sample_id": f"{self.root.name}:{item.task_id}:round-{item.round_id:02d}",
                 "sample_type": quality.label,
+                "candidate_generation_intent": intent,
                 "messages": [
                     {"role": "user", "content": json.dumps(item.prompt, ensure_ascii=False, sort_keys=True)},
-                    {"role": "assistant", "content": json.dumps({**item.response, "code": item.code}, ensure_ascii=False, sort_keys=True)},
+                    {"role": "assistant", "content": json.dumps({**_training_model_response(item.response), "code": item.code}, ensure_ascii=False, sort_keys=True)},
                 ],
                 "quality": {
                     **quality.to_dict(),
@@ -570,14 +639,16 @@ class DatasetExporter:
         rows: list[dict[str, Any]] = []
         for classified in rounds:
             item = classified.artifacts
+            intent = candidate_generation_intent(item.response)
             rows.append({
-                "schema_version": "ascend_kernel_rl_transition_v1",
+                "schema_version": "ascend_kernel_rl_transition_v2",
                 "episode_id": f"{self.root.name}:{item.task_id}",
                 "turn": item.round_id,
                 "observation": item.prompt,
                 "action": {
                     "raw_model_response": item.response,
                     "candidate_code": item.code,
+                    "candidate_generation_intent": intent,
                 },
                 "result": item.evaluation,
                 "feedback": item.feedback,

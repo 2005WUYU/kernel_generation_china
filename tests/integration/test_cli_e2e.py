@@ -109,6 +109,45 @@ class CliEndToEndTests(unittest.TestCase):
                 self.assertGreater(json.loads(output)["rows"], 0)
                 self.assertTrue(destination.is_file())
 
+    def test_task_selection_scopes_the_durable_experiment_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._config(root)
+            value = yaml.safe_load(config.read_text(encoding="utf-8"))
+            value["experiment"]["tasks"] = [
+                "k01_vector_add",
+                "k02_bias_gelu",
+            ]
+            config.write_text(
+                yaml.safe_dump(value, sort_keys=False), encoding="utf-8"
+            )
+
+            code, output, error = self._main(
+                [
+                    "experiment",
+                    "run",
+                    "-c",
+                    str(config),
+                    "--fake",
+                    "--task",
+                    "k01_vector_add",
+                ]
+            )
+
+            self.assertEqual(code, 0, error)
+            summary = json.loads(output)
+            self.assertEqual(
+                [task["task_id"] for task in summary["tasks"]],
+                ["k01_vector_add"],
+            )
+            manifest = json.loads(
+                (Path(summary["experiment_root"]) / "experiment.json").read_text(
+                    encoding="utf-8"
+                )
+            )["experiment"]
+            self.assertEqual(manifest["tasks"], ["k01_vector_add"])
+            self.assertEqual(manifest["task_concurrency"], 1)
+
     def test_acceptance_never_conflates_integrity_with_hardware_gates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

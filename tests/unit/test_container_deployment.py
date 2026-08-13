@@ -63,7 +63,9 @@ class ContainerDeploymentContractTests(unittest.TestCase):
         self.assertIn("未运行(Host瓶颈早停)", watcher)
         self.assertIn("空槽(Repair提前通过)", watcher)
         self.assertNotIn("预算未用或早停", watcher)
-        self.assertIn("只生成了 $finals/10 个最终结果", watcher)
+        self.assertIn("FINAL=$finals/$task_total", watcher)
+        self.assertIn('"$finals" -eq "$task_total"', watcher)
+        self.assertIn("只生成了 $finals/$task_total 个最终结果", watcher)
         self.assertIn('docker logs --tail 100 "$CONTROLLER_NAME"', watcher)
         self.assertNotIn("AUTH_TOKEN", watcher)
         self.assertNotIn("hidden.env", watcher.lower())
@@ -111,17 +113,33 @@ class ContainerDeploymentContractTests(unittest.TestCase):
                 phase: str,
                 phase_index: int,
                 overall_status: str,
+                repair_attempt: int = 0,
             ) -> None:
                 round_root = (
                     run_root / "tasks" / task_id / f"round_{round_number:02d}"
                 )
                 self._write_json(
                     round_root / "prompt.json",
-                    {"metadata": {"phase": phase, "phase_index": phase_index}},
+                    {
+                        "metadata": {
+                            "phase": phase,
+                            "phase_index": phase_index,
+                        },
+                        "user_prompt": {
+                            "feedback_state": {
+                                "repair_attempt": repair_attempt,
+                            }
+                        },
+                    },
                 )
                 self._write_json(
                     round_root / "evaluation_result.json",
-                    {"overall_status": overall_status},
+                    {
+                        "overall_status": overall_status,
+                        "trajectory_phase": phase,
+                        "phase_index": phase_index,
+                        "repair_attempt": repair_attempt,
+                    },
                 )
 
             final(
@@ -172,6 +190,36 @@ class ContainerDeploymentContractTests(unittest.TestCase):
                     overall_status="correct",
                 )
 
+            final(
+                "slot_repaired",
+                status="passed",
+                termination="optimization_round_budget_completed",
+                repairs=1,
+                optimizations=1,
+            )
+            evaluated_round(
+                "slot_repaired",
+                1,
+                phase="repair",
+                phase_index=1,
+                overall_status="correct",
+            )
+            evaluated_round(
+                "slot_repaired",
+                2,
+                phase="optimization",
+                phase_index=1,
+                overall_status="correctness_failed",
+            )
+            evaluated_round(
+                "slot_repaired",
+                3,
+                phase="optimization_repair",
+                phase_index=1,
+                repair_attempt=1,
+                overall_status="correct",
+            )
+
             candidate = run_root / "tasks" / "queue_failure" / "round_01" / "candidate.py"
             candidate.parent.mkdir(parents=True, exist_ok=True)
             candidate.write_text("def run(): pass\n", encoding="utf-8")
@@ -220,6 +268,7 @@ class ContainerDeploymentContractTests(unittest.TestCase):
                     "repair_failed",
                     "host_stopped",
                     "repair_early",
+                    "slot_repaired",
                     "queue_failure",
                     "unfinished",
                 ],
@@ -257,8 +306,84 @@ class ContainerDeploymentContractTests(unittest.TestCase):
             )
             self.assertIn("R07=空槽(Repair提前通过)", lines["repair_early"])
             self.assertIn("R08=空槽(Repair提前通过)", lines["repair_early"])
+            self.assertIn(
+                "ROUNDS=REP1/OPT1/OPTREP1", lines["slot_repaired"]
+            )
+            self.assertIn(
+                "R03[OPT1-REP1]=完成[correct]", lines["slot_repaired"]
+            )
             self.assertIn("R01=CORRECTNESS失败", lines["queue_failure"])
             self.assertIn("R01=未开始", lines["unfinished"])
+
+    def test_experiment_watcher_prefers_durable_single_task_set(self) -> None:
+        experiment_id = "single-task"
+        with tempfile.TemporaryDirectory() as temporary:
+            project_root = Path(temporary)
+            run_root = project_root / "runs" / experiment_id
+            self._write_json(
+                run_root / "experiment.json",
+                {
+                    "experiment": {
+                        "tasks": ["k01_vector_add", "k02_bias_gelu"]
+                    }
+                },
+            )
+            database = project_root / "runs" / "metadata.db"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE tasks (
+                        experiment_id TEXT NOT NULL,
+                        task_id TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO tasks (experiment_id, task_id) VALUES (?, ?)",
+                    (experiment_id, "k01_vector_add"),
+                )
+
+            process = subprocess.run(
+                [
+                    "python3",
+                    "-",
+                    str(database),
+                    str(run_root),
+                    experiment_id,
+                    "fallback_task",
+                ],
+                input=self._watcher_python("task_ids"),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertEqual(process.stdout.splitlines(), ["k01_vector_add"])
+
+            with sqlite3.connect(database) as connection:
+                connection.execute("DELETE FROM tasks")
+            fallback_process = subprocess.run(
+                [
+                    "python3",
+                    "-",
+                    str(database),
+                    str(run_root),
+                    experiment_id,
+                    "fallback_task",
+                ],
+                input=self._watcher_python("task_ids"),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                fallback_process.returncode, 0, fallback_process.stderr
+            )
+            self.assertEqual(
+                fallback_process.stdout.splitlines(),
+                ["k01_vector_add", "k02_bias_gelu"],
+            )
 
     def test_experiment_watcher_final_summary_includes_termination_and_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -276,6 +401,19 @@ class ContainerDeploymentContractTests(unittest.TestCase):
                     "minimum_speedup": 1.1,
                 },
             )
+            for number, phase in (
+                (1, "repair"),
+                (2, "optimization"),
+                (3, "optimization_repair"),
+            ):
+                self._write_json(
+                    run_root
+                    / "tasks"
+                    / "passed_task"
+                    / f"round_{number:02d}"
+                    / "evaluation_result.json",
+                    {"trajectory_phase": phase},
+                )
             self._write_json(
                 run_root / "tasks" / "failed_task" / "final_result.json",
                 {
@@ -307,6 +445,7 @@ class ContainerDeploymentContractTests(unittest.TestCase):
                 "REP=1 OPT=0",
                 process.stdout,
             )
+            self.assertIn("OPT_REPAIR=1 ACTUAL=3", process.stdout)
             self.assertIn(
                 "failed_task status=repair_exhausted termination=repair_exhausted "
                 "REP=3 OPT=0",

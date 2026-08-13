@@ -14,9 +14,9 @@ from .errors import (
 )
 from .types import ModelCompletion, ModelGateway, ModelRequest
 
-_FIELDS = {
-    "status", "round", "change_summary", "expected_effect", "assumptions", "code"
-}
+_COMMON_FIELDS = {"status", "round", "expected_effect", "assumptions", "code"}
+_CURRENT_FIELDS = _COMMON_FIELDS | {"optimization_summary"}
+_LEGACY_FIELDS = _COMMON_FIELDS | {"change_summary"}
 _TRUNCATED_REASONS = {"length", "max_tokens", "max_output_tokens", "token_limit"}
 _SUCCESS_REASONS = {"stop", "end_turn", "success", "completed"}
 
@@ -25,7 +25,7 @@ _SUCCESS_REASONS = {"stop", "end_turn", "success", "completed"}
 class ModelResponse:
     status: str
     round: int
-    change_summary: tuple[str, ...]
+    optimization_summary: tuple[str, ...]
     expected_effect: tuple[str, ...]
     assumptions: tuple[str, ...]
     code: str
@@ -34,7 +34,7 @@ class ModelResponse:
         return {
             "status": self.status,
             "round": self.round,
-            "change_summary": list(self.change_summary),
+            "optimization_summary": list(self.optimization_summary),
             "expected_effect": list(self.expected_effect),
             "assumptions": list(self.assumptions),
             "code": self.code,
@@ -60,9 +60,17 @@ def _string_list(value: Any, path: str) -> tuple[str, ...]:
 
 
 def validate_model_response(
-    value: str | bytes | Mapping[str, Any], *, expected_round: int | None = None
+    value: str | bytes | Mapping[str, Any],
+    *,
+    expected_round: int | None = None,
+    allow_legacy: bool = False,
 ) -> ModelResponse:
-    """Validate JSON content exactly; unknown fields and coercions are rejected."""
+    """Validate JSON content exactly.
+
+    New model completions must use ``optimization_summary``.  The legacy
+    ``change_summary`` spelling is accepted only when a caller explicitly
+    identifies the value as an already-committed historical artifact.
+    """
 
     if isinstance(value, bytes):
         try:
@@ -78,8 +86,19 @@ def validate_model_response(
         decoded = dict(value)
     if not isinstance(decoded, dict) or not all(isinstance(key, str) for key in decoded):
         raise ModelResponseError("response must be a JSON object")
-    unknown = sorted(set(decoded) - _FIELDS)
-    missing = sorted(_FIELDS - set(decoded))
+    fields = set(decoded)
+    if "optimization_summary" in fields and "change_summary" in fields:
+        raise ModelResponseError(
+            "optimization_summary and legacy change_summary are mutually exclusive"
+        )
+    legacy = "change_summary" in fields
+    if legacy and not allow_legacy:
+        raise ModelResponseError(
+            "legacy change_summary is allowed only for committed historical artifacts"
+        )
+    expected_fields = _LEGACY_FIELDS if legacy else _CURRENT_FIELDS
+    unknown = sorted(fields - expected_fields)
+    missing = sorted(expected_fields - fields)
     if unknown:
         raise ModelResponseError(f"unknown response field(s): {', '.join(unknown)}")
     if missing:
@@ -101,10 +120,21 @@ def validate_model_response(
         raise ModelResponseError("code must not contain NUL")
     if code.lstrip().startswith("```") or code.rstrip().endswith("```"):
         raise ModelResponseError("code must be raw Python source, not a Markdown fence")
+    optimization_summary = _string_list(
+        decoded["change_summary" if legacy else "optimization_summary"],
+        "change_summary" if legacy else "optimization_summary",
+    )
+    if not legacy and (
+        not optimization_summary
+        or any(not item.strip() for item in optimization_summary)
+    ):
+        raise ModelResponseError(
+            "optimization_summary must contain at least one non-empty model-authored item"
+        )
     return ModelResponse(
         status=status,
         round=round_number,
-        change_summary=_string_list(decoded["change_summary"], "change_summary"),
+        optimization_summary=optimization_summary,
         expected_effect=_string_list(decoded["expected_effect"], "expected_effect"),
         assumptions=_string_list(decoded["assumptions"], "assumptions"),
         code=code,

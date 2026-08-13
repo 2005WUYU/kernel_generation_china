@@ -62,6 +62,65 @@ def validate_baseline_snapshot(
     return True
 
 
+def prompt_baseline_projection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Project an eager snapshot without raw samples or measurement attempts."""
+
+    comparison_baseline = str(
+        snapshot.get("comparison_baseline", "pytorch_eager")
+    )
+    raw_cases = snapshot.get("per_case")
+    if not isinstance(raw_cases, Sequence) or isinstance(
+        raw_cases, (str, bytes)
+    ):
+        return {"comparison_baseline": comparison_baseline}
+
+    projected_cases: list[dict[str, Any]] = []
+    latencies: list[float] = []
+    weights: list[float] = []
+    for raw_case in raw_cases:
+        if not isinstance(raw_case, Mapping):
+            continue
+        latency_value = raw_case.get("pytorch_eager_us")
+        if latency_value is None:
+            continue
+        latency = float(latency_value)
+        case: dict[str, Any] = {
+            "case_id": str(raw_case.get("case_id", "")),
+            "median_us": latency,
+        }
+        for name in ("dtype", "shape", "shapes"):
+            if name in raw_case:
+                case[name] = raw_case[name]
+        params = raw_case.get("params")
+        if isinstance(params, Mapping):
+            case["params"] = dict(params)
+        weight = float(raw_case.get("weight", 1.0))
+        case["weight"] = weight
+        projected_cases.append(case)
+        latencies.append(latency)
+        weights.append(weight)
+
+    if not projected_cases:
+        return {"comparison_baseline": comparison_baseline}
+    geomean = snapshot.get("pytorch_eager_geomean_us")
+    if geomean is None:
+        geomean = weighted_geometric_mean(latencies, weights)
+    return {
+        "comparison_baseline": comparison_baseline,
+        "definition": {
+            "implementation": "trusted_pytorch_eager_reference",
+            "measurement": "same_device_npu_event_median_per_public_benchmark_case",
+            "latency_unit": "microseconds",
+            "speedup_formula": "pytorch_eager_median_us / candidate_median_us",
+        },
+        "summary": {
+            "case_count": len(projected_cases),
+            "weighted_geomean_us": float(geomean),
+        },
+        "per_case": projected_cases,
+    }
+
+
 @dataclass(frozen=True)
 class BaselineManager:
     backend: BaselineBackend

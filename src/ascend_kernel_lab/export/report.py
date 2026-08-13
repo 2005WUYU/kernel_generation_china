@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .datasets import DatasetExporter, ExportError, assert_export_clean
+from .datasets import (
+    DatasetExporter,
+    ExportError,
+    assert_export_clean,
+    candidate_generation_intent,
+)
 
 
 class ReportExporter:
@@ -25,8 +31,72 @@ class ReportExporter:
         value = json.loads(raw.decode("utf-8"))
         return value if isinstance(value, Mapping) else {}
 
+    @staticmethod
+    def _round_roots(task_root: Path) -> list[Path]:
+        values: list[tuple[int, Path]] = []
+        for path in task_root.iterdir():
+            match = re.fullmatch(r"round_(\d+)", path.name)
+            if match is not None and path.is_dir() and not path.is_symlink():
+                values.append((int(match.group(1)), path))
+        return [path for _number, path in sorted(values)]
+
+    def _trajectory_rounds(
+        self,
+        task_root: Path,
+        result: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        phase_counts = {
+            "repair": 0,
+            "optimization": 0,
+            "optimization_repair": 0,
+            "unknown": 0,
+        }
+        rounds = self._round_roots(task_root)
+        for round_root in rounds:
+            evaluation = self._read(round_root / "evaluation_result.json")
+            phase = evaluation.get("trajectory_phase")
+            if isinstance(phase, str) and phase in {
+                "repair",
+                "optimization",
+                "optimization_repair",
+            }:
+                phase_counts[phase] += 1
+            else:
+                phase_counts["unknown"] += 1
+
+        optimization_budget = manifest.get("rounds_per_task")
+        repair_budget = manifest.get("maximum_repair_rounds", 0)
+        maximum_physical_rounds = None
+        if (
+            isinstance(optimization_budget, int)
+            and optimization_budget > 0
+            and isinstance(repair_budget, int)
+            and repair_budget >= 0
+        ):
+            maximum_physical_rounds = repair_budget + optimization_budget * (
+                repair_budget + 1
+            )
+        return {
+            "actual_physical_rounds": len(rounds),
+            "maximum_physical_rounds": maximum_physical_rounds,
+            "initial_repair_rounds": phase_counts["repair"],
+            "optimization_slots_attempted": phase_counts["optimization"],
+            "optimization_repair_rounds": phase_counts[
+                "optimization_repair"
+            ],
+            "unknown_phase_rounds": phase_counts["unknown"],
+            "reported_initial_repair_rounds": result.get("repair_rounds"),
+            "reported_optimization_slots": result.get("optimization_rounds"),
+        }
+
     def build(self) -> dict[str, Any]:
         tasks: list[dict[str, Any]] = []
+        experiment = self._read(self.root / "experiment.json")
+        manifest_value = experiment.get("experiment")
+        manifest = (
+            manifest_value if isinstance(manifest_value, Mapping) else {}
+        )
         tasks_root = self.root / "tasks"
         if tasks_root.is_dir():
             for root in sorted(path for path in tasks_root.iterdir() if path.is_dir()):
@@ -41,6 +111,11 @@ class ReportExporter:
                         / f"round_{best_round:02d}"
                         / "evaluation_result.json"
                     )
+                    model_response = self._read(
+                        root / f"round_{best_round:02d}" / "model_response.json"
+                    )
+                else:
+                    model_response = {}
                 benchmark_value = public_evaluation.get("benchmark")
                 benchmark = (
                     benchmark_value
@@ -61,12 +136,18 @@ class ReportExporter:
                         "candidate_kernel_coverage"
                     ),
                     "stability_cv": score.get("stability_cv"),
+                    "candidate_generation_intent": candidate_generation_intent(
+                        model_response
+                    ),
                 }
                 tasks.append(
                     {
                         "task_id": root.name,
                         **result,
                         "public_best": public_best,
+                        "trajectory_rounds": self._trajectory_rounds(
+                            root, result, manifest
+                        ),
                     }
                 )
         passed = sum(
@@ -78,7 +159,7 @@ class ReportExporter:
         if not environment:
             environment = self._read(self.root / "env_manifest.json")
         return {
-            "schema_version": "ascend_kernel_experiment_report_v1",
+            "schema_version": "ascend_kernel_experiment_report_v2",
             "experiment_id": self.root.name,
             "task_count": len(tasks),
             "passed_task_count": passed,
@@ -101,14 +182,21 @@ class ReportExporter:
                 "",
                 f"Passed tasks: {report['passed_task_count']} / {report['task_count']}",
                 "",
-                "| Task | Status | Best round | vs PyTorch eager | Coverage |",
-                "| --- | --- | ---: | ---: | ---: |",
+                "| Task | Status | Best round | Trajectory | vs PyTorch eager | Coverage |",
+                "| --- | --- | ---: | ---: | ---: | ---: |",
             ]
             for task in report["tasks"]:
                 public_best = task.get("public_best", {})
+                trajectory = task.get("trajectory_rounds", {})
+                actual = trajectory.get("actual_physical_rounds", "-")
+                maximum = trajectory.get("maximum_physical_rounds")
+                trajectory_text = (
+                    f"{actual}/{maximum}" if maximum is not None else str(actual)
+                )
                 lines.append(
                     f"| {task['task_id']} | {task.get('status', 'unknown')} | "
                     f"{task.get('best_round', '-')} | "
+                    f"{trajectory_text} | "
                     f"{public_best.get('geomean_speedup_vs_eager', '-')} | "
                     f"{public_best.get('candidate_kernel_coverage', '-')} |"
                 )

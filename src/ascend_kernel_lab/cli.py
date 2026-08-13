@@ -233,6 +233,141 @@ def _probe_root(config: ExperimentConfig, explicit: str | None = None) -> Path:
     return requested.resolve()
 
 
+_HARDWARE_PROFILE_RELATIVE_PATH = Path(
+    "hardware_probe/kernel_authoring_environment.reported.json"
+)
+
+
+def _profile_value(profile: Mapping[str, Any], *path: str) -> Any:
+    value: Any = profile
+    try:
+        for component in path:
+            value = value[component]
+        return value["value"]
+    except (KeyError, TypeError) as exc:
+        dotted = ".".join(path) + ".value"
+        raise CommandError(f"hardware profile is missing {dotted}") from exc
+
+
+def _compact_hardware_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
+    if profile.get("schema_version") != "kernel_authoring_environment_v1":
+        raise CommandError("hardware profile has an unexpected schema_version")
+
+    source_profile_sha256 = profile.get("reported_profile_sha256")
+    if not isinstance(source_profile_sha256, str) or len(source_profile_sha256) != 64:
+        raise CommandError("hardware profile has no reported_profile_sha256")
+
+    compiler_runtime = profile.get("compiler_runtime")
+    hardware = profile.get("hardware")
+    raw_evidence = profile.get("raw_evidence")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (compiler_runtime, hardware, raw_evidence)
+    ):
+        raise CommandError("hardware profile is missing kernel-authoring sections")
+
+    assert isinstance(compiler_runtime, Mapping)
+    assert isinstance(hardware, Mapping)
+    assert isinstance(raw_evidence, Mapping)
+    cache_levels = hardware["memory"]["cache_levels"]
+    l2_cache = next(
+        item for item in cache_levels if item.get("level") == "L2"
+    )
+
+    return {
+        "backend": compiler_runtime["backend"],
+        "execution": {
+            "matrix_units": _profile_value(
+                hardware,
+                "execution",
+                "schedulable_engines",
+                "matrix",
+                "physical_count",
+            ),
+            "vector_units": _profile_value(
+                hardware,
+                "execution",
+                "schedulable_engines",
+                "vector",
+                "physical_count",
+            ),
+            "recommended_matrix_programs": _profile_value(
+                compiler_runtime,
+                "dispatch",
+                "recommended_matrix_or_cv_programs",
+            ),
+            "recommended_vector_programs": _profile_value(
+                compiler_runtime,
+                "dispatch",
+                "recommended_vector_programs",
+            ),
+            "max_grid_programs": _profile_value(
+                compiler_runtime,
+                "dispatch",
+                "max_total_grid_programs",
+            ),
+        },
+        "memory": {
+            "global_memory_bytes": _profile_value(
+                hardware, "memory", "global", "capacity"
+            ),
+            "l2_cache_bytes": _profile_value(l2_cache, "capacity"),
+            "local_memory_type": hardware["memory"]["local_scratchpad"][
+                "vendor_term"
+            ],
+        },
+        "memory_access": {
+            "vector_tail_alignment_bytes": _profile_value(
+                compiler_runtime,
+                "memory_access_constraints",
+                "vector_tail_axis_alignment",
+            ),
+            "matrix_vector_tail_alignment_bytes": _profile_value(
+                compiler_runtime,
+                "memory_access_constraints",
+                "cube_vector_tail_axis_alignment",
+            ),
+        },
+        "supported": {
+            "fp16": _profile_value(
+                compiler_runtime,
+                "verified_dtype_paths",
+                "load_store_and_vector_fp16",
+            ),
+            "bf16": _profile_value(
+                compiler_runtime,
+                "verified_dtype_paths",
+                "load_store_and_vector_bfloat16",
+            ),
+            "fp32": _profile_value(
+                compiler_runtime,
+                "verified_dtype_paths",
+                "load_store_and_vector_fp32",
+            ),
+            "matrix_dot_fp16": _profile_value(
+                compiler_runtime,
+                "verified_dtype_paths",
+                "matrix_dot_fp16",
+            ),
+            **{
+                name: _profile_value(
+                    compiler_runtime, "verified_features", name
+                )
+                for name in (
+                    "masked_load_store",
+                    "reduction_sum",
+                    "max_exp",
+                    "grid_2d",
+                    "multiple_kernels",
+                )
+            },
+        },
+        "timing": {
+            "method": raw_evidence["capability_timing"]["timing_method"]
+        },
+    }
+
+
 def _load_probe_snapshot(
     config: ExperimentConfig,
     explicit: str | None = None,
@@ -243,6 +378,21 @@ def _load_probe_snapshot(
     environment = _load_json_object(root / "env_manifest.json", label="environment manifest")
     capabilities = _load_json_object(root / "capability_matrix.json", label="capability matrix")
     profiler = _load_json_object(root / "profiler_capabilities.json", label="profiler manifest")
+    hardware_profile_path = root.parent / _HARDWARE_PROFILE_RELATIVE_PATH
+    hardware_profile = _load_json_object(
+        hardware_profile_path, label="kernel-authoring hardware profile"
+    )
+    raw_hardware_evidence = hardware_profile.get("raw_evidence")
+    if (
+        isinstance(raw_hardware_evidence, Mapping)
+        and raw_hardware_evidence.get("runtime_error")
+    ):
+        raise CommandError(
+            "kernel-authoring hardware probe failed: "
+            + str(raw_hardware_evidence["runtime_error"]),
+            exit_code=EXIT_NOT_READY,
+        )
+    prompt_environment = _compact_hardware_profile(hardware_profile)
     failures = _probe_readiness_failures(
         config,
         capabilities,
@@ -262,6 +412,19 @@ def _load_probe_snapshot(
         "environment_sha256": hashlib.sha256(_canonical(environment)).hexdigest(),
         "capability_sha256": hashlib.sha256(_canonical(capabilities)).hexdigest(),
         "profiler_sha256": hashlib.sha256(_canonical(profiler)).hexdigest(),
+        "prompt_environment": prompt_environment,
+        "hardware_profile_evidence": {
+            "schema_version": "kernel_hardware_profile_evidence_v1",
+            "path_base": "probe_root_parent",
+            "path": _HARDWARE_PROFILE_RELATIVE_PATH.as_posix(),
+            "file_sha256": hashlib.sha256(
+                hardware_profile_path.read_bytes()
+            ).hexdigest(),
+            "reported_profile_sha256": hardware_profile[
+                "reported_profile_sha256"
+            ],
+            "profile": hardware_profile,
+        },
     }
     snapshot["probe_snapshot_sha256"] = hashlib.sha256(_canonical(snapshot)).hexdigest()
     return snapshot
@@ -452,7 +615,7 @@ def custom_op(x):
     return {
         "status": "candidate",
         "round": round_number,
-        "change_summary": ["deterministic offline pipeline candidate"],
+        "optimization_summary": ["deterministic offline pipeline candidate"],
         "expected_effect": ["exercise every recoverable controller checkpoint"],
         "assumptions": ["FakeBackend is used; no hardware result is claimed"],
         "code": source,
@@ -517,21 +680,40 @@ def _cmd_probe_all(args: argparse.Namespace) -> int:
         ) from exc
     capabilities = _load_json_object(bundle.capability_path, label="capability matrix")
     profiler = _load_json_object(bundle.profiler_path, label="profiler manifest")
+    hardware_profile = _load_json_object(
+        bundle.hardware_profile_path,
+        label="kernel-authoring hardware profile",
+    )
     failures = _probe_readiness_failures(
         config,
         capabilities,
         profiler,
         require_profile=True,
     )
+    raw_hardware_evidence = hardware_profile.get("raw_evidence")
+    if (
+        isinstance(raw_hardware_evidence, Mapping)
+        and raw_hardware_evidence.get("runtime_error")
+    ):
+        failures.append(
+            "kernel-authoring hardware properties were unavailable: "
+            + str(raw_hardware_evidence["runtime_error"])
+        )
+    try:
+        _compact_hardware_profile(hardware_profile)
+    except CommandError as exc:
+        failures.append(str(exc))
     report = {
         "schema_version": "ascend_probe_result_v1",
         "output_root": str(bundle.output_root),
         "environment_path": str(bundle.environment_path),
         "capability_path": str(bundle.capability_path),
         "profiler_path": str(bundle.profiler_path),
+        "hardware_profile_path": str(bundle.hardware_profile_path),
         "environment_sha256": bundle.environment_sha256,
         "capability_sha256": bundle.capability_sha256,
         "profiler_sha256": bundle.profiler_sha256,
+        "hardware_profile_sha256": bundle.hardware_profile_sha256,
         "feature_smokes_run": not args.skip_feature_smokes,
         "ready": not failures,
         "failures": failures,
@@ -707,7 +889,7 @@ def _start_local_worker(config: ExperimentConfig) -> tuple[Any, threading.Thread
 def _experiment_components(
     config: ExperimentConfig,
     args: argparse.Namespace,
-    _selected: Sequence[str],
+    selected: Sequence[str],
 ) -> tuple[Any, Any, Mapping[str, Any], Mapping[str, Any], Callable[[], None]]:
     if args.fake:
         return (
@@ -723,7 +905,7 @@ def _experiment_components(
                     "task_id": task_id,
                     "notice": "Synthetic baseline for control-plane testing only.",
                 }
-                for task_id in config.tasks
+                for task_id in selected
             },
             lambda: None,
         )
@@ -735,7 +917,7 @@ def _experiment_components(
     )
     baseline = _load_baselines(
         config,
-        config.tasks,
+        selected,
         environment_sha256=str(environment["probe_snapshot_sha256"]),
         allow_missing=bool(args.allow_missing_baseline),
     )
@@ -764,6 +946,12 @@ def _cmd_experiment_run(args: argparse.Namespace) -> int:
         _config(args), args.experiment_id, fake=bool(args.fake)
     )
     selected = _select_tasks(config, args.task)
+    if selected != config.tasks:
+        config = dataclasses.replace(
+            config,
+            tasks=selected,
+            task_concurrency=min(config.task_concurrency, len(selected)),
+        )
     gateway, backend, environment, baseline, cleanup = _experiment_components(
         config, args, selected
     )

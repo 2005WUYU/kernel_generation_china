@@ -45,6 +45,55 @@ def _json(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+_ROUND_DIRECTORY = re.compile(r"round_(\d+)")
+_TRAJECTORY_PHASES = {"repair", "optimization", "optimization_repair"}
+
+
+def _round_directories(task_root: Path) -> list[Path]:
+    if not task_root.is_dir():
+        return []
+    values: list[tuple[int, Path]] = []
+    for path in task_root.iterdir():
+        match = _ROUND_DIRECTORY.fullmatch(path.name)
+        if match is not None and path.is_dir() and not path.is_symlink():
+            values.append((int(match.group(1)), path))
+    return [path for _round_number, path in sorted(values)]
+
+
+def _experiment_round_directories(root: Path) -> list[Path]:
+    tasks_root = root / "tasks"
+    if not tasks_root.is_dir() or tasks_root.is_symlink():
+        return []
+    rounds: list[Path] = []
+    for task_root in sorted(tasks_root.iterdir()):
+        if task_root.is_dir() and not task_root.is_symlink():
+            rounds.extend(_round_directories(task_root))
+    return rounds
+
+
+def _trajectory_phase_counts(
+    rounds: list[Path],
+) -> dict[str, int] | None:
+    counts = {phase: 0 for phase in _TRAJECTORY_PHASES}
+    for round_root in rounds:
+        evaluation = _json(round_root / "evaluation_result.json")
+        phase = evaluation.get("trajectory_phase") if evaluation is not None else None
+        if phase not in _TRAJECTORY_PHASES:
+            return None
+        counts[str(phase)] += 1
+    return counts
+
+
+def _maximum_physical_rounds(
+    optimization_rounds: int, maximum_repair_rounds: int
+) -> int:
+    if maximum_repair_rounds == 0:
+        return optimization_rounds
+    return maximum_repair_rounds + optimization_rounds * (
+        maximum_repair_rounds + 1
+    )
+
+
 class RunVerifier:
     """Verify committed artifacts without importing or executing candidate source."""
 
@@ -315,12 +364,6 @@ class RunVerifier:
             final_path = self.root / "tasks" / task_id / "final_result.json"
             final = _json(final_path)
             actual_rounds = len(durable_rounds)
-            expected_actual = (
-                int(final.get("repair_rounds", 0))
-                + int(final.get("optimization_rounds", 0))
-                if isinstance(final, Mapping)
-                else None
-            )
             repair_actual = (
                 int(final.get("repair_rounds", 0))
                 if isinstance(final, Mapping)
@@ -338,10 +381,34 @@ class RunVerifier:
                 else ""
             )
             fixed_protocol = maximum_repair_rounds == 0
+            artifact_rounds = _round_directories(
+                self.root / "tasks" / task_id
+            )
+            phase_counts = _trajectory_phase_counts(artifact_rounds)
+            maximum_physical_rounds = (
+                _maximum_physical_rounds(
+                    rounds_per_task, maximum_repair_rounds
+                )
+                if rounds_per_task is not None
+                else None
+            )
+            phase_count_mismatch = bool(
+                not fixed_protocol
+                and phase_counts is not None
+                and (
+                    repair_actual != phase_counts["repair"]
+                    or optimization_actual != phase_counts["optimization"]
+                    or phase_counts["optimization_repair"]
+                    > phase_counts["optimization"]
+                    * maximum_repair_rounds
+                    or sum(phase_counts.values()) != actual_rounds
+                )
+            )
             invalid_round_count = (
                 rounds_per_task is not None
                 and (
                     int(row["current_round"]) != actual_rounds
+                    or len(artifact_rounds) != actual_rounds
                     or (
                         fixed_protocol
                         and actual_rounds != rounds_per_task
@@ -350,9 +417,9 @@ class RunVerifier:
                         not fixed_protocol
                         and (
                             actual_rounds < 1
-                            or actual_rounds
-                            > rounds_per_task + maximum_repair_rounds
-                            or expected_actual != actual_rounds
+                            or maximum_physical_rounds is None
+                            or actual_rounds > maximum_physical_rounds
+                            or phase_count_mismatch
                             or repair_actual is None
                             or repair_actual < 1
                             or repair_actual > maximum_repair_rounds
@@ -463,7 +530,10 @@ class RunVerifier:
     def _verify_prompt_separation(self) -> None:
         sensitive_markers = ("hidden_seed", "secret_seed", "hidden_template", "hidden_cases")
         for pattern in ("prompt.json", "feedback.json"):
-            for path in self.root.glob(f"tasks/*/round_[0-9][0-9]/{pattern}"):
+            for round_root in _experiment_round_directories(self.root):
+                path = round_root / pattern
+                if not path.is_file() or path.is_symlink():
+                    continue
                 try:
                     text = path.read_text(encoding="utf-8")
                 except (OSError, UnicodeError):
@@ -481,9 +551,10 @@ class RunVerifier:
         environment = _json(self.root / "environment_snapshot.json") or {}
         fake_run = str(environment.get("schema_version", "")).startswith("ascend_fake_")
         artifact_root = self.root.parent
-        for evaluation_path in sorted(
-            self.root.glob("tasks/*/round_[0-9][0-9]/evaluation_result.json")
-        ):
+        for round_root in _experiment_round_directories(self.root):
+            evaluation_path = round_root / "evaluation_result.json"
+            if not evaluation_path.is_file() or evaluation_path.is_symlink():
+                continue
             evaluation = _json(evaluation_path)
             if evaluation is None:
                 continue
@@ -548,14 +619,8 @@ class RunVerifier:
             if not task_root.is_dir() or task_root.is_symlink():
                 self._add("error", "task_artifacts_missing", f"task {task_id} is missing", task_root)
                 continue
-            rounds = sorted(task_root.glob("round_[0-9][0-9]"))
+            rounds = _round_directories(task_root)
             final = _json(task_root / "final_result.json")
-            actual_expected = (
-                int(final.get("repair_rounds", 0))
-                + int(final.get("optimization_rounds", 0))
-                if isinstance(final, Mapping)
-                else None
-            )
             repair_actual = (
                 int(final.get("repair_rounds", 0))
                 if isinstance(final, Mapping)
@@ -572,6 +637,26 @@ class RunVerifier:
                 if isinstance(final, Mapping)
                 else ""
             )
+            phase_counts = _trajectory_phase_counts(rounds)
+            maximum_physical_rounds = (
+                _maximum_physical_rounds(
+                    expected_rounds, maximum_repair_rounds
+                )
+                if expected_rounds is not None
+                else None
+            )
+            phase_count_mismatch = bool(
+                maximum_repair_rounds > 0
+                and phase_counts is not None
+                and (
+                    repair_actual != phase_counts["repair"]
+                    or optimization_actual != phase_counts["optimization"]
+                    or phase_counts["optimization_repair"]
+                    > phase_counts["optimization"]
+                    * maximum_repair_rounds
+                    or sum(phase_counts.values()) != len(rounds)
+                )
+            )
             invalid_count = (
                 expected_rounds is not None
                 and (
@@ -583,9 +668,9 @@ class RunVerifier:
                         maximum_repair_rounds > 0
                         and (
                             len(rounds) < 1
-                            or len(rounds)
-                            > expected_rounds + maximum_repair_rounds
-                            or actual_expected != len(rounds)
+                            or maximum_physical_rounds is None
+                            or len(rounds) > maximum_physical_rounds
+                            or phase_count_mismatch
                             or repair_actual is None
                             or repair_actual < 1
                             or repair_actual > maximum_repair_rounds

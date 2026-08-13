@@ -26,7 +26,7 @@ def candidate(round_number: int) -> dict[str, object]:
     return {
         "status": "candidate",
         "round": round_number,
-        "change_summary": [f"round {round_number}"],
+        "optimization_summary": [f"round {round_number}"],
         "expected_effect": ["test"],
         "assumptions": [],
         "code": f"# round {round_number}\ndef custom_op(x):\n    return x\n",
@@ -64,7 +64,27 @@ class ControllerIntegrationTests(unittest.TestCase):
             model_gateway=gateway,
             backend=backend,
             environment={"device": {"name": "fake-910c"}},
-            baseline={"k01_vector_add": {"kind": "fake"}},
+            baseline={
+                "k01_vector_add": {
+                    "schema_version": "ascend_baseline_snapshot_v1",
+                    "comparison_baseline": "pytorch_eager",
+                    "pytorch_eager_geomean_us": 15.0,
+                    "per_case": [
+                        {
+                            "case_id": "b01_prime_fp16",
+                            "dtype": "float16",
+                            "params": {"n": 1_000_003},
+                            "weight": 1.0,
+                            "pytorch_eager_us": 15.0,
+                            "pytorch_eager": {
+                                "median_us": 15.0,
+                                "raw_samples_us": [14.0, 15.0, 16.0],
+                            },
+                            "measurement_attempts": [{"attempt": 1}],
+                        }
+                    ],
+                }
+            },
             hidden_seed=12345,
             allow_insecure_hidden_seed_for_testing=True,
         )
@@ -93,10 +113,54 @@ class ControllerIntegrationTests(unittest.TestCase):
             self.assertEqual(summaries[0].status, "passed")
             self.assertEqual(summaries[0].best_round, 2)
             self.assertEqual(len(gateway.requests), 3)
+            first_response = json.loads(
+                (
+                    controller.experiment_root
+                    / "tasks/k01_vector_add/round_01/model_response.json"
+                ).read_text(encoding="utf-8")
+            )
+            first_exchange = json.loads(
+                (
+                    controller.experiment_root
+                    / "tasks/k01_vector_add/round_01/model_exchange.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertIn("optimization_summary", first_response)
+            self.assertNotIn("change_summary", first_response)
+            self.assertIn(
+                "optimization_summary", first_exchange["response"]
+            )
+            first_prompt = json.loads(gateway.requests[0].user_prompt)
+            self.assertEqual(
+                first_prompt["baseline"]["per_case"],
+                [
+                    {
+                        "case_id": "b01_prime_fp16",
+                        "dtype": "float16",
+                        "median_us": 15.0,
+                        "params": {"n": 1_000_003},
+                        "weight": 1.0,
+                    }
+                ],
+            )
+            self.assertEqual(
+                first_prompt["baseline"]["summary"]["weighted_geomean_us"],
+                15.0,
+            )
+            self.assertNotIn("raw_samples_us", gateway.requests[0].user_prompt)
+            self.assertNotIn(
+                "measurement_attempts", gateway.requests[0].user_prompt
+            )
             follow_up = json.loads(gateway.requests[1].user_prompt)
-            self.assertIn("current_candidate", follow_up["round_context"])
-            self.assertNotIn("environment", follow_up)
-            self.assertNotIn("baseline", follow_up)
+            self.assertNotIn("working_candidate", follow_up["round_context"])
+            self.assertEqual(follow_up["best_candidate"]["round"], 1)
+            self.assertEqual(
+                follow_up["environment"], {"device": {"name": "fake-910c"}}
+            )
+            self.assertEqual(
+                follow_up["baseline"],
+                {"comparison_baseline": "pytorch_eager"},
+            )
             self.assertNotIn("best_candidate", follow_up["round_context"])
             self.assertNotIn("last_evaluation", follow_up["round_context"])
             self.assertIn("task_contract", follow_up)
@@ -124,6 +188,188 @@ class ControllerIntegrationTests(unittest.TestCase):
                 [json.loads(line)["sequence"] for line in first_events.splitlines()],
                 sorted(json.loads(line)["sequence"] for line in first_events.splitlines()),
             )
+
+    def test_committed_feedback_repairs_missing_database_best_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, _gateway, store = self._controller(
+                root, backend=FakeBackend(), rounds=1
+            )
+            original_run_final = controller._run_final
+            split_brain_observed = False
+
+            def run_final_after_pointer_loss(task):
+                nonlocal split_brain_observed
+                feedback_path = (
+                    controller.experiment_root
+                    / "tasks/k01_vector_add/round_01/feedback.json"
+                )
+                self.assertTrue(feedback_path.is_file())
+                feedback = json.loads(feedback_path.read_text(encoding="utf-8"))
+                expected = feedback["best_after"]["candidate_id"]
+                with (
+                    store.database.connection() as connection,
+                    store.database.transaction(connection, immediate=True),
+                ):
+                    connection.execute(
+                        """
+                        UPDATE tasks SET best_candidate_id = NULL
+                        WHERE experiment_id = ? AND task_id = ?
+                        """,
+                        (controller.experiment_id, task.id),
+                    )
+                evaluation = json.loads(
+                    (
+                        controller.experiment_root
+                        / "tasks/k01_vector_add/round_01/evaluation_result.json"
+                    ).read_text(encoding="utf-8")
+                )
+
+                controller._ensure_feedback(task, 1, evaluation)
+
+                repaired = store.get_task(controller.experiment_id, task.id)
+                assert repaired is not None
+                self.assertEqual(repaired.best_candidate_id, expected)
+                split_brain_observed = True
+                return original_run_final(task)
+
+            with patch.object(
+                controller, "_run_final", side_effect=run_final_after_pointer_loss
+            ):
+                summary = controller.run()[0]
+
+            self.assertTrue(split_brain_observed)
+            self.assertEqual(summary.best_round, 1)
+            self.assertEqual(
+                summary.best_candidate_id,
+                summary.final_result["best_candidate_id"],
+            )
+
+    def test_database_best_before_feedback_artifact_resumes_same_online_best(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, gateway, store = self._controller(
+                root, backend=FakeBackend(), rounds=1
+            )
+            original_commit = controller._commit_json
+            failed = False
+
+            def fail_first_feedback_commit(relative, value, **kwargs):
+                nonlocal failed
+                if not failed and str(relative).endswith(
+                    "tasks/k01_vector_add/round_01/feedback.json"
+                ):
+                    failed = True
+                    raise RuntimeError("injected feedback artifact crash")
+                return original_commit(relative, value, **kwargs)
+
+            with (
+                patch.object(
+                    controller,
+                    "_commit_json",
+                    side_effect=fail_first_feedback_commit,
+                ),
+                self.assertRaisesRegex(RuntimeError, "feedback artifact crash"),
+            ):
+                controller.run()
+
+            task_after_crash = store.get_task(
+                controller.experiment_id, "k01_vector_add"
+            )
+            assert task_after_crash is not None
+            selected_before_feedback = task_after_crash.best_candidate_id
+            self.assertIsNotNone(selected_before_feedback)
+            self.assertFalse(
+                (
+                    controller.experiment_root
+                    / "tasks/k01_vector_add/round_01/feedback.json"
+                ).exists()
+            )
+            model_calls = len(gateway.requests)
+
+            summary = controller.run()[0]
+
+            self.assertEqual(len(gateway.requests), model_calls)
+            self.assertEqual(summary.best_candidate_id, selected_before_feedback)
+            self.assertEqual(
+                summary.final_result["best_candidate_id"],
+                selected_before_feedback,
+            )
+            task_after_resume = store.get_task(
+                controller.experiment_id, "k01_vector_add"
+            )
+            assert task_after_resume is not None
+            self.assertEqual(
+                task_after_resume.best_candidate_id,
+                selected_before_feedback,
+            )
+
+    def test_final_replays_online_tie_instead_of_legacy_history_ranking(self) -> None:
+        public_benchmarks = [
+            StageResult.success(
+                EvaluationStage.BENCHMARK,
+                details={
+                    "status": "stable",
+                    "per_case": [],
+                    "geomean_speedup_vs_eager": 1.0,
+                    "minimum_speedup_vs_eager": 1.0,
+                    "maximum_cv": 0.02,
+                },
+            ),
+            StageResult.success(
+                EvaluationStage.BENCHMARK,
+                details={
+                    "status": "stable",
+                    "per_case": [],
+                    "geomean_speedup_vs_eager": 1.015,
+                    "minimum_speedup_vs_eager": 1.005,
+                    "maximum_cv": 0.02,
+                },
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, _gateway, store = self._controller(
+                root,
+                backend=FakeBackend(
+                    {EvaluationStage.BENCHMARK: public_benchmarks}
+                ),
+                rounds=2,
+            )
+            original_run_final = controller._run_final
+
+            def run_final_without_pointer(task):
+                with (
+                    store.database.connection() as connection,
+                    store.database.transaction(connection, immediate=True),
+                ):
+                    connection.execute(
+                        """
+                        UPDATE tasks SET best_candidate_id = NULL
+                        WHERE experiment_id = ? AND task_id = ?
+                        """,
+                        (controller.experiment_id, task.id),
+                    )
+                return original_run_final(task)
+
+            with patch.object(
+                controller, "_run_final", side_effect=run_final_without_pointer
+            ):
+                summary = controller.run()[0]
+
+            second_feedback = json.loads(
+                (
+                    controller.experiment_root
+                    / "tasks/k01_vector_add/round_02/feedback.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(second_feedback["performance_decision"], "TIE")
+            self.assertEqual(second_feedback["best_after"]["round"], 1)
+            self.assertEqual(summary.best_round, 1)
+            self.assertEqual(summary.final_result["best_round"], 1)
+            task = store.get_task(controller.experiment_id, "k01_vector_add")
+            assert task is not None
+            self.assertEqual(task.best_candidate_id, summary.best_candidate_id)
 
     def test_identical_no_change_source_reuses_public_evaluation(self) -> None:
         backend = FakeBackend()
@@ -259,19 +505,70 @@ class ControllerIntegrationTests(unittest.TestCase):
                 ["repair", "repair", "optimization", "optimization"],
             )
             second = json.loads(gateway.requests[1].user_prompt)
-            self.assertIn("source[forbidden_call]", repr(second))
+            self.assertEqual(
+                second["failed_candidate"]["raw_stage_result"]["findings"][0],
+                {
+                    "code": "forbidden_call",
+                    "message": "getattr is forbidden",
+                },
+            )
             third = json.loads(gateway.requests[2].user_prompt)
             self.assertEqual(third["phase"]["index"], 1)
-            self.assertEqual(
-                third["round_context"]["current_candidate"]["role"],
-                "best_public_candidate",
-            )
+            self.assertNotIn("working_candidate", third["round_context"])
+            self.assertEqual(third["best_candidate"]["round"], 2)
             verification = RunVerifier(
                 controller.experiment_root, database_path=config.db_path
             ).verify()
             self.assertTrue(verification["passed"], verification["issues"])
 
-    def test_correctness_repair_prompt_contains_only_compact_failed_cases(self) -> None:
+    def test_correct_unprofiled_seed_is_not_described_as_best(self) -> None:
+        backend = FakeBackend(
+            {
+                EvaluationStage.PROFILE: [
+                    StageResult.failure(
+                        EvaluationStage.PROFILE,
+                        details={
+                            "profile_available": False,
+                            "error": "smoke profile unavailable",
+                        },
+                    )
+                ]
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                self._config(root, rounds=1), maximum_repair_rounds=2
+            )
+            gateway = FakeGateway(
+                lambda request: candidate(int(request.metadata["round"]))
+            )
+            controller = ExperimentController(
+                config=config,
+                store=SQLiteStateStore(config.db_path),
+                artifacts=AtomicArtifactStore(config.artifact_root),
+                registry=TaskRegistry(config.task_root),
+                model_gateway=gateway,
+                backend=backend,
+                environment={},
+                baseline={"k01_vector_add": {"kind": "fake"}},
+                hidden_seed=12345,
+                allow_insecure_hidden_seed_for_testing=True,
+            )
+
+            controller.run()
+
+            follow_up = json.loads(gateway.requests[1].user_prompt)
+            instruction = follow_up["feedback_state"]["instruction"]
+            self.assertIn("正确但尚未形成可比较 BEST", instruction)
+            self.assertIn("benchmark 和 smoke profile", instruction)
+            self.assertNotIn("这是当前真实运行得到的 BEST", instruction)
+            self.assertEqual(
+                follow_up["round_context"]["working_candidate"]["role"],
+                "latest_correct_seed",
+            )
+
+    def test_correctness_repair_prompt_preserves_raw_failed_stage_once(self) -> None:
         correctness_failure = StageResult.failure(
             EvaluationStage.CORRECTNESS,
             details={
@@ -352,50 +649,67 @@ class ControllerIntegrationTests(unittest.TestCase):
                     controller.experiment_root
                     / "tasks/k01_vector_add/round_02/prompt.json"
                 ).read_text(encoding="utf-8")
-            )["user_prompt"]["round_context"]["previous_round"]
-            correctness = follow_up["key_metrics"]["correctness"]
+            )["user_prompt"]
+            correctness = follow_up["failed_candidate"]["raw_stage_result"]
+            self.assertNotIn(
+                "working_candidate", follow_up["round_context"]
+            )
+            self.assertNotIn(
+                "raw_failure_evidence", follow_up["failed_candidate"]
+            )
+            self.assertEqual(
+                follow_up["round_context"]["previous_round"]["key_metrics"],
+                {},
+            )
             self.assertEqual(correctness["passed_cases"], 5)
             self.assertEqual(correctness["total_cases"], 8)
             self.assertEqual(correctness["maximum_absolute_error"], 9.0)
             self.assertEqual(correctness["maximum_relative_error"], 8.0)
             self.assertEqual(
-                [case["case_id"] for case in correctness["failed_cases"]],
-                ["metadata_failure", "numeric_failure"],
+                [case["case_id"] for case in correctness["case_results"]],
+                [
+                    "metadata_failure",
+                    "numeric_failure",
+                    "third_failure_not_forwarded",
+                ],
             )
             self.assertEqual(
-                correctness["failed_cases"][0]["error"],
+                correctness["case_results"][0]["error"],
                 "output metadata or finiteness check failed",
             )
-            self.assertFalse(correctness["failed_cases"][0]["shape_ok"])
-            self.assertFalse(correctness["failed_cases"][0]["finite_ok"])
+            self.assertFalse(correctness["case_results"][0]["shape_ok"])
+            self.assertFalse(correctness["case_results"][0]["finite_ok"])
             self.assertEqual(
-                correctness["failed_cases"][1]["maximum_error_flat_index"],
+                correctness["case_results"][1]["maximum_error_flat_index"],
                 7,
             )
             self.assertEqual(
-                correctness["failed_cases"][1]["actual_at_maximum_error"],
+                correctness["case_results"][1]["actual_at_maximum_error"],
                 1.5,
             )
             self.assertEqual(
-                correctness["failed_cases"][1]["expected_at_maximum_error"],
+                correctness["case_results"][1]["expected_at_maximum_error"],
                 1.0,
             )
-            rendered = json.dumps(follow_up, ensure_ascii=False)
-            self.assertNotIn("case_results", rendered)
-            self.assertNotIn("unbounded_debug_payload", rendered)
-            self.assertNotIn("third_failure_not_forwarded", rendered)
-            diagnostic_reason = next(
-                reason
-                for reason in follow_up["failure_reasons"]
-                if reason.startswith("correctness diagnostics:")
+            self.assertEqual(
+                correctness["case_results"][0]["unbounded_debug_payload"],
+                "must-not-enter-prompt",
             )
-            self.assertIn("metadata_failure", diagnostic_reason)
-            self.assertIn("failed_checks=shape_ok,finite_ok", diagnostic_reason)
-            self.assertIn("numeric_failure", diagnostic_reason)
-            self.assertIn("maximum_absolute_error=0.5", diagnostic_reason)
-            self.assertIn("actual_at_maximum_error=1.5", diagnostic_reason)
-            self.assertIn("expected_at_maximum_error=1.0", diagnostic_reason)
-            self.assertIn("maximum_error_flat_index=7", diagnostic_reason)
+            failed_candidate = json.loads(
+                (
+                    controller.experiment_root
+                    / "tasks/k01_vector_add/round_02/prompt.json"
+                ).read_text(encoding="utf-8")
+            )["user_prompt"]["failed_candidate"]
+            self.assertEqual(
+                failed_candidate["failed_stage"], "correctness"
+            )
+            self.assertEqual(
+                failed_candidate["raw_stage_result"]["case_results"][1][
+                    "actual_at_maximum_error"
+                ],
+                1.5,
+            )
 
     def test_repair_exhaustion_finishes_without_optimization(self) -> None:
         backend = FakeBackend(
@@ -437,6 +751,160 @@ class ControllerIntegrationTests(unittest.TestCase):
                 controller.experiment_root, database_path=config.db_path
             ).verify()
             self.assertTrue(verification["passed"], verification["issues"])
+
+    def test_failed_optimization_slot_repairs_failed_candidate_without_consuming_slot(self) -> None:
+        backend = FakeBackend(
+            {
+                EvaluationStage.CORRECTNESS: [
+                    StageResult.success(
+                        EvaluationStage.CORRECTNESS,
+                        details={"passed": True, "passed_cases": 8, "total_cases": 8},
+                    ),
+                    StageResult.failure(
+                        EvaluationStage.CORRECTNESS,
+                        details={
+                            "passed": False,
+                            "passed_cases": 7,
+                            "total_cases": 8,
+                            "case_results": [
+                                {
+                                    "case_id": "bad",
+                                    "passed": False,
+                                    "maximum_absolute_error": 1.0,
+                                }
+                            ],
+                        },
+                    ),
+                ],
+                EvaluationStage.BENCHMARK: [
+                    StageResult.success(
+                        EvaluationStage.BENCHMARK,
+                        details={
+                            "status": "stable",
+                            "per_case": [],
+                            "geomean_speedup_vs_eager": 1.0,
+                            "minimum_speedup_vs_eager": 1.0,
+                            "maximum_cv": 0.01,
+                        },
+                    ),
+                    StageResult.success(
+                        EvaluationStage.BENCHMARK,
+                        details={
+                            "status": "stable",
+                            "per_case": [],
+                            "geomean_speedup_vs_eager": 1.1,
+                            "minimum_speedup_vs_eager": 1.05,
+                            "maximum_cv": 0.01,
+                        },
+                    ),
+                ],
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                self._config(root, rounds=1), maximum_repair_rounds=2
+            )
+            gateway = FakeGateway(
+                lambda request: candidate(int(request.metadata["round"]))
+            )
+            store = SQLiteStateStore(config.db_path)
+            controller = ExperimentController(
+                config=config,
+                store=store,
+                artifacts=AtomicArtifactStore(config.artifact_root),
+                registry=TaskRegistry(config.task_root),
+                model_gateway=gateway,
+                backend=backend,
+                environment={
+                    "schema_version": "ascend_fake_environment_v1",
+                    "hardware_profile": {"status": "pending_probe"},
+                },
+                baseline={"k01_vector_add": {"kind": "fake"}},
+                hidden_seed=12345,
+                allow_insecure_hidden_seed_for_testing=True,
+            )
+
+            summary = controller.run()[0]
+
+            self.assertEqual(summary.final_result["optimization_rounds"], 1)
+            self.assertEqual(len(gateway.requests), 3)
+            repaired = json.loads(gateway.requests[2].user_prompt)
+            self.assertEqual(
+                repaired["phase"]["name"], "optimization_repair"
+            )
+            self.assertEqual(
+                repaired["failed_candidate"]["code"],
+                "# round 2\ndef custom_op(x):\n    return x\n",
+            )
+            self.assertEqual(
+                repaired["failed_candidate"]["candidate_generation_intent"][
+                    "optimization_summary"
+                ],
+                ["round 2"],
+            )
+            self.assertIn(
+                "maximum_absolute_error",
+                repr(repaired["failed_candidate"]["raw_stage_result"]),
+            )
+            self.assertEqual(summary.best_round, 3)
+            verification = RunVerifier(
+                controller.experiment_root,
+                database_path=config.db_path,
+            ).verify()
+            self.assertTrue(verification["passed"], verification["issues"])
+
+    def test_model_format_repair_regenerates_from_committed_best(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                self._config(root, rounds=1), maximum_repair_rounds=1
+            )
+
+            def response(request):
+                round_number = int(request.metadata["round"])
+                return (
+                    "not valid json"
+                    if round_number == 2
+                    else candidate(round_number)
+                )
+
+            gateway = FakeGateway(response)
+            controller = ExperimentController(
+                config=config,
+                store=SQLiteStateStore(config.db_path),
+                artifacts=AtomicArtifactStore(config.artifact_root),
+                registry=TaskRegistry(config.task_root),
+                model_gateway=gateway,
+                backend=FakeBackend(),
+                environment={"prompt_environment": {"backend": "fake"}},
+                baseline={"k01_vector_add": {"kind": "fake"}},
+                hidden_seed=12345,
+                allow_insecure_hidden_seed_for_testing=True,
+            )
+
+            summary = controller.run()[0]
+
+            self.assertTrue(summary.status.startswith("passed"))
+            regenerated = json.loads(gateway.requests[-1].user_prompt)
+            self.assertEqual(regenerated["phase"]["name"], "optimization_repair")
+            self.assertEqual(regenerated["best_candidate"]["round"], 1)
+            self.assertEqual(
+                regenerated["failed_candidate"][
+                    "candidate_generation_intent"
+                ]["model_authored"],
+                False,
+            )
+            self.assertIn(
+                "model_response_error", regenerated["failed_candidate"]
+            )
+            self.assertIn(
+                "failed_candidate.model_response_error",
+                regenerated["phase"]["directive"],
+            )
+            self.assertNotIn(
+                "working_candidate", regenerated["round_context"]
+            )
 
     def test_host_dispatch_seed_stops_before_optimization_model_call(self) -> None:
         host_bound = StageResult.success(
@@ -486,6 +954,79 @@ class ControllerIntegrationTests(unittest.TestCase):
                 summary.final_result["termination_reason"],
                 "host_dispatch_limited",
             )
+
+    def test_regressed_host_bound_branch_does_not_stop_best_optimization(self) -> None:
+        benchmarks = [
+            StageResult.success(
+                EvaluationStage.BENCHMARK,
+                details={
+                    "status": "stable",
+                    "per_case": [],
+                    "geomean_speedup_vs_eager": 1.2,
+                    "minimum_speedup_vs_eager": 1.1,
+                    "maximum_cv": 0.01,
+                },
+            ),
+            StageResult.success(
+                EvaluationStage.BENCHMARK,
+                details={
+                    "status": "stable",
+                    "per_case": [],
+                    "geomean_speedup_vs_eager": 0.8,
+                    "minimum_speedup_vs_eager": 0.7,
+                    "maximum_cv": 0.01,
+                    "bottleneck_type": "host_dispatch",
+                    "host_dispatch_limited": True,
+                    "bottleneck": {
+                        "bottleneck_type": "host_dispatch",
+                        "host_dispatch_limited": True,
+                    },
+                },
+            ),
+            StageResult.success(
+                EvaluationStage.BENCHMARK,
+                details={
+                    "status": "stable",
+                    "per_case": [],
+                    "geomean_speedup_vs_eager": 1.3,
+                    "minimum_speedup_vs_eager": 1.2,
+                    "maximum_cv": 0.01,
+                },
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                self._config(root, rounds=2), maximum_repair_rounds=1
+            )
+            gateway = FakeGateway(
+                lambda request: candidate(int(request.metadata["round"]))
+            )
+            controller = ExperimentController(
+                config=config,
+                store=SQLiteStateStore(config.db_path),
+                artifacts=AtomicArtifactStore(config.artifact_root),
+                registry=TaskRegistry(config.task_root),
+                model_gateway=gateway,
+                backend=FakeBackend(
+                    {EvaluationStage.BENCHMARK: benchmarks}
+                ),
+                environment={},
+                hidden_seed=12345,
+                allow_insecure_hidden_seed_for_testing=True,
+            )
+
+            summary = controller.run()[0]
+
+            self.assertEqual(len(gateway.requests), 3)
+            self.assertEqual(summary.best_round, 3)
+            regressed = json.loads(
+                (
+                    controller.experiment_root
+                    / "tasks/k01_vector_add/round_02/feedback.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(regressed["performance_decision"], "REGRESSION")
 
     def test_complete_ten_task_five_round_offline_pipeline(self) -> None:
         """Exercise the production state graph at its full configured cardinality."""

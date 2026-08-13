@@ -8,6 +8,85 @@ from dataclasses import dataclass
 
 from .models import BenchmarkSample, CandidateScore
 
+PERFORMANCE_TIE_FLOOR = 0.01
+
+
+@dataclass(frozen=True)
+class PublicCandidateComparison:
+    """Noise-aware comparison against the incumbent public BEST.
+
+    ``candidate_selection_key`` remains the deterministic final ranking policy
+    for legacy runs.  This comparison is the online optimization policy: it
+    changes BEST only when an observed improvement is larger than benchmark
+    noise and does not hide a similarly certain worst-case regression.
+    """
+
+    decision: str
+    tolerance_fraction: float
+    geomean_change_fraction: float | None
+    minimum_change_fraction: float | None
+
+    def to_dict(self) -> dict[str, float | str | None]:
+        return {
+            "decision": self.decision,
+            "tolerance_fraction": self.tolerance_fraction,
+            "geomean_change_fraction": self.geomean_change_fraction,
+            "minimum_change_fraction": self.minimum_change_fraction,
+            "geomean_change_percent": (
+                self.geomean_change_fraction * 100.0
+                if self.geomean_change_fraction is not None
+                else None
+            ),
+            "minimum_change_percent": (
+                self.minimum_change_fraction * 100.0
+                if self.minimum_change_fraction is not None
+                else None
+            ),
+        }
+
+
+def compare_public_candidate(
+    candidate: CandidateScore,
+    incumbent: CandidateScore | None,
+    *,
+    tie_floor: float = PERFORMANCE_TIE_FLOOR,
+) -> PublicCandidateComparison:
+    """Classify a measured public candidate as INITIAL/NEW_BEST/TIE/REGRESSION."""
+
+    if not math.isfinite(tie_floor) or tie_floor < 0:
+        raise ValueError("tie_floor must be finite and non-negative")
+    if not candidate.is_publicly_valid:
+        return PublicCandidateComparison(
+            "INVALID", tie_floor, None, None
+        )
+    if incumbent is None:
+        return PublicCandidateComparison(
+            "INITIAL_BEST", tie_floor, None, None
+        )
+    if not incumbent.is_publicly_valid:
+        raise ValueError("incumbent BEST must be publicly valid")
+
+    assert candidate.geomean_speedup is not None
+    assert candidate.minimum_speedup is not None
+    assert incumbent.geomean_speedup is not None
+    assert incumbent.minimum_speedup is not None
+    tolerance = max(
+        tie_floor,
+        candidate.stability_cv or 0.0,
+        incumbent.stability_cv or 0.0,
+    )
+    geomean_delta = candidate.geomean_speedup / incumbent.geomean_speedup - 1.0
+    minimum_delta = candidate.minimum_speedup / incumbent.minimum_speedup - 1.0
+    if geomean_delta > tolerance and minimum_delta >= -tolerance:
+        decision = "NEW_BEST"
+    elif geomean_delta < -tolerance or minimum_delta < -tolerance:
+        decision = "REGRESSION"
+    else:
+        decision = "TIE"
+    return PublicCandidateComparison(
+        decision, tolerance, geomean_delta, minimum_delta
+    )
+
 
 def weighted_geometric_mean(samples: Iterable[BenchmarkSample]) -> float:
     """Compute a weighted geometric mean in log space.

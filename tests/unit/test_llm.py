@@ -65,7 +65,7 @@ def candidate(round_number: int = 1) -> dict[str, object]:
     return {
         "status": "candidate",
         "round": round_number,
-        "change_summary": ["coalesced loads"],
+        "optimization_summary": ["coalesced loads"],
         "expected_effect": ["lower latency"],
         "assumptions": [],
         "code": "def custom_op(x):\n    return x\n",
@@ -76,10 +76,82 @@ class ResponseTests(unittest.TestCase):
     def test_strict_response_validation(self) -> None:
         response = validate_model_response(candidate(), expected_round=1)
         self.assertEqual(response.status, "candidate")
+        self.assertEqual(response.optimization_summary, ("coalesced loads",))
+        self.assertIn("optimization_summary", response.to_dict())
+        self.assertNotIn("change_summary", response.to_dict())
         invalid = candidate()
         invalid["extra"] = True
         with self.assertRaises(ModelResponseError):
             validate_model_response(invalid)
+
+    def test_legacy_change_summary_artifact_is_read_and_normalized(self) -> None:
+        legacy = candidate()
+        legacy["change_summary"] = legacy.pop("optimization_summary")
+
+        response = validate_model_response(
+            legacy,
+            expected_round=1,
+            allow_legacy=True,
+        )
+
+        self.assertEqual(response.optimization_summary, ("coalesced loads",))
+        self.assertEqual(
+            response.to_dict()["optimization_summary"], ["coalesced loads"]
+        )
+        self.assertNotIn("change_summary", response.to_dict())
+
+    def test_live_validation_rejects_legacy_change_summary(self) -> None:
+        legacy = candidate()
+        legacy["change_summary"] = legacy.pop("optimization_summary")
+
+        with self.assertRaisesRegex(
+            ModelResponseError, "committed historical artifacts"
+        ):
+            validate_model_response(legacy, expected_round=1)
+
+    def test_live_completion_rejects_legacy_or_empty_optimization_summary(
+        self,
+    ) -> None:
+        legacy = candidate()
+        legacy["change_summary"] = legacy.pop("optimization_summary")
+        empty = candidate()
+        empty["optimization_summary"] = []
+
+        for invalid in (legacy, empty):
+            with (
+                self.subTest(fields=sorted(invalid)),
+                self.assertRaises(ModelResponseAttemptsExhausted),
+            ):
+                complete_model_response(
+                    ReplayGateway([invalid]),
+                    ModelRequest("system", "request"),
+                    expected_round=1,
+                    maximum_format_repair_retries=0,
+                )
+
+    def test_new_request_schema_requires_only_optimization_summary(self) -> None:
+        schema = ModelRequest("system", "request").json_schema
+
+        self.assertIn("optimization_summary", schema["required"])
+        self.assertNotIn("change_summary", schema["required"])
+        self.assertIn("optimization_summary", schema["properties"])
+        self.assertNotIn("change_summary", schema["properties"])
+
+    def test_duplicate_current_and_legacy_summary_is_rejected(self) -> None:
+        duplicate = candidate()
+        duplicate["change_summary"] = ["ambiguous legacy value"]
+        with self.assertRaisesRegex(ModelResponseError, "mutually exclusive"):
+            validate_model_response(duplicate)
+
+    def test_current_optimization_summary_must_be_model_authored_and_nonempty(self) -> None:
+        for summary in ([], ["  "]):
+            with self.subTest(summary=summary):
+                invalid = candidate()
+                invalid["optimization_summary"] = summary
+                with self.assertRaisesRegex(
+                    ModelResponseError, "at least one non-empty"
+                ):
+                    validate_model_response(invalid)
 
     def test_finish_reason_length_is_rejected(self) -> None:
         completion = ModelCompletion(json.dumps(candidate()), "length", {})
@@ -163,6 +235,7 @@ class PromptTests(unittest.TestCase):
         self.assertIn("包括 n == 0 等提前返回", SYSTEM_PROMPT)
         self.assertIn("不得调用自定义 Python 辅助函数", SYSTEM_PROMPT)
         self.assertIn("coreDim)必须小于等于 65535", SYSTEM_PROMPT)
+        self.assertIn("optimization_summary 必须在生成候选时同步概括", SYSTEM_PROMPT)
 
     def test_first_and_followup_prompts_remove_hidden_content_recursively(self) -> None:
         builder = PromptBuilder()
@@ -190,17 +263,99 @@ class PromptTests(unittest.TestCase):
         followup_payload = json.loads(followup.user_prompt)
         self.assertNotIn("DO_NOT_LEAK", followup.user_prompt)
         self.assertEqual(
-            followup_payload["round_context"]["current_candidate"]["code"],
+            followup_payload["round_context"]["working_candidate"]["code"],
             "def custom_op(x):\n    return x\n",
         )
-        self.assertNotIn("environment", followup_payload)
-        self.assertNotIn("baseline", followup_payload)
+        self.assertEqual(followup_payload["environment"], {})
+        self.assertEqual(followup_payload["baseline"], {})
         self.assertIn("source_checker_contract", followup_payload)
         self.assertIn("legal_structure_template", followup_payload["source_checker_contract"])
         self.assertEqual(followup_payload["task_contract"], {})
         self.assertEqual(followup_payload["round_context"]["history_summary"], [])
-        self.assertNotIn("best_candidate", followup.user_prompt)
+        self.assertIsNone(followup_payload["best_candidate"])
         self.assertNotIn("last_evaluation", followup.user_prompt)
+
+    def test_collection_strategy_counts_per_optimization_repair_budget(self) -> None:
+        request = PromptBuilder().build_first_round(
+            task={"task_id": "k01"},
+            environment={},
+            baseline={},
+            maximum_rounds=23,
+            optimization_rounds=5,
+            maximum_repair_rounds=3,
+        )
+        strategy = json.loads(request.user_prompt)["collection_strategy"]
+        self.assertEqual(strategy["maximum_total_rounds"], 23)
+
+    def test_first_repair_generates_from_task_and_hardware_without_failure_context(
+        self,
+    ) -> None:
+        request = PromptBuilder().build_first_round(
+            task={"task_id": "k01"},
+            environment={"backend": "triton-ascend"},
+            baseline={"comparison_baseline": "pytorch_eager"},
+            phase="repair",
+            phase_index=1,
+            optimization_rounds=5,
+            maximum_repair_rounds=3,
+        )
+
+        payload = json.loads(request.user_prompt)
+        directive = payload["phase"]["directive"]
+        self.assertIn("首次 Repair", directive)
+        self.assertIn("task、environment、baseline", directive)
+        self.assertIn("尚无 previous_round 或 failed_candidate", directive)
+        self.assertNotIn("previous_round", payload["round_context"])
+        self.assertIsNone(payload["round_context"]["current_candidate"])
+        self.assertIn("首次生成", payload["objective"]["first"])
+
+    def test_prompts_receive_only_compact_hardware_projection(self) -> None:
+        compact = {
+            "backend": "triton-ascend",
+            "execution": {"matrix_units": 24, "vector_units": 48},
+        }
+        environment_snapshot = {
+            "schema_version": "ascend_prompt_environment_v1",
+            "prompt_environment": compact,
+            "environment": {"raw_marker": "MUST_NOT_ENTER_PROMPT"},
+            "capabilities": {"raw_marker": "MUST_NOT_ENTER_PROMPT"},
+            "profiler": {"raw_marker": "MUST_NOT_ENTER_PROMPT"},
+            "hardware_profile_evidence": {
+                "path": "hardware_probe/full.json",
+                "file_sha256": "b" * 64,
+                "profile": {
+                    "compiler_runtime": {
+                        "versions": {
+                            "raw_version_file": "FULL_PROFILE_MUST_NOT_ENTER_PROMPT"
+                        }
+                    },
+                    "raw_evidence": {
+                        "probe_output": "FULL_PROFILE_MUST_NOT_ENTER_PROMPT"
+                    },
+                },
+            },
+        }
+        builder = PromptBuilder()
+        first = builder.build_first_round(
+            task={"task_id": "k01"},
+            environment=environment_snapshot,
+            baseline={},
+        )
+        followup = builder.build_follow_up(
+            round_number=2,
+            maximum_rounds=5,
+            last_candidate_code="",
+            key_metrics={},
+            failure_reasons=[],
+            next_round_suggestions=[],
+            environment=environment_snapshot,
+        )
+        for request in (first, followup):
+            payload = json.loads(request.user_prompt)
+            self.assertEqual(payload["environment"], compact)
+            self.assertNotIn("MUST_NOT_ENTER_PROMPT", request.user_prompt)
+            self.assertNotIn("FULL_PROFILE_MUST_NOT_ENTER_PROMPT", request.user_prompt)
+            self.assertNotIn("hardware_profile_evidence", request.user_prompt)
 
     def test_repair_followup_is_bounded_and_phase_aware(self) -> None:
         request = PromptBuilder().build_follow_up(
@@ -213,7 +368,7 @@ class PromptTests(unittest.TestCase):
             task_contract={"task_id": "k01", "description": "add"},
             candidate_round=2,
             candidate_role="latest_repair_candidate",
-            last_candidate_code="def custom_op(x):\n    return x\n",
+            last_candidate_code="",
             key_metrics={"source": {"status": "fail"}},
             failure_reasons=["source[forbidden_call]: getattr is forbidden"],
             next_round_suggestions=["remove getattr"],
@@ -221,12 +376,26 @@ class PromptTests(unittest.TestCase):
                 {"round": 1, "status": "source_failed"},
                 {"round": 2, "status": "source_failed"},
             ],
+            failed_candidate={
+                "round": 2,
+                "code": "def custom_op(x):\n    return x\n",
+                "raw_stage_result": {
+                    "status": "fail",
+                    "details": {"findings": ["getattr is forbidden"]},
+                },
+            },
         )
         payload = json.loads(request.user_prompt)
         self.assertEqual(payload["phase"]["name"], "repair")
         self.assertEqual(payload["phase"]["index"], 3)
-        self.assertIn("failed_cases", payload["phase"]["directive"])
-        self.assertIn("current_candidate", payload["phase"]["directive"])
+        self.assertIn(
+            "failed_candidate.raw_stage_result",
+            payload["phase"]["directive"],
+        )
+        self.assertEqual(
+            payload["failed_candidate"]["raw_stage_result"]["status"],
+            "fail",
+        )
         self.assertIn(
             "coreDim must be <= 65535",
             payload["source_checker_contract"]["runtime_launch_constraints"][0],
@@ -234,12 +403,11 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(request.metadata["phase"], "repair")
         self.assertGreater(request.metadata["user_prompt_utf8_bytes"], 0)
         self.assertGreater(request.metadata["system_prompt_utf8_bytes"], 0)
-        self.assertEqual(
-            payload["round_context"]["current_candidate"]["round"], 2
-        )
+        self.assertNotIn("working_candidate", payload["round_context"])
+        self.assertEqual(payload["failed_candidate"]["round"], 2)
         self.assertEqual(len(payload["round_context"]["history_summary"]), 2)
-        self.assertNotIn("environment", payload)
-        self.assertNotIn("baseline", payload)
+        self.assertEqual(payload["environment"], {})
+        self.assertEqual(payload["baseline"], {})
 
 
 class ProviderSafetyTests(unittest.TestCase):

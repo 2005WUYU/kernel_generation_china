@@ -800,6 +800,79 @@ class SQLiteStateStore:
             ).fetchall()
         return [self._score_from_row(row) for row in rows]
 
+    def set_best_candidate(
+        self,
+        experiment_id: str,
+        task_id: str,
+        candidate_id: str,
+        *,
+        reason: str,
+        now: datetime | None = None,
+    ) -> CandidateScore:
+        """Persist an already-computed online BEST decision atomically."""
+
+        now = now or utc_now()
+        with (
+            self.database.connection() as connection,
+            self.database.transaction(connection, immediate=True),
+        ):
+            row = connection.execute(
+                """
+                SELECT score.* FROM candidate_scores AS score
+                JOIN candidates AS candidate USING (candidate_id)
+                WHERE score.candidate_id = ? AND candidate.experiment_id = ?
+                  AND candidate.task_id = ?
+                """,
+                (candidate_id, experiment_id, task_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(candidate_id)
+            score = self._score_from_row(row)
+            if not score.is_publicly_valid:
+                raise ValueError("BEST candidate must be publicly valid")
+            task_row = connection.execute(
+                """
+                SELECT best_candidate_id FROM tasks
+                WHERE experiment_id = ? AND task_id = ?
+                """,
+                (experiment_id, task_id),
+            ).fetchone()
+            if task_row is None:
+                raise KeyError((experiment_id, task_id))
+            previous = task_row["best_candidate_id"]
+            if previous == candidate_id:
+                return score
+            connection.execute(
+                """
+                UPDATE tasks SET best_candidate_id = ?, updated_at = ?,
+                                 version = version + 1
+                WHERE experiment_id = ? AND task_id = ?
+                """,
+                (
+                    candidate_id,
+                    datetime_to_timestamp(now),
+                    experiment_id,
+                    task_id,
+                ),
+            )
+            self.events._append_in_transaction(
+                connection,
+                event_type="BEST_CANDIDATE_SELECTED",
+                aggregate_type="task",
+                aggregate_id=f"{experiment_id}/{task_id}",
+                experiment_id=experiment_id,
+                task_id=task_id,
+                payload={
+                    "candidate_id": candidate_id,
+                    "round_number": score.round_number,
+                    "previous_candidate_id": previous,
+                    "selection_reason": reason,
+                    "require_hidden_correctness": False,
+                },
+                occurred_at=now,
+            )
+            return score
+
     def select_and_set_best_candidate(
         self,
         experiment_id: str,

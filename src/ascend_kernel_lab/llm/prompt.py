@@ -31,6 +31,7 @@ SYSTEM_PROMPT = """你负责生成可在华为昇腾 Triton-Ascend 环境运行�
 14. 不要在候选源码中实现 cache、warmup、benchmark、计时、异常捕获或任何运行时探测; 这些由评测框架负责。
 15. Triton Kernel 名称必须是至少 8 个字符的具体标识符; custom_op 是普通 Python host wrapper, 不能用 @triton.jit 装饰。
 16. 对每个公开用例, launch grid 的 program 总数(coreDim)必须小于等于 65535; 不要为每个元素或每行盲目启动一个 program, 应通过 BLOCK/tiling 让每个 program 处理多个元素。
+17. optimization_summary 必须在生成候选时同步概括 code 中实际采用的具体修改或初始实现选择; 不得留给评测系统事后推断, expected_effect 则单独写预期影响。
 """
 
 
@@ -97,7 +98,11 @@ def _cold_start_sft_strategy(
         "repair_then_optimize": maximum_repair_rounds > 0,
         "maximum_repair_rounds": maximum_repair_rounds,
         "optimization_round_count": optimization_rounds,
-        "maximum_total_rounds": optimization_rounds + maximum_repair_rounds,
+        # Each performance proposal may need its own bounded repair chain.
+        # The initial repair seed and those per-slot repairs use consecutive
+        # durable round numbers and therefore all count toward the maximum.
+        "maximum_total_rounds": maximum_repair_rounds
+        + optimization_rounds * (maximum_repair_rounds + 1),
         "target_speedup": None,
         "comparison_baseline": "pytorch_eager",
         "policy": (
@@ -114,25 +119,51 @@ def _phase_context(
     phase_index: int,
     optimization_rounds: int,
     maximum_repair_rounds: int,
+    initial_generation: bool = False,
+    failure_evidence_path: str | None = None,
 ) -> dict[str, Any]:
-    if phase not in {"repair", "optimization"}:
-        raise ValueError("phase must be repair or optimization")
+    if phase not in {"repair", "optimization", "optimization_repair"}:
+        raise ValueError(
+            "phase must be repair, optimization, or optimization_repair"
+        )
     if phase_index < 1:
         raise ValueError("phase_index must be at least one")
     if optimization_rounds < 1 or maximum_repair_rounds < 0:
         raise ValueError("invalid repair/optimization round counts")
+    if phase == "repair" and initial_generation:
+        directive = (
+            "这是首次 Repair, 尚无 previous_round 或 failed_candidate; "
+            "请直接依据 task、environment、baseline 和 source_checker_contract "
+            "首次生成完整 Kernel, 优先保证 source/compile/correctness"
+        )
+    elif phase in {"repair", "optimization_repair"}:
+        evidence_path = (
+            failure_evidence_path
+            or "failed_candidate.raw_stage_result"
+        )
+        if evidence_path == "failed_candidate.model_response_error":
+            directive = (
+                "上一轮模型响应格式失败, 没有可继续修复的 failed_candidate.code; "
+                "请从 task 或 BEST 重新生成完整 Kernel; "
+                "本轮原始格式错误位于 failed_candidate.model_response_error"
+            )
+        else:
+            directive = (
+                "从 failed_candidate.code 完整源码出发, 保留已通过的阶段; "
+                f"本轮原始错误位于 {evidence_path}; "
+                "必须只依据该原始证据精确修复, 不做无关性能改写"
+            )
+    else:
+        directive = (
+            "从已正确候选出发做一次可解释的性能修改; "
+            "始终保持 source/compile/correctness"
+        )
     return {
         "name": phase,
         "index": phase_index,
         "maximum_repair_rounds": maximum_repair_rounds,
         "optimization_rounds": optimization_rounds,
-        "directive": (
-            "从 current_candidate 完整源码出发, 保留已通过的阶段; "
-            "优先使用 previous_round 中的编译错误或 failed_cases 精确修复 "
-            "source/compile/correctness, 不做无关性能改写"
-            if phase == "repair"
-            else "从已正确候选出发做一次可解释的性能修改; 始终保持 source/compile/correctness"
-        ),
+        "directive": directive,
     }
 
 _SENSITIVE_EXACT = {
@@ -188,6 +219,13 @@ def _public_json(value: Any, *, path: str = "$", depth: int = 0) -> Any:
     raise TypeError(f"prompt payload contains unsupported type at {path}: {type(value).__name__}")
 
 
+def _prompt_environment(environment: Mapping[str, Any]) -> Mapping[str, Any]:
+    compact = environment.get("prompt_environment")
+    if isinstance(compact, Mapping):
+        return compact
+    return environment
+
+
 class PromptBuilder:
     """Build canonical JSON requests while recursively removing hidden data."""
 
@@ -234,6 +272,7 @@ class PromptBuilder:
             phase_index=phase_index,
             optimization_rounds=optimization_count,
             maximum_repair_rounds=maximum_repair_rounds,
+            initial_generation=True,
         )
         payload = {
             "protocol_version": self.protocol_version,
@@ -242,7 +281,7 @@ class PromptBuilder:
             ),
             "phase": phase_context,
             "task": task,
-            "environment": environment,
+            "environment": _prompt_environment(environment),
             "baseline": baseline,
             "source_checker_contract": SOURCE_CHECKER_CONTRACT,
             "round_context": {
@@ -259,8 +298,8 @@ class PromptBuilder:
         }
         if objective is None and phase == "repair":
             payload["objective"] = {
-                "first": "修复 source checker 错误",
-                "second": "修复编译和公开正确性错误",
+                "first": "首次生成满足 source checker 契约的完整 Kernel",
+                "second": "使首次候选通过编译和公开正确性",
                 "third": "得到可作为 Optimization 起点的正确 Kernel; 本轮不要求性能提升",
             }
         elif objective is None:
@@ -297,9 +336,14 @@ class PromptBuilder:
         failure_reasons: Sequence[str],
         next_round_suggestions: Sequence[str],
         task_contract: Mapping[str, Any] | None = None,
+        environment: Mapping[str, Any] | None = None,
+        baseline: Mapping[str, Any] | None = None,
         candidate_round: int | None = None,
         candidate_role: str = "current_best",
         history_summary: Sequence[Mapping[str, Any]] = (),
+        feedback_state: Mapping[str, Any] | None = None,
+        best_candidate: Mapping[str, Any] | None = None,
+        failed_candidate: Mapping[str, Any] | None = None,
         phase: str = "optimization",
         phase_index: int | None = None,
         optimization_rounds: int | None = None,
@@ -307,35 +351,53 @@ class PromptBuilder:
         model: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ModelRequest:
-        if not 2 <= round_number <= maximum_rounds:
-            raise ValueError("follow-up round must be between 2 and maximum_rounds")
+        if round_number < 2:
+            raise ValueError("follow-up round must be at least 2")
         optimization_count = optimization_rounds or maximum_rounds
         phase_context = _phase_context(
             phase=phase,
             phase_index=phase_index or round_number,
             optimization_rounds=optimization_count,
             maximum_repair_rounds=maximum_repair_rounds,
+            failure_evidence_path=(
+                "failed_candidate.raw_stage_result"
+                if isinstance(failed_candidate, Mapping)
+                and "raw_stage_result" in failed_candidate
+                else (
+                    "failed_candidate.model_response_error"
+                    if isinstance(failed_candidate, Mapping)
+                    and "model_response_error" in failed_candidate
+                    else None
+                )
+            ),
         )
+        round_context: dict[str, Any] = {
+            "round": round_number,
+            "maximum_rounds": maximum_rounds,
+            "previous_round": {
+                "key_metrics": key_metrics,
+                "failure_reasons": list(failure_reasons),
+                "next_round_suggestions": list(next_round_suggestions),
+            },
+            "history_summary": list(history_summary),
+        }
+        if last_candidate_code:
+            round_context["working_candidate"] = {
+                "round": candidate_round,
+                "role": candidate_role,
+                "code": last_candidate_code,
+            }
         payload = {
             "protocol_version": self.protocol_version,
             "phase": phase_context,
             "task_contract": task_contract or {},
+            "environment": _prompt_environment(environment or {}),
+            "baseline": baseline or {},
             "source_checker_contract": SOURCE_CHECKER_CONTRACT,
-            "round_context": {
-                "round": round_number,
-                "maximum_rounds": maximum_rounds,
-                "current_candidate": {
-                    "round": candidate_round,
-                    "role": candidate_role,
-                    "code": last_candidate_code,
-                },
-                "previous_round": {
-                    "key_metrics": key_metrics,
-                    "failure_reasons": list(failure_reasons),
-                    "next_round_suggestions": list(next_round_suggestions),
-                },
-                "history_summary": list(history_summary),
-            },
+            "round_context": round_context,
+            "feedback_state": feedback_state or {},
+            "best_candidate": best_candidate,
+            "failed_candidate": failed_candidate,
         }
         user_prompt = self._render(payload)
         return ModelRequest(

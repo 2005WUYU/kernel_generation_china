@@ -9,7 +9,7 @@ DEVICE_IDS=${AKG_DEVICE_IDS:-0,2,4,6,8,10,12,14}
 RUN_ROOT=$PROJECT_ROOT/runs/$EXPERIMENT_ID
 START_EPOCH=$(date +%s)
 
-TASKS='k01_vector_add
+DEFAULT_TASKS='k01_vector_add
 k02_bias_gelu
 k03_swiglu
 k04_transpose
@@ -19,6 +19,57 @@ k07_layernorm
 k08_rope
 k09_gemm
 k10_gemm_bias_gelu'
+
+task_ids() {
+    python3 - "$PROJECT_ROOT/runs/metadata.db" "$RUN_ROOT" "$EXPERIMENT_ID" $DEFAULT_TASKS <<'PY'
+import json
+import pathlib
+import sqlite3
+import sys
+
+database_path = pathlib.Path(sys.argv[1])
+run_root = pathlib.Path(sys.argv[2])
+experiment_id = sys.argv[3]
+fallback = sys.argv[4:]
+selected = []
+
+if database_path.is_file():
+    try:
+        connection = sqlite3.connect(
+            f"file:{database_path}?mode=ro", uri=True, timeout=2.0
+        )
+        try:
+            selected = [
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT task_id FROM tasks
+                    WHERE experiment_id = ? ORDER BY task_id
+                    """,
+                    (experiment_id,),
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        selected = []
+
+if not selected:
+    manifest_path = run_root / "experiment.json"
+    try:
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        configured = document.get("experiment", {}).get("tasks", [])
+        if isinstance(configured, list) and all(
+            isinstance(value, str) and value for value in configured
+        ):
+            selected = configured
+    except (OSError, TypeError, json.JSONDecodeError):
+        selected = []
+
+for task_id in selected or fallback:
+    print(task_id)
+PY
+}
 
 worker_counts() {
     running=0
@@ -48,9 +99,10 @@ claude_count() {
 }
 
 task_snapshot() {
-    python3 - "$PROJECT_ROOT/runs/metadata.db" "$RUN_ROOT" "$EXPERIMENT_ID" $TASKS <<'PY'
+    python3 - "$PROJECT_ROOT/runs/metadata.db" "$RUN_ROOT" "$EXPERIMENT_ID" "$@" <<'PY'
 import json
 import pathlib
+import re
 import sqlite3
 import sys
 
@@ -84,7 +136,9 @@ if manifest_path.is_file():
         manifest = manifest_document.get("experiment", {})
         optimization_budget = int(manifest.get("rounds_per_task", 5))
         repair_budget = int(manifest.get("maximum_repair_rounds", 0))
-        maximum_rounds = optimization_budget + repair_budget
+        maximum_rounds = repair_budget + optimization_budget * (
+            repair_budget + 1
+        )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         optimization_budget = 5
         repair_budget = 0
@@ -132,6 +186,50 @@ def json_object(raw):
     return value if isinstance(value, dict) else {}
 
 
+def round_phase(round_root):
+    phase_name = None
+    phase_index = None
+    repair_attempt = None
+    prompt_path = round_root / "prompt.json"
+    if prompt_path.is_file():
+        try:
+            prompt = json.loads(prompt_path.read_text(encoding="utf-8"))
+            metadata = prompt.get("metadata", {})
+            phase_name = metadata.get("phase")
+            phase_index = metadata.get("phase_index")
+            user_prompt = prompt.get("user_prompt", {})
+            if isinstance(user_prompt, dict):
+                feedback_state = user_prompt.get("feedback_state", {})
+                if isinstance(feedback_state, dict):
+                    repair_attempt = feedback_state.get("repair_attempt")
+        except (OSError, json.JSONDecodeError):
+            pass
+    evaluation_path = round_root / "evaluation_result.json"
+    if evaluation_path.is_file():
+        try:
+            evaluation = json.loads(
+                evaluation_path.read_text(encoding="utf-8")
+            )
+            phase_name = evaluation.get("trajectory_phase", phase_name)
+            phase_index = evaluation.get("phase_index", phase_index)
+            repair_attempt = evaluation.get("repair_attempt", repair_attempt)
+        except (OSError, json.JSONDecodeError):
+            pass
+    return phase_name, phase_index, repair_attempt, prompt_path.is_file()
+
+
+def phase_marker(phase_name, phase_index, repair_attempt):
+    if phase_name == "repair":
+        return f"[REP{phase_index}]"
+    if phase_name == "optimization":
+        return f"[OPT{phase_index}]"
+    if phase_name == "optimization_repair":
+        if repair_attempt not in (None, 0):
+            return f"[OPT{phase_index}-REP{repair_attempt}]"
+        return f"[OPTREP{phase_index}]"
+    return ""
+
+
 def queue_stage(task_id, round_number):
     value = latest.get((task_id, round_number))
     if value is None:
@@ -174,6 +272,16 @@ for task_id in task_ids:
     termination_reason = None
     completed_repairs = 0
     completed_optimizations = 0
+    completed_optimization_repairs = 0
+    task_root = run_root / "tasks" / task_id
+    round_numbers = []
+    if task_root.is_dir():
+        for path in task_root.iterdir():
+            match = re.fullmatch(r"round_(\d+)", path.name)
+            if match is not None and path.is_dir():
+                round_numbers.append(int(match.group(1)))
+                if round_phase(path)[0] == "optimization_repair":
+                    completed_optimization_repairs += 1
     if final_path.is_file():
         try:
             final_value = json.loads(final_path.read_text(encoding="utf-8"))
@@ -181,7 +289,7 @@ for task_id in task_ids:
             termination_reason = str(final_value.get("termination_reason", "-"))
             completed_repairs = int(final_value.get("repair_rounds", 0))
             completed_optimizations = int(final_value.get("optimization_rounds", 0))
-            final_rounds = completed_repairs + completed_optimizations
+            final_rounds = max(round_numbers, default=0)
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             final_rounds = None
     fields = [task_id]
@@ -190,26 +298,19 @@ for task_id in task_ids:
             (
                 f"FINAL={final_status}",
                 f"STOP={termination_reason}",
-                f"ROUNDS=REP{completed_repairs}/OPT{completed_optimizations}",
+                f"ROUNDS=REP{completed_repairs}/OPT{completed_optimizations}"
+                f"/OPTREP{completed_optimization_repairs}",
             )
         )
-    for round_number in range(1, maximum_rounds + 1):
+    display_rounds = max(maximum_rounds, max(round_numbers, default=0))
+    for round_number in range(1, display_rounds + 1):
         round_root = (
             run_root / "tasks" / task_id / f"round_{round_number:02d}"
         )
-        phase = ""
-        prompt_path = round_root / "prompt.json"
-        if prompt_path.is_file():
-            try:
-                prompt = json.loads(prompt_path.read_text(encoding="utf-8"))
-                metadata = prompt.get("metadata", {})
-                phase_name = metadata.get("phase")
-                phase_index = metadata.get("phase_index")
-                if phase_name in {"repair", "optimization"}:
-                    short = "REP" if phase_name == "repair" else "OPT"
-                    phase = f"[{short}{phase_index}]"
-            except (OSError, json.JSONDecodeError):
-                pass
+        phase_name, phase_index, repair_attempt, prompt_exists = round_phase(
+            round_root
+        )
+        phase = phase_marker(phase_name, phase_index, repair_attempt)
         evaluation_path = round_root / "evaluation_result.json"
         if final_rounds is not None and round_number > final_rounds:
             if final_status == "repair_exhausted":
@@ -236,7 +337,7 @@ for task_id in task_ids:
             stage = queue_stage(task_id, round_number)
         elif (round_root / "model_response.json").is_file():
             stage = "模型已返回"
-        elif prompt_path.is_file():
+        elif prompt_exists:
             stage = "等待模型"
         else:
             stage = "未开始"
@@ -247,7 +348,7 @@ PY
 
 final_count() {
     count=0
-    for task_id in $TASKS; do
+    for task_id in "$@"; do
         if [ -f "$RUN_ROOT/tasks/$task_id/final_result.json" ]; then
             count=$((count + 1))
         fi
@@ -263,9 +364,10 @@ elapsed_time() {
 
 print_final_summary() {
     echo "===== FINAL SUMMARY elapsed=$(elapsed_time) ====="
-    python3 - "$RUN_ROOT" $TASKS <<'PY'
+    python3 - "$RUN_ROOT" "$@" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 root = pathlib.Path(sys.argv[1])
@@ -276,6 +378,24 @@ for task_id in sys.argv[2:]:
     status = str(result.get("status", "-"))
     if status.startswith("passed"):
         passed += 1
+
+    task_root = root / "tasks" / task_id
+    actual_rounds = 0
+    optimization_repairs = 0
+    if task_root.is_dir():
+        for round_root in task_root.iterdir():
+            if re.fullmatch(r"round_(\d+)", round_root.name) is None:
+                continue
+            if not round_root.is_dir():
+                continue
+            actual_rounds += 1
+            evaluation_path = round_root / "evaluation_result.json"
+            if evaluation_path.is_file():
+                evaluation = json.loads(
+                    evaluation_path.read_text(encoding="utf-8")
+                )
+                if evaluation.get("trajectory_phase") == "optimization_repair":
+                    optimization_repairs += 1
 
     def show(value):
         if value is None:
@@ -289,6 +409,7 @@ for task_id in sys.argv[2:]:
         f"termination={show(result.get('termination_reason'))} "
         f"REP={show(result.get('repair_rounds'))} "
         f"OPT={show(result.get('optimization_rounds'))} "
+        f"OPT_REPAIR={optimization_repairs} ACTUAL={actual_rounds} "
         f"best_round={show(result.get('best_round'))} "
         f"hidden_correct={show(result.get('hidden_correctness_passed'))} "
         f"hidden_geo={show(result.get('speedup_geomean'))} "
@@ -300,13 +421,15 @@ PY
 
 last_snapshot=''
 while :; do
+    selected_tasks=$(task_ids)
+    task_total=$(printf '%s\n' "$selected_tasks" | awk 'NF { count += 1 } END { print count + 0 }')
     workers=$(worker_counts)
     claude=$(claude_count)
-    finals=$(final_count)
-    tasks=$(task_snapshot)
+    finals=$(final_count $selected_tasks)
+    tasks=$(task_snapshot $selected_tasks)
     controller_running=$(docker container inspect --format '{{.State.Running}}' \
         "$CONTROLLER_NAME" 2>/dev/null || true)
-    snapshot="WORKERS=$workers CLAUDE=$claude FINAL=$finals/10 CONTROLLER=${controller_running:-absent}
+    snapshot="WORKERS=$workers CLAUDE=$claude FINAL=$finals/$task_total CONTROLLER=${controller_running:-absent}
 $tasks"
 
     if [ "$snapshot" != "$last_snapshot" ]; then
@@ -316,11 +439,11 @@ $tasks"
     fi
 
     if [ "$controller_running" != true ]; then
-        if [ "$finals" -eq 10 ]; then
-            print_final_summary
+        if [ "$task_total" -gt 0 ] && [ "$finals" -eq "$task_total" ]; then
+            print_final_summary $selected_tasks
             exit 0
         fi
-        echo "Controller 已停止，但只生成了 $finals/10 个最终结果。" >&2
+        echo "Controller 已停止，但只生成了 $finals/$task_total 个最终结果。" >&2
         echo '===== CONTROLLER LOG =====' >&2
         docker logs --tail 100 "$CONTROLLER_NAME" >&2 || true
         exit 1

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import math
@@ -16,8 +17,8 @@ from ascend_kernel_lab.domain import (
     ExperimentState,
     RoundState,
     TaskState,
+    compare_public_candidate,
     compute_reward,
-    select_best_candidate,
 )
 from ascend_kernel_lab.evaluation.orchestrator import (
     EvaluationBackend,
@@ -39,6 +40,7 @@ from ascend_kernel_lab.storage import AtomicArtifactStore, SQLiteStateStore
 from ascend_kernel_lab.tasks import TaskRegistry, TaskSpec
 from ascend_kernel_lab.tasks.runtime import hidden_cases_from_template, validate_hidden_seed
 
+from .baseline import prompt_baseline_projection
 from .feedback import build_feedback
 
 
@@ -412,8 +414,25 @@ class ExperimentController:
                 round_number,
                 phase="optimization",
                 phase_index=optimization_count + 1,
+                repair_attempt=0,
             )
             optimization_count += 1
+            evaluation = self._round_evaluation(task, round_number)
+            repair_attempt = 0
+            while (
+                not self._repair_seed_ready(evaluation)
+                and repair_attempt < self.config.maximum_repair_rounds
+            ):
+                repair_attempt += 1
+                round_number += 1
+                self._run_round(
+                    task,
+                    round_number,
+                    phase="optimization_repair",
+                    phase_index=optimization_count,
+                    repair_attempt=repair_attempt,
+                )
+                evaluation = self._round_evaluation(task, round_number)
             round_number += 1
         return self._run_final(task)
 
@@ -470,6 +489,17 @@ class ExperimentController:
         feedback_path = self._artifact_path(task.id, round_number, "feedback.json")
         feedback = _read_json(feedback_path) if feedback_path.is_file() else {}
         if feedback.get("stop_recommended") is not True:
+            return False
+        # A host-bound observation may terminate optimization only when it is
+        # the committed BEST.  A slower branch can be host-bound while the
+        # incumbent still has useful device-side optimization headroom.
+        best_after = feedback.get("best_after")
+        if (
+            not isinstance(best_after, Mapping)
+            or best_after.get("round") != round_number
+            or feedback.get("performance_decision")
+            not in {"INITIAL_BEST", "NEW_BEST"}
+        ):
             return False
         benchmark = evaluation.get("benchmark")
         if not isinstance(benchmark, Mapping):
@@ -781,26 +811,186 @@ class ExperimentController:
     def _best_context(
         self, task: TaskSpec, *, before_round: int | None = None
     ) -> dict[str, Any] | None:
-        scores = self.store.list_candidate_scores(self.experiment_id, task.id)
-        if before_round is not None:
-            scores = [score for score in scores if score.round_number < before_round]
-        best = select_best_candidate(scores)
+        task_record = self.store.get_task(self.experiment_id, task.id)
+        best = (
+            self.store.get_candidate_score(task_record.best_candidate_id)
+            if task_record is not None and task_record.best_candidate_id is not None
+            else None
+        )
+        if best is not None and before_round is not None and best.round_number >= before_round:
+            best = None
+        if best is None:
+            scores = sorted(
+                (
+                    score
+                    for score in self.store.list_candidate_scores(
+                        self.experiment_id, task.id
+                    )
+                    if before_round is None or score.round_number < before_round
+                ),
+                key=lambda score: score.round_number,
+            )
+            online_best: CandidateScore | None = None
+            for score in scores:
+                decision = compare_public_candidate(score, online_best)
+                if decision.decision in {"INITIAL_BEST", "NEW_BEST"}:
+                    online_best = score
+            best = online_best
         if best is None:
             return None
         code_path = self._artifact_path(task.id, best.round_number, "candidate.py")
         evaluation_path = self._artifact_path(task.id, best.round_number, "evaluation_result.json")
+        response_path = self._artifact_path(
+            task.id, best.round_number, "model_response.json"
+        )
+        response = _read_json(response_path) if response_path.is_file() else {}
         return {
             "round": best.round_number,
             "candidate_id": best.candidate_id,
             "code": code_path.read_text(encoding="utf-8"),
             "geomean_speedup": best.geomean_speedup,
             "minimum_speedup": best.minimum_speedup,
+            "candidate_kernel_coverage": best.candidate_kernel_coverage,
+            "stability_cv": best.stability_cv,
+            "score": asdict(best),
+            "optimization_summary": list(
+                response.get(
+                    "optimization_summary", response.get("change_summary", [])
+                )
+            ),
             "evaluation": _read_json(evaluation_path) if evaluation_path.is_file() else {},
         }
 
+    def _committed_online_best(
+        self, task: TaskSpec
+    ) -> tuple[CandidateScore | None, int]:
+        """Replay committed online BEST decisions in trajectory order.
+
+        ``feedback.json.best_after`` is the durable result of the online,
+        noise-aware comparison for a round.  Older feedback artifacts do not
+        have that field, so they are replayed with the same comparison policy.
+        Candidate scores without committed feedback are deliberately ignored:
+        they may belong to an evaluation-to-feedback crash window.
+        """
+
+        scores = sorted(
+            self.store.list_candidate_scores(self.experiment_id, task.id),
+            key=lambda score: (score.round_number, score.candidate_id),
+        )
+        scores_by_id = {score.candidate_id: score for score in scores}
+        online_best: CandidateScore | None = None
+        last_committed_round = 0
+        for score in scores:
+            feedback_path = self._artifact_path(
+                task.id, score.round_number, "feedback.json"
+            )
+            if not feedback_path.is_file():
+                continue
+            feedback = _read_json(feedback_path)
+            last_committed_round = max(last_committed_round, score.round_number)
+            best_after = feedback.get("best_after")
+            if isinstance(best_after, Mapping):
+                candidate_id = best_after.get("candidate_id")
+                selected = (
+                    scores_by_id.get(str(candidate_id))
+                    if candidate_id is not None
+                    else None
+                )
+                if (
+                    selected is None
+                    or not selected.is_publicly_valid
+                    or selected.round_number > score.round_number
+                ):
+                    raise ControllerError(
+                        "committed feedback references an invalid online BEST"
+                    )
+                online_best = selected
+                continue
+
+            decision = str(feedback.get("performance_decision", ""))
+            if decision in {"INITIAL_BEST", "NEW_BEST"}:
+                if not score.is_publicly_valid:
+                    raise ControllerError(
+                        "committed feedback selects an ineligible online BEST"
+                    )
+                online_best = score
+            elif decision in {"TIE", "REGRESSION", "INVALID"}:
+                continue
+            else:
+                comparison = compare_public_candidate(score, online_best)
+                if comparison.decision in {"INITIAL_BEST", "NEW_BEST"}:
+                    online_best = score
+        return online_best, last_committed_round
+
+    def _reconcile_committed_online_best(
+        self,
+        task: TaskSpec,
+        *,
+        allow_inflight_candidate: bool,
+    ) -> CandidateScore | None:
+        """Make the DB pointer agree with the committed feedback trajectory."""
+
+        expected, last_committed_round = self._committed_online_best(task)
+        task_record = self.store.get_task(self.experiment_id, task.id)
+        if task_record is None:
+            raise ControllerError("cannot reconcile BEST for a missing task")
+        if expected is None:
+            return None
+        if task_record.best_candidate_id == expected.candidate_id:
+            return expected
+        current = (
+            self.store.get_candidate_score(task_record.best_candidate_id)
+            if task_record.best_candidate_id is not None
+            else None
+        )
+        if (
+            allow_inflight_candidate
+            and current is not None
+            and current.round_number > last_committed_round
+        ):
+            return current
+        self.store.set_best_candidate(
+            self.experiment_id,
+            task.id,
+            expected.candidate_id,
+            reason="RECONCILE_COMMITTED_FEEDBACK",
+        )
+        return expected
+
     def _prompt_candidate_context(
-        self, task: TaskSpec, *, before_round: int
+        self,
+        task: TaskSpec,
+        *,
+        before_round: int,
+        phase: str,
     ) -> dict[str, Any]:
+        previous_evaluation_path = self._artifact_path(
+            task.id, before_round - 1, "evaluation_result.json"
+        )
+        previous = (
+            _read_json(previous_evaluation_path)
+            if previous_evaluation_path.is_file()
+            else {}
+        )
+        if phase in {"repair", "optimization_repair"} and previous.get(
+            "overall_status"
+        ) in {
+            "source_failed",
+            "compile_failed",
+            "correctness_failed",
+        }:
+            candidate_path = self._artifact_path(
+                task.id, before_round - 1, "candidate.py"
+            )
+            if not candidate_path.is_file():
+                raise ControllerError(
+                    f"round {before_round - 1} failed candidate is missing"
+                )
+            return {
+                "round": before_round - 1,
+                "role": "failed_candidate_under_repair",
+                "code": candidate_path.read_text(encoding="utf-8"),
+            }
         best = self._best_context(task, before_round=before_round)
         if best is not None:
             return {
@@ -870,7 +1060,97 @@ class ExperimentController:
                     "bottleneck_type": benchmark.get("bottleneck_type"),
                 }
             )
-        return rows
+        # The durable artifacts retain every branch.  The model only needs a
+        # short recent scorecard; allowing this list to grow across proposal
+        # repair chains would recreate the prompt-bloat problem this feedback
+        # protocol is intended to remove.
+        return rows[-8:]
+
+    def _candidate_intent(
+        self, task: TaskSpec, round_number: int
+    ) -> dict[str, Any]:
+        response_path = self._artifact_path(
+            task.id, round_number, "model_response.json"
+        )
+        if not response_path.is_file():
+            return {
+                "source": "model_response.optimization_summary",
+                "optimization_summary": [],
+                "expected_effect": [],
+                "model_authored": False,
+            }
+        response = _read_json(response_path)
+        model_failure_path = self._artifact_path(
+            task.id, round_number, "model_failure.json"
+        )
+        if model_failure_path.is_file():
+            return {
+                "source": "synthetic_model_failure_sentinel",
+                "optimization_summary": [],
+                "expected_effect": [],
+                "model_authored": False,
+            }
+        return {
+            "source": (
+                "model_response.optimization_summary"
+                if "optimization_summary" in response
+                else "model_response.change_summary"
+            ),
+            "optimization_summary": list(
+                response.get(
+                    "optimization_summary", response.get("change_summary", [])
+                )
+            ),
+            "expected_effect": list(response.get("expected_effect", [])),
+            "model_authored": True,
+        }
+
+    @staticmethod
+    def _code_diff(before: str, after: str) -> list[str]:
+        return list(
+            difflib.unified_diff(
+                before.splitlines(),
+                after.splitlines(),
+                fromfile="BEST",
+                tofile="candidate",
+                lineterm="",
+                n=3,
+            )
+        )
+
+    def _successful_best_history(
+        self, task: TaskSpec, *, before_round: int
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for round_number in range(1, before_round):
+            feedback_path = self._artifact_path(
+                task.id, round_number, "feedback.json"
+            )
+            if not feedback_path.is_file():
+                continue
+            feedback = _read_json(feedback_path)
+            if feedback.get("performance_decision") not in {
+                "INITIAL_BEST",
+                "NEW_BEST",
+            }:
+                continue
+            rows.append(
+                {
+                    "round": round_number,
+                    "decision": feedback.get("performance_decision"),
+                    "optimization_summary": feedback.get(
+                        "candidate_generation_intent", {}
+                    ).get("optimization_summary", []),
+                    "geomean_speedup_vs_pytorch_eager": (
+                        feedback.get("benchmark", {}).get(
+                            "geomean_speedup_vs_eager"
+                        )
+                        if isinstance(feedback.get("benchmark"), Mapping)
+                        else None
+                    ),
+                }
+            )
+        return rows[-5:]
 
     def _build_prompt(
         self,
@@ -879,14 +1159,21 @@ class ExperimentController:
         *,
         phase: str,
         phase_index: int,
+        repair_attempt: int = 0,
     ) -> ModelRequest:
         maximum_rounds = (
-            self.config.rounds_per_task + self.config.maximum_repair_rounds
+            self.config.maximum_repair_rounds
+            + self.config.rounds_per_task
+            * (self.config.maximum_repair_rounds + 1)
         )
-        common = {
+        task_baseline = self.baseline.get(task.id)
+        baseline_snapshot = (
+            task_baseline if isinstance(task_baseline, Mapping) else self.baseline
+        )
+        common: dict[str, Any] = {
             "task": task.public_prompt_view(),
             "environment": self.environment,
-            "baseline": self.baseline.get(task.id, self.baseline),
+            "baseline": prompt_baseline_projection(baseline_snapshot),
             "maximum_rounds": maximum_rounds,
             "phase": phase,
             "phase_index": phase_index,
@@ -906,23 +1193,186 @@ class ExperimentController:
             _read_json(previous_feedback_path) if previous_feedback_path.is_file() else {}
         )
         candidate = self._prompt_candidate_context(
-            task, before_round=round_number
+            task,
+            before_round=round_number,
+            phase=phase,
         )
+        best = self._best_context(task, before_round=round_number)
+        previous_code_path = self._artifact_path(
+            task.id, round_number - 1, "candidate.py"
+        )
+        previous_code = (
+            previous_code_path.read_text(encoding="utf-8")
+            if previous_code_path.is_file()
+            else ""
+        )
+        previous_intent = self._candidate_intent(task, round_number - 1)
+        previous_overall = str(
+            previous_evaluation.get("overall_status", "unknown")
+        )
+        feedback_state: dict[str, Any] = {
+            "mode": previous_feedback.get(
+                "next_prompt_mode", "REPAIR_FAILED_CANDIDATE"
+            ),
+            "performance_decision": previous_feedback.get(
+                "performance_decision", "INVALID"
+            ),
+            "instruction": (
+                "刚才的模型响应没有通过结构化响应校验; 不要沿用内部失败占位源码。"
+                "请从当前任务或 BEST 重新生成完整 Kernel 和模型原生 optimization_summary。"
+                if previous_overall == "model_failed"
+                else (
+                    "刚才的候选未通过 compile/correctness; 必须从该失败候选继续修复, "
+                    "保留其模型原生 optimization_summary, 并只依据原始错误修改。"
+                    if candidate["role"] == "failed_candidate_under_repair"
+                    else (
+                        "刚才的尝试造成确定性性能倒退; BEST 保持不变。"
+                        "从 BEST 完整实现重新出发, 不要沿倒退候选继续优化。"
+                        if previous_feedback.get("performance_decision")
+                        == "REGRESSION"
+                        else (
+                            "候选与 BEST 的差异落在测量噪声范围, BEST 保持不变; "
+                            "从 BEST 继续尝试新的优化方案。"
+                            if previous_feedback.get("performance_decision")
+                            == "TIE"
+                            else (
+                                "这是当前真实运行得到的 BEST; 从 BEST 继续优化。"
+                                if best is not None
+                                else (
+                                    "这是正确但尚未形成可比较 BEST 的工作候选; "
+                                    "请从它继续并取得 benchmark 和 smoke profile。"
+                                )
+                            )
+                        )
+                    )
+                )
+            ),
+            "successful_best_history": self._successful_best_history(
+                task, before_round=round_number
+            ),
+            "optimization_index": (
+                phase_index
+                if phase in {"optimization", "optimization_repair"}
+                else None
+            ),
+            "repair_attempt": repair_attempt,
+        }
+        failed_candidate: dict[str, Any] | None = None
+        if previous_overall == "model_failed":
+            failure_path = self._artifact_path(
+                task.id, round_number - 1, "model_failure.json"
+            )
+            failed_candidate = {
+                "round": round_number - 1,
+                "model_response_error": (
+                    _read_json(failure_path) if failure_path.is_file() else None
+                ),
+                "candidate_generation_intent": {
+                    "source": "synthetic_model_failure_sentinel",
+                    "optimization_summary": [],
+                    "expected_effect": [],
+                    "model_authored": False,
+                },
+            }
+        elif candidate["role"] == "failed_candidate_under_repair":
+            failed_stage = next(
+                (
+                    name
+                    for name in (
+                        "source",
+                        "compile",
+                        "correctness",
+                    )
+                    if isinstance(previous_evaluation.get(name), Mapping)
+                    and not _passed_stage(previous_evaluation.get(name))
+                ),
+                None,
+            )
+            failed_candidate = {
+                "round": round_number - 1,
+                "code": previous_code,
+                "candidate_generation_intent": previous_intent,
+                "failed_stage": failed_stage,
+                "raw_stage_result": (
+                    previous_evaluation.get(failed_stage)
+                    if failed_stage is not None
+                    else None
+                ),
+            }
+        elif best is not None and previous_code and int(best["round"]) != round_number - 1:
+            failed_candidate = {
+                "round": round_number - 1,
+                "candidate_generation_intent": previous_intent,
+                "system_computed_code_diff_from_best": self._code_diff(
+                    str(best["code"]), previous_code
+                ),
+                "candidate_metrics": self._follow_up_metrics(
+                    previous_evaluation
+                ),
+                "system_computed_metric_and_profile_delta": previous_feedback.get(
+                    "comparison_with_best"
+                ),
+            }
+        repair_prompt = candidate["role"] == "failed_candidate_under_repair"
+        prompt_best = best if best is not None and not repair_prompt else None
+        use_working_candidate = prompt_best is None and failed_candidate is None
+        compact_metrics = (
+            self._follow_up_metrics(previous_evaluation)
+            if use_working_candidate
+            else {}
+        )
+        compact_failures = (
+            self._follow_up_failure_reasons(
+                previous_evaluation, previous_feedback
+            )
+            if use_working_candidate
+            else []
+        )
+        if use_working_candidate:
+            feedback_state["working_candidate_generation_intent"] = (
+                previous_intent
+            )
         return self.prompt_builder.build_follow_up(
             round_number=round_number,
             maximum_rounds=maximum_rounds,
-            last_candidate_code=str(candidate["code"]),
-            key_metrics=self._follow_up_metrics(previous_evaluation),
-            failure_reasons=self._follow_up_failure_reasons(
-                previous_evaluation, previous_feedback
+            last_candidate_code=(
+                str(candidate["code"]) if use_working_candidate else ""
             ),
+            key_metrics=compact_metrics,
+            failure_reasons=compact_failures,
             next_round_suggestions=self._follow_up_suggestions(previous_feedback),
             task_contract=task.public_prompt_view(),
+            environment=self.environment,
+            baseline={
+                "comparison_baseline": (
+                    self.config.benchmark.comparison_baseline
+                )
+            },
             candidate_round=int(candidate["round"]),
             candidate_role=str(candidate["role"]),
             history_summary=self._history_scorecard(
                 task, before_round=round_number
             ),
+            feedback_state=feedback_state,
+            best_candidate=(
+                {
+                    "round": prompt_best["round"],
+                    "candidate_id": prompt_best["candidate_id"],
+                    "code": prompt_best["code"],
+                    "metrics": self._follow_up_metrics(
+                        prompt_best["evaluation"]
+                    ),
+                    "candidate_generation_intent": {
+                        "source": "model_response.optimization_summary",
+                        "optimization_summary": prompt_best[
+                            "optimization_summary"
+                        ],
+                    },
+                }
+                if prompt_best is not None
+                else None
+            ),
+            failed_candidate=failed_candidate,
             phase=phase,
             phase_index=phase_index,
             optimization_rounds=self.config.rounds_per_task,
@@ -939,6 +1389,7 @@ class ExperimentController:
                 round_number=round_number,
             ),
             expected_round=round_number,
+            allow_legacy=True,
         )
 
     @staticmethod
@@ -951,7 +1402,12 @@ class ExperimentController:
         }
 
     def _materialize_model_exchange(
-        self, task: TaskSpec, round_number: int, exchange: Mapping[str, Any]
+        self,
+        task: TaskSpec,
+        round_number: int,
+        exchange: Mapping[str, Any],
+        *,
+        allow_legacy: bool = False,
     ) -> ModelResponse:
         attempts = exchange.get("attempts")
         if not isinstance(attempts, Sequence) or isinstance(attempts, (str, bytes)) or not attempts:
@@ -985,7 +1441,9 @@ class ExperimentController:
         if not isinstance(response_value, Mapping):
             raise ControllerError("committed model exchange has no structured response")
         response = validate_model_response(
-            response_value, expected_round=round_number
+            response_value,
+            expected_round=round_number,
+            allow_legacy=allow_legacy,
         )
         self._commit_json(
             self._relative(task.id, round_number, "model_response.json"),
@@ -1038,20 +1496,31 @@ class ExperimentController:
             task_id=task.id,
             round_number=round_number,
         )
-        response = ModelResponse(
-            status="candidate",
-            round=round_number,
-            change_summary=(),
-            expected_effect=(),
-            assumptions=("Model output failed structured-response validation.",),
-            code=(
+        # This internal failure sentinel is deliberately not represented as a
+        # model-authored optimization_summary.  ``change_summary`` is reserved
+        # here solely for the legacy-compatible sentinel/read path; live model
+        # completions are always validated against the current strict schema.
+        synthetic_response = {
+            "status": "candidate",
+            "round": round_number,
+            "change_summary": [],
+            "expected_effect": [],
+            "assumptions": [
+                "Model output failed structured-response validation."
+            ],
+            "code": (
                 "# Invalid model response; this round intentionally "
                 "fails source validation.\n"
             ),
+        }
+        response = validate_model_response(
+            synthetic_response,
+            expected_round=round_number,
+            allow_legacy=True,
         )
         self._commit_json(
             self._relative(task.id, round_number, "model_response.json"),
-            response.to_dict(),
+            synthetic_response,
             task_id=task.id,
             round_number=round_number,
         )
@@ -1092,6 +1561,7 @@ class ExperimentController:
         *,
         phase: str,
         phase_index: int,
+        repair_attempt: int = 0,
     ) -> None:
         record = self.store.get_round(self.experiment_id, task.id, round_number)
         if record is None:
@@ -1102,6 +1572,7 @@ class ExperimentController:
                 round_number,
                 phase=phase,
                 phase_index=phase_index,
+                repair_attempt=repair_attempt,
             )
             self._commit_json(
                 self._relative(task.id, round_number, "prompt.json"),
@@ -1151,6 +1622,7 @@ class ExperimentController:
                             task.id, round_number, "model_exchange.json"
                         )
                     ),
+                    allow_legacy=True,
                 )
             elif self._artifact_path(
                 task.id, round_number, "model_failure_exchange.json"
@@ -1245,10 +1717,11 @@ class ExperimentController:
             score = _score_from_mapping(evaluation_mapping["score"])
             committed_phase = evaluation_mapping.get("trajectory_phase")
             committed_phase_index = evaluation_mapping.get("phase_index")
+            committed_repair_attempt = evaluation_mapping.get("repair_attempt")
             if committed_phase not in {None, phase} or committed_phase_index not in {
                 None,
                 phase_index,
-            }:
+            } or committed_repair_attempt not in {None, repair_attempt}:
                 raise ControllerError(
                     "committed evaluation trajectory phase disagrees with replay"
                 )
@@ -1321,6 +1794,12 @@ class ExperimentController:
                     score = evaluation.score
             evaluation_mapping["trajectory_phase"] = phase
             evaluation_mapping["phase_index"] = phase_index
+            evaluation_mapping["optimization_index"] = (
+                phase_index
+                if phase in {"optimization", "optimization_repair"}
+                else None
+            )
+            evaluation_mapping["repair_attempt"] = repair_attempt
             self._commit_json(
                 self._relative(task.id, round_number, "evaluation_result.json"),
                 evaluation_mapping,
@@ -1464,19 +1943,75 @@ class ExperimentController:
         relative = self._relative(task.id, round_number, "feedback.json")
         path = self.artifacts.path_for(relative)
         if path.is_file():
-            return self._load_committed_json(
+            feedback = self._load_committed_json(
                 relative,
                 task_id=task.id,
                 round_number=round_number,
             )
+            self._reconcile_committed_online_best(
+                task, allow_inflight_candidate=True
+            )
+            return feedback
+        best_before = self._best_context(task, before_round=round_number)
         feedback = build_feedback(
             task_id=task.id,
             round_number=round_number,
             result=evaluation,
-            best=self._best_context(task, before_round=round_number),
+            best=best_before,
             consecutive_non_improvements=self._consecutive_non_improvements(
                 task, round_number
             ),
+            candidate_intent=self._candidate_intent(task, round_number),
+        )
+        score_value = evaluation.get("score")
+        candidate_score = (
+            _score_from_mapping(score_value)
+            if isinstance(score_value, Mapping)
+            else None
+        )
+        incumbent = (
+            self.store.get_candidate_score(str(best_before["candidate_id"]))
+            if best_before is not None
+            else None
+        )
+        decision = (
+            compare_public_candidate(candidate_score, incumbent)
+            if candidate_score is not None
+            else None
+        )
+        if candidate_score is not None and decision is not None and decision.decision in {
+            "INITIAL_BEST",
+            "NEW_BEST",
+        }:
+            self.store.set_best_candidate(
+                self.experiment_id,
+                task.id,
+                candidate_score.candidate_id,
+                reason=decision.decision,
+            )
+        task_record = self.store.get_task(self.experiment_id, task.id)
+        best_after_score = (
+            self.store.get_candidate_score(task_record.best_candidate_id)
+            if task_record is not None and task_record.best_candidate_id is not None
+            else None
+        )
+        feedback["best_before"] = (
+            {
+                "round": best_before["round"],
+                "candidate_id": best_before["candidate_id"],
+            }
+            if best_before is not None
+            else None
+        )
+        feedback["best_after"] = (
+            {
+                "candidate_id": task_record.best_candidate_id,
+                "round": best_after_score.round_number,
+            }
+            if task_record is not None
+            and task_record.best_candidate_id is not None
+            and best_after_score is not None
+            else None
         )
         self._commit_json(
             relative,
@@ -1531,12 +2066,8 @@ class ExperimentController:
                 final,
             )
         if task_record.state is TaskState.ROUNDS_RUNNING:
-            best = (
-                self.store.get_candidate_score(task_record.best_candidate_id)
-                if task_record.best_candidate_id is not None
-                else self.store.select_and_set_best_candidate(
-                    self.experiment_id, task.id
-                )
+            best = self._reconcile_committed_online_best(
+                task, allow_inflight_candidate=False
             )
             task_record = self.store.get_task(self.experiment_id, task.id) or task_record
         else:

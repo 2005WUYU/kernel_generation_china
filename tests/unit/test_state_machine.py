@@ -10,6 +10,7 @@ from ascend_kernel_lab.domain import (
     RoundState,
     TaskState,
     aggregate_candidate_score,
+    compare_public_candidate,
     compute_reward,
     round_state_machine,
     select_best_candidate,
@@ -184,6 +185,32 @@ class ScoringTests(unittest.TestCase):
             BenchmarkSample("bad", float("nan"))
         with self.assertRaises(ValueError):
             weighted_geometric_mean([])
+
+    def test_online_best_comparison_is_noise_aware(self) -> None:
+        incumbent = self._score(
+            "best", 1, minimum=1.0, geomean=1.0, cv=0.02
+        )
+        first = compare_public_candidate(incumbent, None)
+        self.assertEqual(first.decision, "INITIAL_BEST")
+        tied = self._score(
+            "tie", 2, minimum=1.005, geomean=1.015, cv=0.02
+        )
+        self.assertEqual(
+            compare_public_candidate(tied, incumbent).decision, "TIE"
+        )
+        better = self._score(
+            "better", 3, minimum=1.01, geomean=1.04, cv=0.01
+        )
+        self.assertEqual(
+            compare_public_candidate(better, incumbent).decision, "NEW_BEST"
+        )
+        regressed = self._score(
+            "regressed", 4, minimum=0.95, geomean=0.99, cv=0.01
+        )
+        self.assertEqual(
+            compare_public_candidate(regressed, incumbent).decision,
+            "REGRESSION",
+        )
 
 
 if __name__ == "__main__":

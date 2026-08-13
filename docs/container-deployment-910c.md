@@ -113,6 +113,11 @@ Controller 文件填写 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、
 `model.provider: claude_cli` 和当前 DeepSeek thinking/reasoning 行为，不切换 provider，
 也不关闭或改写 thinking 设置。
 
+每次 DeepSeek 候选响应必须同步包含完整可运行的 `code`、模型原生
+`optimization_summary` 和独立的 `expected_effect`。controller 不会根据候选代码、评测指标或
+profiler 反推 `optimization_summary`；系统算出的代码/指标差与 BEST 决策使用独立字段，原始模型意图
+保留在 `model_response.json`、`model_exchange.json` 和后续数据导出中。
+
 两个容器使用不同的专用数字 UID，并加入同一个共享数字 GID 来写 SQLite、WAL 和
 artifact。把远端 `runs/` 设为共享组、setgid、other 无权限；启动前分别用两个镜像执行
 一次文件创建/读取探针。不要对候选 attempt 私有目录递归放宽权限。
@@ -170,12 +175,31 @@ done
 把十个任务并发提交到 SQLite durable queue，NPU 阶段由八个 Worker 自然限流到最多八路并行，
 同一任务的各轮保持顺序。每个任务先进行最多 3 轮 Repair，直到得到同时通过
 source check、compile 和 correctness 的 seed Kernel；seed 轮不计入随后的
-5 轮 Optimization。公开评测有效的候选若被归类为 host-bound，Optimization
+5 个 Optimization proposal slot。每个性能提案若发生模型格式、source、compile 或 correctness
+失败，可沿失败候选做最多 3 次 `optimization_repair`；修复轮使用连续的持久轮号，但不会消耗下一个
+Optimization slot。因此五个 slot 是五次性能提案，不是五次模型调用的总上限。公开评测有效的候选
+若被归类为 host-bound，Optimization
 可提前结束，然后仍按正常流程选择公开最佳并只评测一个最终候选。
 
-后续 Prompt 只保留固定任务描述和约束、当前候选代码、上一轮紧凑的关键指标/
-失败原因/下一轮建议，以及历史的短成绩表；不重复携带完整 evaluation、
-全量日志或 profiler 原始内容。
+controller 的反馈状态机是：
+
+- **A（首次生成）**：任务、PyTorch eager baseline、source checker 契约和 compact hardware
+  生成第一份完整 Kernel 与模型原生 `optimization_summary`；
+- **B（失败修复）**：模型格式、source、compile 或 correctness 失败后，在同一 repair/proposal
+  上修复；存在失败源码时从该源码继续，并附原始错误；
+- **C（BEST 前进）**：首个公开可比较候选提交为 `INITIAL_BEST`，只有 noise-aware 比较得到
+  `NEW_BEST` 才更新 BEST，下一次性能提案从新 BEST 开始；
+- **D（回到 BEST）**：`REGRESSION` 丢弃当前分支并回到 BEST，同时传失败方案的模型原生意图、
+  代码 diff 和指标差；`TIE` 也保留 BEST，并从 BEST 尝试不同方案。
+
+公开可比较候选必须通过 source/compile/correctness/anti-bypass，并有 geomean/minimum speedup。
+噪声容差取 1%、候选 `stability_cv` 与 BEST `stability_cv` 的最大值；只有 geomean 提升超过容差且
+minimum 未越过负容差才是 `NEW_BEST`，明确退化为 `REGRESSION`，其余为 `TIE`。
+
+后续 Prompt 只保留固定任务约束、状态机要求的候选/BEST 完整源码、模型原生意图、上一轮紧凑的
+关键指标/失败原因/下一轮建议、compact hardware 和历史短成绩表；不重复携带完整 evaluation、
+全量日志、完整 hardware profile 或 profiler 原始内容。完整 profile 只留作实验证据，模型仅收到
+与当前决策直接相关的 quick-profile/延迟摘要。
 
 Worker 启动会强制验证：没有模型变量、隐藏 seed 合法、只暴露一张 NPU、
 `torch.npu.is_available()` 为真、clean Git clone。它使用 `--runtime=ascend`、
@@ -190,6 +214,20 @@ end-to-end latency、host overhead 和 bottleneck 类型。任何一步非零退
 `probe` 使用可执行的临时 Triton cache、验证子进程恰好只能看到一张 NPU，并要求所有必需
 feature、计时方法和 profiler 指标通过；固定输出目录必须为空，避免旧 profiler 数据混入。
 维护期间若项目 Worker 正在运行会直接拒绝。
+
+标准 probe 证据必须包含四项：
+
+```text
+runs/probe/env_manifest.json
+runs/probe/capability_matrix.json
+runs/probe/profiler_capabilities.json
+runs/hardware_probe/kernel_authoring_environment.reported.json
+```
+
+第四项是完整 Kernel-authoring 硬件档案。实验 snapshot 保留其完整内容和摘要作为证据；每轮 Prompt
+只使用从中抽取的 backend、matrix/vector 单元及建议 program 数、grid 上限、global/L2/UB、tail
+alignment、已验证 dtype/feature 和计时方法，不把完整档案重复发送给模型。
+
 若 probe 失败，先保留整个失败证据目录再重跑，禁止直接删除：
 
 ```bash
@@ -206,7 +244,8 @@ kernel 数和候选 kernel coverage 等短时间可取信息，不运行 full pr
 失败、性能回退、host-bound 和后续无提升样本不进入默认 SFT 集。
 `akg export sft --all-samples` 导出全量样本并保留每条质量分类标签。
 RL 导出同样保留全量样本和标签，便于将 source failure、性能回退、host-bound、
-后续无提升与高质量优化区分处理。
+后续无提升与高质量优化区分处理。导出中的
+`candidate_generation_intent.optimization_summary` 始终来自对应 DeepSeek 响应。
 
 检查 `runs/probe/` 和 baseline 证据后，再按验收指南完成板端验收。八个 Worker 状态都变成
 `healthy` 后运行：

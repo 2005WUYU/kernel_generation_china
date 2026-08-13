@@ -15,7 +15,18 @@ class ExportTests(unittest.TestCase):
         round_root = experiment / "tasks" / "k01_vector_add" / "round_01"
         round_root.mkdir(parents=True)
         (round_root / "prompt.json").write_text(json.dumps({"task": "public"}), encoding="utf-8")
-        (round_root / "model_response.json").write_text(json.dumps({"status": "candidate", "round": 1}), encoding="utf-8")
+        (round_root / "model_response.json").write_text(
+            json.dumps(
+                {
+                    "status": "candidate",
+                    "round": 1,
+                    "optimization_summary": ["coalesce adjacent element loads"],
+                    "expected_effect": ["reduce device latency"],
+                    "assumptions": [],
+                }
+            ),
+            encoding="utf-8",
+        )
         (round_root / "candidate.py").write_text("def custom_op(x):\n    return x\n", encoding="utf-8")
         (round_root / "evaluation_result.json").write_text(
             json.dumps(
@@ -65,24 +76,52 @@ class ExportTests(unittest.TestCase):
             exporter = DatasetExporter(experiment)
             self.assertEqual(exporter.export_sft(root / "sft.jsonl"), 1)
             sft = json.loads((root / "sft.jsonl").read_text())
+            self.assertEqual(sft["schema_version"], "ascend_kernel_sft_v2")
             self.assertEqual(sft["sample_type"], "high_quality_optimization")
             self.assertEqual(
                 sft["quality"]["label"], "high_quality_optimization"
             )
+            self.assertEqual(
+                sft["candidate_generation_intent"]["optimization_summary"],
+                ["coalesce adjacent element loads"],
+            )
+            assistant = json.loads(sft["messages"][1]["content"])
+            self.assertIn("optimization_summary", assistant)
+            self.assertNotIn("change_summary", assistant)
             self.assertEqual(exporter.export_rl(root / "rl.jsonl"), 1)
             trajectory = json.loads((root / "rl.jsonl").read_text())
+            self.assertEqual(
+                trajectory["schema_version"],
+                "ascend_kernel_rl_transition_v2",
+            )
             self.assertTrue(trajectory["selected_as_best"])
             self.assertEqual(trajectory["feedback"], {"overall_status": "success"})
             self.assertEqual(
                 trajectory["quality"]["label"], "high_quality_optimization"
             )
+            self.assertEqual(
+                trajectory["action"]["candidate_generation_intent"][
+                    "optimization_summary"
+                ],
+                ["coalesce adjacent element loads"],
+            )
             ReportExporter(experiment).write(root / "report.json", root / "report.md")
             report = json.loads((root / "report.json").read_text())
+            self.assertEqual(
+                report["schema_version"],
+                "ascend_kernel_experiment_report_v2",
+            )
             self.assertEqual(report["passed_task_count"], 1)
             self.assertEqual(report["environment"], {"device": "fake"})
             self.assertEqual(
                 report["tasks"][0]["public_best"]["geomean_speedup_vs_eager"],
                 1.1,
+            )
+            self.assertEqual(
+                report["tasks"][0]["public_best"][
+                    "candidate_generation_intent"
+                ]["optimization_summary"],
+                ["coalesce adjacent element loads"],
             )
             self.assertEqual(
                 report["trajectory_quality_summary"]["counts"],
@@ -101,6 +140,93 @@ class ExportTests(unittest.TestCase):
             (round_root / "prompt.json").write_text(json.dumps({"Authorization": "Bearer abcdefghijklmnop"}), encoding="utf-8")
             with self.assertRaises(ExportError):
                 DatasetExporter(experiment).export_sft(root / "sft.jsonl")
+
+    def test_legacy_change_summary_exports_as_current_candidate_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            experiment = self._run(root)
+            response_path = (
+                experiment
+                / "tasks/k01_vector_add/round_01/model_response.json"
+            )
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+            response["change_summary"] = response.pop("optimization_summary")
+            response_path.write_text(json.dumps(response), encoding="utf-8")
+
+            output = root / "legacy-sft.jsonl"
+            self.assertEqual(DatasetExporter(experiment).export_sft(output), 1)
+            sample = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(
+                sample["candidate_generation_intent"]["source_field"],
+                "model_response.change_summary",
+            )
+            assistant = json.loads(sample["messages"][1]["content"])
+            self.assertEqual(
+                assistant["optimization_summary"],
+                ["coalesce adjacent element loads"],
+            )
+            self.assertNotIn("change_summary", assistant)
+
+    def test_synthetic_model_failure_is_not_presented_as_model_authored_intent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            experiment = self._run(root)
+            response_path = (
+                experiment
+                / "tasks/k01_vector_add/round_01/model_response.json"
+            )
+            response_path.write_text(
+                json.dumps(
+                    {
+                        "status": "candidate",
+                        "round": 1,
+                        "change_summary": [],
+                        "expected_effect": [],
+                        "assumptions": [
+                            "Model output failed structured-response validation."
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            evaluation_path = (
+                experiment
+                / "tasks/k01_vector_add/round_01/evaluation_result.json"
+            )
+            evaluation = json.loads(
+                evaluation_path.read_text(encoding="utf-8")
+            )
+            evaluation["overall_status"] = "model_failed"
+            evaluation["score"] = {
+                "compile_passed": False,
+                "correctness_passed": False,
+                "anti_bypass_passed": False,
+                "geomean_speedup": None,
+                "minimum_speedup": None,
+            }
+            evaluation_path.write_text(
+                json.dumps(evaluation), encoding="utf-8"
+            )
+
+            output = root / "all.jsonl"
+            self.assertEqual(
+                DatasetExporter(experiment).export_sft(
+                    output, main_only=False
+                ),
+                1,
+            )
+            sample = json.loads(output.read_text(encoding="utf-8"))
+            intent = sample["candidate_generation_intent"]
+            self.assertFalse(intent["optimization_summary_model_authored"])
+            self.assertEqual(
+                intent["candidate_response_provenance"],
+                "synthetic_model_failure_sentinel",
+            )
+            assistant = json.loads(sample["messages"][1]["content"])
+            self.assertEqual(assistant["change_summary"], [])
+            self.assertNotIn("optimization_summary", assistant)
 
     def test_main_sft_requires_final_hidden_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -176,6 +302,64 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(rows[1]["sample_type"], "valid_but_not_improved")
             self.assertFalse(rows[1]["quality"]["eligible_for_default_sft"])
 
+    def test_report_counts_physical_optimization_repair_rounds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            experiment = self._run(root)
+            (experiment / "experiment.json").write_text(
+                json.dumps(
+                    {
+                        "experiment": {
+                            "rounds_per_task": 2,
+                            "maximum_repair_rounds": 2,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task_root = experiment / "tasks/k01_vector_add"
+            phases = ("repair", "optimization", "optimization_repair")
+            for number, phase in enumerate(phases, start=1):
+                round_root = task_root / f"round_{number:02d}"
+                round_root.mkdir(exist_ok=True)
+                (round_root / "evaluation_result.json").write_text(
+                    json.dumps({"trajectory_phase": phase}),
+                    encoding="utf-8",
+                )
+
+            trajectory = ReportExporter(experiment).build()["tasks"][0][
+                "trajectory_rounds"
+            ]
+
+            self.assertEqual(trajectory["actual_physical_rounds"], 3)
+            self.assertEqual(trajectory["maximum_physical_rounds"], 8)
+            self.assertEqual(trajectory["initial_repair_rounds"], 1)
+            self.assertEqual(trajectory["optimization_slots_attempted"], 1)
+            self.assertEqual(trajectory["optimization_repair_rounds"], 1)
+
+    def test_dataset_round_discovery_is_not_limited_to_two_digits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            experiment = self._run(root)
+            task_root = experiment / "tasks/k01_vector_add"
+            first = task_root / "round_01"
+            hundredth = task_root / "round_100"
+            hundredth.mkdir()
+            for name in (
+                "prompt.json",
+                "model_response.json",
+                "candidate.py",
+                "evaluation_result.json",
+                "feedback.json",
+                "reward.json",
+            ):
+                hundredth.joinpath(name).write_bytes(first.joinpath(name).read_bytes())
+
+            self.assertEqual(
+                [item.round_id for item in DatasetExporter(experiment).rounds()],
+                [1, 100],
+            )
+
     def test_quality_classification_curates_only_optimization_and_repair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -197,7 +381,14 @@ class ExportTests(unittest.TestCase):
                     json.dumps({"round": number}), encoding="utf-8"
                 )
                 (round_root / "model_response.json").write_text(
-                    json.dumps({"status": "candidate", "round": number}),
+                    json.dumps(
+                        {
+                            "status": "candidate",
+                            "round": number,
+                            "optimization_summary": [f"round {number} intent"],
+                            "expected_effect": ["lower latency"],
+                        }
+                    ),
                     encoding="utf-8",
                 )
                 (round_root / "candidate.py").write_text(

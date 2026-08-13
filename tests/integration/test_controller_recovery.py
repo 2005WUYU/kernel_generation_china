@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
@@ -16,7 +17,7 @@ from ascend_kernel_lab.domain import (
     ExperimentState,
     TaskState,
 )
-from ascend_kernel_lab.llm import FakeGateway
+from ascend_kernel_lab.llm import FakeGateway, ModelGatewayError
 from ascend_kernel_lab.orchestration.controller import ControllerError, ExperimentController
 from ascend_kernel_lab.storage import AtomicArtifactStore, SQLiteStateStore
 from ascend_kernel_lab.tasks import TaskRegistry
@@ -29,7 +30,7 @@ def _candidate(round_number: int) -> dict[str, object]:
     return {
         "status": "candidate",
         "round": round_number,
-        "change_summary": ["recovery candidate"],
+        "optimization_summary": ["recovery candidate"],
         "expected_effect": ["exercise persistence boundaries"],
         "assumptions": [],
         "code": "def custom_op(x):\n    return x\n",
@@ -450,6 +451,23 @@ class ControllerRecoveryTests(unittest.TestCase):
                 / "tasks/k01_vector_add/round_01/model_failure_exchange.json"
             )
             self.assertTrue(failure_exchange.is_file())
+            sentinel = json.loads(
+                (
+                    controller.experiment_root
+                    / "tasks/k01_vector_add/round_01/model_response.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(sentinel["change_summary"], [])
+            self.assertNotIn("optimization_summary", sentinel)
+            feedback = json.loads(
+                (
+                    controller.experiment_root
+                    / "tasks/k01_vector_add/round_01/feedback.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertFalse(
+                feedback["candidate_generation_intent"]["model_authored"]
+            )
             task = store.get_task(controller.experiment_id, "k01_vector_add")
             assert task is not None
             self.assertIs(task.state, TaskState.TASK_FAILED)
@@ -457,6 +475,42 @@ class ControllerRecoveryTests(unittest.TestCase):
             # A terminal resume verifies the durable result and performs no model call.
             self.assertEqual(controller.run()[0].status, "failed_no_valid_candidate")
             self.assertEqual(len(invalid_gateway.requests), 2)
+
+    def test_resume_reads_committed_legacy_model_response_without_new_call(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller, _gateway, _store = self._controller(
+                root,
+                FakeBackend(),
+            )
+            transport_failure = FakeGateway(
+                ModelGatewayError("injected pre-response transport failure")
+            )
+            controller.model_gateway = transport_failure
+
+            with self.assertRaisesRegex(
+                ModelGatewayError, "pre-response transport failure"
+            ):
+                controller.run()
+            self.assertEqual(len(transport_failure.requests), 1)
+
+            legacy = _candidate(1)
+            legacy["change_summary"] = legacy.pop("optimization_summary")
+            controller._commit_json(
+                controller._relative(
+                    "k01_vector_add", 1, "model_response.json"
+                ),
+                legacy,
+                task_id="k01_vector_add",
+                round_number=1,
+            )
+
+            summary = controller.run()[0]
+
+            self.assertEqual(summary.status, "passed")
+            self.assertEqual(len(transport_failure.requests), 1)
 
     def test_terminal_state_without_final_result_fails_loudly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

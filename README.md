@@ -1,9 +1,10 @@
 # Ascend Kernel Lab
 
 Ascend Kernel Lab 是面向华为 Ascend 910C 与 Triton-Ascend 的完整 Kernel 生成、评测和
-分阶段优化流水线。模型只返回完整候选源码；Prompt、状态推进、编译、正确性、计时、
-`msprof`、历史最佳选择、隐藏评测和训练数据导出全部由本地程序控制。冷启动 SFT 采集配置
-使用 DeepSeek V4 Pro；轨迹不设硬加速目标，性能只与 PyTorch eager NPU 比较。
+分阶段优化流水线。DeepSeek 每次生成候选时同步返回完整候选源码、模型原生
+`optimization_summary` 和 `expected_effect`；Prompt、状态推进、编译、正确性、计时、
+`msprof`、在线 BEST、隐藏评测和训练数据导出全部由本地程序控制。冷启动 SFT 采集配置使用
+DeepSeek V4 Pro；轨迹不设硬加速目标，性能只与 PyTorch eager NPU 比较。
 
 项目适合下面的交付方式：
 
@@ -159,6 +160,12 @@ DeepSeek 与旧的 Kimi 配置都使用 `model.provider: claude_cli`。Claude CL
 - 临时 HOME、临时工作目录和独立配置目录；
 - API/传输失败采用有界退避重试，格式修复次数独立受限。
 
+每次新模型响应都使用同一份结构化契约：`code` 是可独立评测的完整 Python Kernel，
+`optimization_summary` 是 DeepSeek 在生成该候选的同时写下的具体实现/优化选择，
+`expected_effect` 单独记录模型预期的影响。`optimization_summary` 不是 controller 根据代码、
+指标或 profiler 事后补写的摘要；系统计算的 BEST 比较和指标差值保存在独立字段中。
+`model_response.json`、`model_exchange.json` 以及 SFT/RL/report 导出都会保留这份模型原生意图。
+
 本轮冷启动 SFT 只改变控制器的 Prompt 内容和轮次调度：DeepSeek 仍使用上述
 `claude_cli` provider、AIPing Anthropic-compatible 端点和现有 thinking 行为，不切换
 provider，也不关闭或改写 thinking/reasoning 设置。
@@ -217,9 +224,17 @@ akg probe all \
 runs/probe/env_manifest.json
 runs/probe/capability_matrix.json
 runs/probe/profiler_capabilities.json
+runs/hardware_probe/kernel_authoring_environment.reported.json
 ```
 
-实际 SoC 名、CANN 版本和 profiler 字段由机器探测，不在代码中假定。不可用指标必须是 `null` 或带明确 unavailable reason。
+第四项是供 Kernel 编写使用的完整硬件档案，与 `runs/probe/` 同属一次标准板端探测证据。
+它记录物理执行单元、内存层级、对齐约束、已验证特性、dispatch 建议和原始证据；完整内容只作为
+实验证据保存在 environment snapshot 中。controller 为每轮 Prompt 只抽取 compact hardware：
+backend、matrix/vector 单元数与建议 program 数、grid 上限、global/L2/UB 信息、tail alignment、
+已验证 dtype/feature 和计时方法，不重复发送完整硬件档案或原始证据。
+
+实际 SoC 名、CANN 版本、硬件事实和 profiler 字段由机器探测，不在代码中假定。不可用指标必须是
+`null` 或带明确 unavailable reason。
 
 ### 3. PyTorch eager baseline
 
@@ -280,13 +295,33 @@ akg experiment run -c configs/experiment_910c_deepseek_v4_pro.yaml
 
 每个任务先进入 Repair 阶段，最多请求 3 轮，直到得到同时通过
 source check、compile 和 correctness 的 seed Kernel。seed 所在轮属于 Repair，
-不计入后续 5 轮 Optimization。修复成功后才开始计算这 5 轮性能优化；
+不计入后续 5 个 Optimization proposal slot。修复成功后才开始计算这 5 个性能提案；
+每个提案如果发生模型格式、source、compile 或 correctness 失败，可以沿该失败候选继续做最多
+3 次 `optimization_repair`，这些修复使用连续的持久轮号，但不占用下一个 Optimization slot。
+因此“五轮优化”表示五个性能提案，而不是最多五次模型调用。
 若公开评测有效的候选被识别为 host-bound，Optimization 可以提前停止，
 随后仍按正常流程选择公开最佳并只对最终候选执行隐藏评测。
 
-首轮 Prompt 提供任务与环境起点。后续 Prompt 只保留固定任务描述和约束、
-当前候选代码、上一轮的紧凑关键指标/失败原因/下一轮建议，以及历史轮次的
-短成绩表；不再重复追加完整 evaluation、全量日志或 profiler 原始内容。
+每次反馈都落入明确的 A/B/C/D 状态，不把“修代码”和“性能提案”混成同一种 Prompt：
+
+- **A — 首次生成**：提供任务、PyTorch eager baseline、source checker 契约和 compact hardware，
+  要求返回完整 Kernel 与模型原生 `optimization_summary`。
+- **B — 失败修复**：模型格式、source、compile 或 correctness 失败时，保留同一 repair/proposal
+  上下文；有失败源码时从该源码修复，并附原始失败证据，不把修复算作新的性能提案。
+- **C — BEST 前进**：首个公开可比较候选成为 `INITIAL_BEST`；后续候选只有被判为
+  `NEW_BEST` 才替换 BEST，下一次提案从新 BEST 继续。
+- **D — 回到 BEST**：`REGRESSION` 不替换 BEST，下一次提案回到 BEST，并携带失败方案的模型原生
+  意图、相对 BEST 的代码 diff 和指标差；`TIE` 同样保留 BEST，但要求尝试不同方案。
+
+“公开可比较”要求候选通过 source/compile/correctness/anti-bypass，并产出 geomean 与 minimum
+speedup。在线比较是 noise-aware：容差取 1%、当前候选 `stability_cv` 和 BEST
+`stability_cv` 的最大值；geomean 提升超过容差且 minimum 未越过负容差才是 `NEW_BEST`，
+任一确定性退化是 `REGRESSION`，其余为 `TIE`。最终选择不会因最后一轮覆盖已提交 BEST。
+
+后续 Prompt 只保留固定任务约束、所处状态要求的候选/BEST 完整源码、模型原生意图、上一轮紧凑
+指标/失败原因/下一轮建议、compact hardware 和短成绩表；不重复追加两份完整 evaluation、全量日志、
+完整 hardware profile 或 profiler 原始内容。完整 profile 和原始采集文件只保留为实验证据，模型只看到
+与本次决策直接相关的 quick-profile/延迟摘要。
 
 只跑指定任务：
 
@@ -359,7 +394,8 @@ akg export report \
 `successful_repair` 和 `high_quality_optimization` 三类样本；失败、性能回退、
 host-bound 和后续无提升样本不进入默认 SFT 集。
 `akg export sft --all-samples` 才导出所有轮次，并为 source failure、性能回退等样本保留质量分类标签。
-RL 导出始终保留全量轮次及其质量标签，并明确记录最终采用的轮次。
+RL 导出始终保留全量轮次及其质量标签，并明确记录最终采用的轮次。各导出格式中的
+`candidate_generation_intent.optimization_summary` 来自该次 DeepSeek 响应，不是评测系统推断。
 
 ## Artifact 结构
 

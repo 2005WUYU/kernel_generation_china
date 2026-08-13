@@ -33,9 +33,11 @@ from .models import (
     utc_now,
 )
 from .scoring import (
+    PublicCandidateComparison,
     RewardBreakdown,
     aggregate_candidate_score,
     candidate_selection_key,
+    compare_public_candidate,
     compute_reward,
     rank_candidates,
     select_best_candidate,
@@ -70,6 +72,7 @@ __all__ = [
     "JobStatus",
     "LeaseLostError",
     "LeasedEvaluationJob",
+    "PublicCandidateComparison",
     "RewardBreakdown",
     "RoundRecord",
     "RoundState",
@@ -81,6 +84,7 @@ __all__ = [
     "TaskStateMachine",
     "aggregate_candidate_score",
     "candidate_selection_key",
+    "compare_public_candidate",
     "compute_reward",
     "rank_candidates",
     "round_state_machine",
