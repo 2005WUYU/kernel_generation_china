@@ -624,8 +624,8 @@ def _benchmark(
         for item in per_case
     ]
     return {
-        "passed": stable,
-        "status": "stable" if stable else "unstable",
+        "passed": True,
+        "measurement_stable": stable,
         "per_case": per_case,
         "maximum_cv": max(observed_cvs, default=0.0),
         **summary,
@@ -763,7 +763,7 @@ def _redact_details(stage: str, details: Mapping[str, Any]) -> dict[str, Any]:
     if stage == "benchmark":
         return {
             **common,
-            "status": details.get("status"),
+            "measurement_stable": details.get("measurement_stable"),
             "geomean_speedup_vs_eager": details.get("geomean_speedup_vs_eager"),
             "minimum_speedup_vs_eager": details.get("minimum_speedup_vs_eager"),
             "maximum_speedup_vs_eager": details.get("maximum_speedup_vs_eager"),

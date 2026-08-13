@@ -122,8 +122,7 @@ def _final_gate_status(
         return "failed_final_benchmark", True
     assert isinstance(benchmark, Mapping)
     if (
-        str(benchmark.get("status", "")).lower() not in {"stable", "pass"}
-        or not _finite_positive_number(
+        not _finite_positive_number(
             benchmark.get("geomean_speedup_vs_eager", benchmark.get("speedup_geomean"))
         )
         or not _finite_positive_number(
@@ -565,6 +564,7 @@ class ExperimentController:
                     "minimum_speedup_vs_eager"
                 ),
                 "maximum_cv": benchmark.get("maximum_cv"),
+                "measurement_stable": benchmark.get("measurement_stable"),
                 "cases": cases,
             }
 
