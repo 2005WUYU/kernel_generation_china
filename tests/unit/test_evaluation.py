@@ -54,6 +54,7 @@ class EvaluationFlowTests(unittest.TestCase):
                     candidate_id="exp_test:k01_vector_add:r01:candidate",
                     candidate_path=candidate,
                     artifact_dir=Path(temporary) / "artifacts",
+                    combine_candidate_stages=True,
                 ),
             )
 
@@ -62,15 +63,15 @@ class EvaluationFlowTests(unittest.TestCase):
             [call["stage"] for call in backend.calls],
             [
                 EvaluationStage.SOURCE_CHECK.value,
+                EvaluationStage.FULL_EVALUATION.value,
                 EvaluationStage.COMPILE.value,
                 EvaluationStage.CORRECTNESS.value,
                 EvaluationStage.BENCHMARK.value,
-                EvaluationStage.PROFILE.value,
             ],
         )
-        self.assertIsNotNone(result.profile)
-        self.assertTrue(result.anti_bypass["passed"])
-        self.assertEqual(result.score.candidate_kernel_coverage, 1.0)
+        self.assertIsNone(result.profile)
+        self.assertFalse(result.anti_bypass["passed"])
+        self.assertIsNone(result.score.candidate_kernel_coverage)
         self.assertEqual(result.score.stability_cv, 0.25)
         self.assertIsNone(result.score.minimum_speedup)
         self.assertIsNone(result.score.geomean_speedup)

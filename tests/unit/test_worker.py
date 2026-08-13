@@ -98,8 +98,9 @@ class LeakyHiddenBackend(FakeBackend):
         cases: Sequence[CaseSpec],
         artifact_dir: Path,
         baseline_snapshot: Mapping[str, object] | None = None,
+        benchmark_settings: Mapping[str, object] | None = None,
     ) -> StageResult:
-        del candidate_path, task, baseline_snapshot
+        del candidate_path, task, baseline_snapshot, benchmark_settings
         return self._private_result(
             EvaluationStage.BENCHMARK,
             cases,

@@ -344,6 +344,14 @@ class QueueEvaluationBackend(Backend):
             case.kind != "correctness" for case in cases
         ):
             raise ValueError(f"{stage.value} accepts only correctness cases")
+        if stage is EvaluationStage.FULL_EVALUATION:
+            if not any(case.kind == "correctness" for case in cases) or not any(
+                case.kind == "benchmark" for case in cases
+            ):
+                raise ValueError(
+                    "FULL_EVALUATION requires correctness and benchmark cases"
+                )
+            return
         if stage is EvaluationStage.BENCHMARK and any(
             case.kind != "benchmark" for case in cases
         ):
@@ -428,6 +436,9 @@ class QueueEvaluationBackend(Backend):
         artifact_relative: str,
         cases: Sequence[CaseSpec],
         baseline_snapshot: Mapping[str, Any] | None,
+        benchmark_settings: Mapping[str, Any] | None = None,
+        incumbent_relative: str | None = None,
+        incumbent_sha256: str | None = None,
     ) -> dict[str, Any]:
         hidden_case_set = self._hidden_case_set(stage, task, cases)
         payload: dict[str, Any] = {
@@ -450,6 +461,11 @@ class QueueEvaluationBackend(Backend):
             if not isinstance(baseline_snapshot, Mapping):
                 raise TypeError("baseline_snapshot must be a mapping or None")
             payload["baseline_snapshot"] = dict(baseline_snapshot)
+        if benchmark_settings is not None:
+            payload["benchmark_settings"] = dict(benchmark_settings)
+        if incumbent_relative is not None:
+            payload["incumbent_path"] = incumbent_relative
+            payload["incumbent_sha256"] = incumbent_sha256
         payload = self._detached_json_object(payload, "evaluation payload")
         if len(canonical_json_dumps(payload).encode("utf-8")) > self.maximum_payload_bytes:
             raise ValueError("evaluation payload exceeds maximum_payload_bytes")
@@ -464,6 +480,8 @@ class QueueEvaluationBackend(Backend):
         artifact_dir: Path,
         cases: Sequence[CaseSpec],
         baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
+        incumbent_path: Path | None = None,
     ) -> EvaluationJob:
         self._validate_cases(stage, cases)
         candidate_relative = self._relative_path(
@@ -482,6 +500,15 @@ class QueueEvaluationBackend(Backend):
         if artifact_parts[: len(expected_task_prefix.parts)] != expected_task_prefix.parts:
             raise ValueError("artifact_dir does not belong to the submitted task")
         candidate_sha256 = self._candidate_digest(candidate_path, candidate_relative)
+        incumbent_relative = None
+        incumbent_sha256 = None
+        if incumbent_path is not None:
+            incumbent_relative = self._relative_path(
+                incumbent_path, name="incumbent_path", require_file=True
+            )
+            incumbent_sha256 = self._candidate_digest(
+                incumbent_path, incumbent_relative
+            )
         round_number, candidate_id = self._resolve_identity(
             task=task,
             candidate_relative=candidate_relative,
@@ -495,6 +522,9 @@ class QueueEvaluationBackend(Backend):
             artifact_relative=artifact_relative,
             cases=cases,
             baseline_snapshot=baseline_snapshot,
+            benchmark_settings=benchmark_settings,
+            incumbent_relative=incumbent_relative,
+            incumbent_sha256=incumbent_sha256,
         )
         request_identity = {
             "protocol_version": JOB_PROTOCOL_VERSION,
@@ -755,6 +785,8 @@ class QueueEvaluationBackend(Backend):
         cases: Sequence[CaseSpec],
         artifact_dir: Path,
         baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
+        incumbent_path: Path | None = None,
     ) -> StageResult:
         return self._wait(
             self._make_job(
@@ -764,6 +796,8 @@ class QueueEvaluationBackend(Backend):
                 artifact_dir=artifact_dir,
                 cases=cases,
                 baseline_snapshot=baseline_snapshot,
+                benchmark_settings=benchmark_settings,
+                incumbent_path=incumbent_path,
             )
         )
 
@@ -809,6 +843,7 @@ class QueueEvaluationBackend(Backend):
         cases: Sequence[CaseSpec],
         artifact_dir: Path,
         baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
     ) -> StageResult:
         return self._run(
             EvaluationStage.BENCHMARK,
@@ -817,6 +852,29 @@ class QueueEvaluationBackend(Backend):
             cases,
             artifact_dir,
             baseline_snapshot,
+            benchmark_settings,
+        )
+
+    def candidate_evaluation(
+        self,
+        candidate_path: Path,
+        task: TaskSpec,
+        correctness_cases: Sequence[CaseSpec],
+        benchmark_cases: Sequence[CaseSpec],
+        artifact_dir: Path,
+        baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
+        incumbent_path: Path | None = None,
+    ) -> StageResult:
+        return self._run(
+            EvaluationStage.FULL_EVALUATION,
+            candidate_path,
+            task,
+            (*correctness_cases, *benchmark_cases),
+            artifact_dir,
+            baseline_snapshot,
+            benchmark_settings,
+            incumbent_path,
         )
 
     def profile(

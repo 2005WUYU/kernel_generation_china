@@ -17,7 +17,6 @@ from typing import Any
 
 from ascend_kernel_lab.backend import Backend, StageResult, StageStatus
 from ascend_kernel_lab.domain import EvaluationStage, LeasedEvaluationJob, LeaseLostError
-from ascend_kernel_lab.evaluation.orchestrator import EvaluationRequest, evaluate_candidate
 from ascend_kernel_lab.protocol import EVALUATION_JOB_PROTOCOL, harness_digest
 from ascend_kernel_lab.storage import SQLiteEvaluationJobQueue, canonical_json_dumps
 from ascend_kernel_lab.storage.permissions import (
@@ -51,6 +50,9 @@ _PAYLOAD_KEYS = frozenset(
         "cases",
         "case_set",
         "baseline_snapshot",
+        "benchmark_settings",
+        "incumbent_path",
+        "incumbent_sha256",
         "run_profile",
         "profile_coverage_required",
         "minimum_kernel_coverage",
@@ -96,6 +98,9 @@ class _ValidatedJob:
     candidate_sha256: str
     cases: tuple[CaseSpec, ...]
     baseline_snapshot: Mapping[str, Any] | None
+    benchmark_settings: Mapping[str, Any] | None
+    incumbent_path: Path | None
+    incumbent_sha256: str | None
     run_profile: bool
     profile_coverage_required: bool
     minimum_kernel_coverage: float
@@ -489,6 +494,17 @@ class WorkerService:
         requested_sha = str(payload["candidate_sha256"])
         if not re_full_sha256(requested_sha) or _sha256(candidate_path) != requested_sha:
             raise WorkerPayloadError("candidate SHA-256 mismatch")
+        incumbent_path = None
+        incumbent_sha = None
+        if payload.get("incumbent_path") is not None:
+            incumbent_path = self._resolve_existing_file(
+                payload["incumbent_path"], "incumbent_path"
+            )
+            incumbent_sha = str(payload.get("incumbent_sha256", ""))
+            if not re_full_sha256(incumbent_sha) or _sha256(
+                incumbent_path
+            ) != incumbent_sha:
+                raise WorkerPayloadError("incumbent SHA-256 mismatch")
         private_cases = has_case_set
         if private_cases:
             raw_case_set = payload["case_set"]
@@ -518,6 +534,11 @@ class WorkerService:
         baseline = payload.get("baseline_snapshot")
         if baseline is not None and not isinstance(baseline, Mapping):
             raise WorkerPayloadError("baseline_snapshot must be an object or null")
+        benchmark_settings = payload.get("benchmark_settings")
+        if benchmark_settings is not None and not isinstance(
+            benchmark_settings, Mapping
+        ):
+            raise WorkerPayloadError("benchmark_settings must be an object or null")
         minimum = float(payload.get("minimum_kernel_coverage", 0.90))
         if not math.isfinite(minimum) or not 0 <= minimum <= 1:
             raise WorkerPayloadError("minimum_kernel_coverage must be between zero and one")
@@ -529,6 +550,13 @@ class WorkerService:
             candidate_sha256=requested_sha,
             cases=cases,
             baseline_snapshot=dict(baseline) if isinstance(baseline, Mapping) else None,
+            benchmark_settings=(
+                dict(benchmark_settings)
+                if isinstance(benchmark_settings, Mapping)
+                else None
+            ),
+            incumbent_path=incumbent_path,
+            incumbent_sha256=incumbent_sha,
             run_profile=bool(payload.get("run_profile", True)),
             profile_coverage_required=bool(payload.get("profile_coverage_required", True)),
             minimum_kernel_coverage=minimum,
@@ -582,6 +610,7 @@ class WorkerService:
                     cases,
                     validated.artifact_dir,
                     validated.baseline_snapshot,
+                    validated.benchmark_settings,
                 )
             elif job.stage in {
                 EvaluationStage.PROFILE,
@@ -592,40 +621,20 @@ class WorkerService:
                 )
             elif job.stage is EvaluationStage.FULL_EVALUATION:
                 correctness = (
-                    tuple(case for case in cases if case.kind == "correctness") or None
+                    tuple(case for case in cases if case.kind == "correctness")
                 )
                 benchmark = (
-                    tuple(case for case in cases if case.kind == "benchmark") or None
+                    tuple(case for case in cases if case.kind == "benchmark")
                 )
-                profile = tuple(case for case in cases if case.kind == "profile") or None
-                evaluation = evaluate_candidate(
-                    self.backend,
-                    EvaluationRequest(
-                        experiment_id=job.experiment_id,
-                        task=task,
-                        round_number=job.round_number,
-                        candidate_id=job.candidate_id,
-                        candidate_path=validated.candidate_path,
-                        artifact_dir=validated.artifact_dir,
-                        correctness_cases=correctness,
-                        benchmark_cases=benchmark,
-                        profile_cases=profile,
-                        baseline_snapshot=validated.baseline_snapshot,
-                        run_profile=validated.run_profile,
-                        profile_coverage_required=validated.profile_coverage_required,
-                        minimum_kernel_coverage=validated.minimum_kernel_coverage,
-                        hidden=validated.hidden,
-                    ),
-                )
-                result_mapping = evaluation.to_dict()
-                if _sha256(validated.candidate_path) != validated.candidate_sha256:
-                    raise WorkerPayloadError(
-                        "candidate changed while it was being evaluated"
-                    )
-                return (
-                    _sanitize_hidden_mapping(result_mapping)
-                    if validated.private_cases
-                    else result_mapping
+                result = self.backend.candidate_evaluation(
+                    validated.candidate_path,
+                    task,
+                    correctness,
+                    benchmark,
+                    validated.artifact_dir,
+                    validated.baseline_snapshot,
+                    validated.benchmark_settings,
+                    validated.incumbent_path,
                 )
             else:  # pragma: no cover - enum exhaustiveness guard
                 raise WorkerPayloadError(
@@ -634,6 +643,14 @@ class WorkerService:
             if _sha256(validated.candidate_path) != validated.candidate_sha256:
                 raise WorkerPayloadError(
                     "candidate changed while it was being evaluated"
+                )
+            if (
+                validated.incumbent_path is not None
+                and _sha256(validated.incumbent_path)
+                != validated.incumbent_sha256
+            ):
+                raise WorkerPayloadError(
+                    "incumbent changed while it was being evaluated"
                 )
             if result.stage != job.stage:
                 result = StageResult(

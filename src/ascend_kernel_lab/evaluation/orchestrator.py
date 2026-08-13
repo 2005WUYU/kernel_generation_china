@@ -30,6 +30,19 @@ class EvaluationBackend(Protocol):
         cases: Sequence[CaseSpec],
         artifact_dir: Path,
         baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
+    ) -> StageLike: ...
+
+    def candidate_evaluation(
+        self,
+        candidate_path: Path,
+        task: TaskSpec,
+        correctness_cases: Sequence[CaseSpec],
+        benchmark_cases: Sequence[CaseSpec],
+        artifact_dir: Path,
+        baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
+        incumbent_path: Path | None = None,
     ) -> StageLike: ...
 
     def profile(self, candidate_path: Path, task: TaskSpec, cases: Sequence[CaseSpec], artifact_dir: Path) -> StageLike: ...
@@ -47,6 +60,9 @@ class EvaluationRequest:
     benchmark_cases: tuple[CaseSpec, ...] | None = None
     profile_cases: tuple[CaseSpec, ...] | None = None
     baseline_snapshot: Mapping[str, Any] | None = None
+    benchmark_settings: Mapping[str, Any] | None = None
+    incumbent_path: Path | None = None
+    combine_candidate_stages: bool = False
     run_profile: bool = True
     profile_coverage_required: bool = True
     minimum_kernel_coverage: float = 0.90
@@ -106,6 +122,16 @@ def _stage_dict(stage: StageLike) -> dict[str, Any]:
         # Keep envelope fields and surface normalized metrics for consumers.
         return {**value, **details}
     return value
+
+
+def _combined_stage(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    result = dict(value)
+    details = result.get("details")
+    if isinstance(details, Mapping):
+        result.update(details)
+    return result
 
 
 def _failure_result(
@@ -178,36 +204,84 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
         return _failure_result(request, overall_status="source_failed", source=source)
 
     correctness_cases = request.correctness_cases or request.task.correctness_cases
-    compile_stage = backend.compile(request.candidate_path, request.task, correctness_cases, request.artifact_dir)
-    compile_result = _stage_dict(compile_stage)
-    if not compile_stage.passed:
-        return _failure_result(
-            request, overall_status="compile_failed", source=source, compile_result=compile_result,
-        )
-
-    correctness_stage = backend.check_correctness(
-        request.candidate_path, request.task, correctness_cases, request.artifact_dir,
-    )
-    correctness = _stage_dict(correctness_stage)
-    if not correctness_stage.passed:
-        return _failure_result(
-            request,
-            overall_status="correctness_failed",
-            source=source,
-            compile_result=compile_result,
-            correctness=correctness,
-        )
-
     benchmark_cases = request.benchmark_cases or request.task.benchmark_cases
-    benchmark_stage = backend.benchmark(
-        request.candidate_path,
-        request.task,
-        benchmark_cases,
-        request.artifact_dir,
-        request.baseline_snapshot,
-    )
-    benchmark = _stage_dict(benchmark_stage)
-    benchmark_passed = benchmark_stage.passed
+    compile_result: dict[str, Any] | None
+    correctness: dict[str, Any] | None
+    benchmark: dict[str, Any] | None
+    if request.hidden or not request.combine_candidate_stages:
+        compile_stage = backend.compile(
+            request.candidate_path,
+            request.task,
+            correctness_cases,
+            request.artifact_dir,
+        )
+        compile_result = _stage_dict(compile_stage)
+        if not compile_stage.passed:
+            return _failure_result(
+                request,
+                overall_status="compile_failed",
+                source=source,
+                compile_result=compile_result,
+            )
+        correctness_stage = backend.check_correctness(
+            request.candidate_path,
+            request.task,
+            correctness_cases,
+            request.artifact_dir,
+        )
+        correctness = _stage_dict(correctness_stage)
+        if not correctness_stage.passed:
+            return _failure_result(
+                request,
+                overall_status="correctness_failed",
+                source=source,
+                compile_result=compile_result,
+                correctness=correctness,
+            )
+        benchmark_stage = backend.benchmark(
+            request.candidate_path,
+            request.task,
+            benchmark_cases,
+            request.artifact_dir,
+            request.baseline_snapshot,
+            request.benchmark_settings,
+        )
+        benchmark = _stage_dict(benchmark_stage)
+        benchmark_passed = benchmark_stage.passed
+    else:
+        candidate_stage = backend.candidate_evaluation(
+            request.candidate_path,
+            request.task,
+            correctness_cases,
+            benchmark_cases,
+            request.artifact_dir,
+            request.baseline_snapshot,
+            request.benchmark_settings,
+            request.incumbent_path,
+        )
+        candidate_result = _stage_dict(candidate_stage)
+        compile_result = _combined_stage(candidate_result.get("compile"))
+        correctness = _combined_stage(candidate_result.get("correctness"))
+        benchmark = _combined_stage(candidate_result.get("benchmark"))
+        outcome = str(candidate_result.get("outcome", "compile_failed"))
+        if compile_result is None:
+            compile_result = candidate_result
+        if outcome == "compile_failed":
+            return _failure_result(
+                request,
+                overall_status=outcome,
+                source=source,
+                compile_result=compile_result,
+            )
+        if outcome == "correctness_failed":
+            return _failure_result(
+                request,
+                overall_status=outcome,
+                source=source,
+                compile_result=compile_result,
+                correctness=correctness,
+            )
+        benchmark_passed = benchmark is not None and _passed(benchmark)
 
     profile: dict[str, Any] | None = None
     if request.run_profile and benchmark_passed:

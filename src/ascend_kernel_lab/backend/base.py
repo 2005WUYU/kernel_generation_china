@@ -210,6 +210,19 @@ class Backend(Protocol):
         cases: Sequence[CaseSpec],
         artifact_dir: Path,
         baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
+    ) -> StageResult: ...
+
+    def candidate_evaluation(
+        self,
+        candidate_path: Path,
+        task: TaskSpec,
+        correctness_cases: Sequence[CaseSpec],
+        benchmark_cases: Sequence[CaseSpec],
+        artifact_dir: Path,
+        baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
+        incumbent_path: Path | None = None,
     ) -> StageResult: ...
 
     def profile(

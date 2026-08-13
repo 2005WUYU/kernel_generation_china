@@ -526,7 +526,7 @@ def _load_baselines(
                     task=task,
                     environment_sha256=environment_sha256,
                     harness_git_commit=measured_commit,
-                    benchmark_config=dataclasses.asdict(config.benchmark),
+                    benchmark_config=config.benchmark.baseline_settings(),
                 )
                 if not validate_baseline_snapshot(snapshot, expected_identity=identity):
                     invalid_reasons.append("identity_sha256_or_measurements")
@@ -736,7 +736,7 @@ def _cmd_baseline_run(args: argparse.Namespace) -> int:
         backend=backend,
         environment_sha256=environment_sha,
         harness_git_commit=_git_commit(config.project_root),
-        benchmark_config=dataclasses.asdict(config.benchmark),
+        benchmark_config=config.benchmark.baseline_settings(),
     )
     artifacts = AtomicArtifactStore(config.artifact_root)
     snapshots: dict[str, Any] = {}
@@ -853,6 +853,12 @@ def _queue_backend(config: ExperimentConfig) -> Any:
             * 20
             + 30,
             EvaluationStage.BENCHMARK: config.timeouts.benchmark_seconds + 30,
+            EvaluationStage.FULL_EVALUATION: (
+                config.timeouts.compile_seconds
+                + config.timeouts.correctness_case_seconds * 20
+                + config.timeouts.benchmark_seconds
+                + 30
+            ),
             EvaluationStage.PROFILE: config.timeouts.profile_seconds + 30,
         },
         maximum_job_attempts=config.worker.maximum_job_attempts,

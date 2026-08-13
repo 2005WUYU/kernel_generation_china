@@ -113,6 +113,7 @@ task_ids = sys.argv[4:]
 
 stage_rank = {
     "SOURCE_CHECK": 1,
+    "FULL_EVALUATION": 4,
     "COMPILE": 2,
     "CORRECTNESS": 3,
     "BENCHMARK": 4,
@@ -120,6 +121,7 @@ stage_rank = {
 }
 stage_label = {
     "SOURCE_CHECK": "SOURCE",
+    "FULL_EVALUATION": "EVAL",
     "COMPILE": "COMPILE",
     "CORRECTNESS": "CORRECTNESS",
     "BENCHMARK": "BENCHMARK",
@@ -154,7 +156,7 @@ if database_path.is_file():
             FROM evaluation_jobs
             WHERE experiment_id = ?
               AND stage IN (
-                  'SOURCE_CHECK', 'COMPILE', 'CORRECTNESS',
+                  'SOURCE_CHECK', 'FULL_EVALUATION', 'COMPILE', 'CORRECTNESS',
                   'BENCHMARK', 'PROFILE'
               )
             """,

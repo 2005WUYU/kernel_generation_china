@@ -15,6 +15,7 @@ from ascend_kernel_lab.config import ExperimentConfig
 from ascend_kernel_lab.domain import (
     CandidateScore,
     ExperimentState,
+    PublicCandidateComparison,
     RoundState,
     TaskState,
     compare_public_candidate,
@@ -107,6 +108,46 @@ def _finite_positive_number(value: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return number > 0 and math.isfinite(number)
+
+
+def _online_public_comparison(
+    evaluation: Mapping[str, Any],
+    candidate: CandidateScore,
+    incumbent: CandidateScore | None,
+) -> PublicCandidateComparison:
+    fallback = compare_public_candidate(candidate, incumbent)
+    if fallback.decision in {"INVALID", "INITIAL_BEST"}:
+        return fallback
+    benchmark = evaluation.get("benchmark")
+    paired = (
+        benchmark.get("paired_best_comparison")
+        if isinstance(benchmark, Mapping)
+        else None
+    )
+    if not isinstance(paired, Mapping):
+        return fallback
+    geomean = paired.get("geomean_speedup_vs_best")
+    minimum = paired.get("minimum_speedup_vs_best")
+    maximum_cv = paired.get("maximum_cv")
+    if not _finite_positive_number(geomean) or not _finite_positive_number(minimum):
+        return fallback
+    geomean_value = float(str(geomean))
+    minimum_value = float(str(minimum))
+    tolerance = max(0.01, float(str(maximum_cv or 0.0)))
+    geomean_change = geomean_value - 1.0
+    minimum_change = minimum_value - 1.0
+    if geomean_change > tolerance and minimum_change >= -tolerance:
+        decision = "NEW_BEST"
+    elif geomean_change < -tolerance or minimum_change < -tolerance:
+        decision = "REGRESSION"
+    else:
+        decision = "TIE"
+    return PublicCandidateComparison(
+        decision,
+        tolerance,
+        geomean_change,
+        minimum_change,
+    )
 
 
 def _final_gate_status(
@@ -579,14 +620,40 @@ class ExperimentController:
             )
             pipeline_value = summary.get("pipeline")
             pipeline = pipeline_value if isinstance(pipeline_value, Mapping) else {}
-            memory_value = summary.get("memory")
-            memory = memory_value if isinstance(memory_value, Mapping) else {}
+            profile_case_value = summary.get(
+                "profile_case", profile.get("profile_case")
+            )
+            profile_case = (
+                {
+                    "case_id": profile_case_value.get("case_id"),
+                    "dtype": profile_case_value.get("dtype"),
+                    "params": dict(profile_case_value.get("params", {})),
+                }
+                if isinstance(profile_case_value, Mapping)
+                else None
+            )
+            kernels_value = summary.get("executed_candidate_kernels")
+            kernels = []
+            if isinstance(kernels_value, Sequence) and not isinstance(
+                kernels_value, (str, bytes)
+            ):
+                for kernel in kernels_value:
+                    if isinstance(kernel, Mapping):
+                        kernels.append(
+                            {
+                                "kernel_name": kernel.get("kernel_name"),
+                                "duration_us": kernel.get("duration_us"),
+                                "block_dim": kernel.get("block_dim"),
+                            }
+                        )
             profile_summary = {
                 "status": profile.get("status"),
                 "passed": profile.get("passed"),
                 "mode": summary.get("profile_mode", profile.get("profile_mode")),
+                "profile_case": profile_case,
                 "kernel_count": summary.get("kernel_count"),
                 "candidate_kernel_coverage": summary.get("candidate_kernel_coverage"),
+                "executed_candidate_kernels": kernels,
                 "candidate_device_execution_us": scheduling.get(
                     "candidate_device_execution_us"
                 ),
@@ -599,9 +666,6 @@ class ExperimentController:
                 "pipeline_utilization": {
                     str(key): value
                     for key, value in list(pipeline.items())[:8]
-                },
-                "memory": {
-                    str(key): value for key, value in list(memory.items())[:4]
                 },
             }
 
@@ -687,26 +751,12 @@ class ExperimentController:
                         reasons.append(
                             "correctness diagnostics: " + " | ".join(summaries)
                         )
-        focus = feedback.get("next_round_requirement")
-        if len(reasons) == 1 and isinstance(focus, Mapping):
-            suggestions = focus.get("focus")
-            if isinstance(suggestions, Sequence) and not isinstance(suggestions, (str, bytes)):
-                reasons.extend(str(item) for item in suggestions[:1])
         return reasons
 
     @staticmethod
     def _follow_up_suggestions(feedback: Mapping[str, Any]) -> list[str]:
-        requirement = feedback.get("next_round_requirement")
-        if not isinstance(requirement, Mapping):
-            return ["保持正确性并依据 PyTorch eager 对比信息尝试下一次修改"]
-        focus = requirement.get("focus")
-        if not isinstance(focus, Sequence) or isinstance(focus, (str, bytes)):
-            return ["保持正确性并依据 PyTorch eager 对比信息尝试下一次修改"]
-        result = []
-        for item in focus:
-            text = str(item)
-            result.append(text)
-        return result
+        del feedback
+        return []
 
     def _best_context(
         self, task: TaskSpec, *, before_round: int | None = None
@@ -1701,11 +1751,27 @@ class ExperimentController:
                     "score": asdict(score),
                 }
             else:
-                reused = self._reuse_evaluation(
-                    task=task,
-                    round_number=round_number,
-                    source_sha=source_sha,
-                    candidate_id=candidate_id,
+                best_before_evaluation = self._best_context(
+                    task, before_round=round_number
+                )
+                incumbent_path = (
+                    self._artifact_path(
+                        task.id,
+                        int(best_before_evaluation["round"]),
+                        "candidate.py",
+                    )
+                    if best_before_evaluation is not None
+                    else None
+                )
+                reused = (
+                    self._reuse_evaluation(
+                        task=task,
+                        round_number=round_number,
+                        source_sha=source_sha,
+                        candidate_id=candidate_id,
+                    )
+                    if incumbent_path is None
+                    else None
                 )
                 if reused is not None:
                     evaluation_mapping, score = reused
@@ -1723,6 +1789,11 @@ class ExperimentController:
                                 self.baseline.get(task.id)
                                 if isinstance(self.baseline.get(task.id), Mapping)
                                 else self.baseline
+                            ),
+                            benchmark_settings=self.config.benchmark.search_settings(),
+                            incumbent_path=incumbent_path,
+                            combine_candidate_stages=(
+                                not self.config.worker.fresh_process_per_stage
                             ),
                             run_profile=self.config.profile.run_after_correctness,
                             profile_coverage_required=self.profile_coverage_required,
@@ -1891,16 +1962,6 @@ class ExperimentController:
             )
             return feedback
         best_before = self._best_context(task, before_round=round_number)
-        feedback = build_feedback(
-            task_id=task.id,
-            round_number=round_number,
-            result=evaluation,
-            best=best_before,
-            consecutive_non_improvements=self._consecutive_non_improvements(
-                task, round_number
-            ),
-            candidate_intent=self._candidate_intent(task, round_number),
-        )
         score_value = evaluation.get("score")
         candidate_score = (
             _score_from_mapping(score_value)
@@ -1913,9 +1974,20 @@ class ExperimentController:
             else None
         )
         decision = (
-            compare_public_candidate(candidate_score, incumbent)
+            _online_public_comparison(evaluation, candidate_score, incumbent)
             if candidate_score is not None
             else None
+        )
+        feedback = build_feedback(
+            task_id=task.id,
+            round_number=round_number,
+            result=evaluation,
+            best=best_before,
+            consecutive_non_improvements=self._consecutive_non_improvements(
+                task, round_number
+            ),
+            candidate_intent=self._candidate_intent(task, round_number),
+            performance_comparison=decision,
         )
         if candidate_score is not None and decision is not None and decision.decision in {
             "INITIAL_BEST",
@@ -2077,6 +2149,7 @@ class ExperimentController:
                     benchmark_cases=hidden_benchmark,
                     profile_cases=hidden_benchmark[:1],
                     baseline_snapshot=self.baseline.get(task.id) if isinstance(self.baseline.get(task.id), Mapping) else self.baseline,
+                    benchmark_settings=self.config.benchmark.final_settings(),
                     run_profile=self.config.profile.run_for_final_best,
                     profile_coverage_required=self.profile_coverage_required,
                     hidden=True,

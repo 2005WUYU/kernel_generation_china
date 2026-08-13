@@ -164,11 +164,13 @@ class AscendTritonBackend(Backend):
         raise RuntimeError(f"too many {stage_name} attempts in {root}")
 
     @staticmethod
-    def _copy_candidate(candidate_path: Path, work_dir: Path) -> Path:
+    def _copy_candidate(
+        candidate_path: Path, work_dir: Path, *, name: str = "candidate.py"
+    ) -> Path:
         source = Path(candidate_path)
         if source.is_symlink() or not source.is_file():
             raise ValueError("candidate must be a regular non-symlink file")
-        destination = work_dir / "candidate.py"
+        destination = work_dir / name
         value = source.read_bytes()
         with destination.open("xb") as handle:
             handle.write(value)
@@ -182,6 +184,7 @@ class AscendTritonBackend(Backend):
         artifact_dir: Path,
         stage_name: str,
         candidate_path: Path,
+        incumbent_path: Path | None = None,
     ) -> tuple[Path, Path, dict[str, str]]:
         attempt = self._attempt_dir(artifact_dir, stage_name)
         work = attempt / "work"
@@ -193,6 +196,8 @@ class AscendTritonBackend(Backend):
         for path in (cache, dump, temporary, home):
             path.mkdir(mode=0o700)
         self._copy_candidate(candidate_path, work)
+        if incumbent_path is not None:
+            self._copy_candidate(incumbent_path, work, name="incumbent.py")
         env = {
             "HOME": str(home),
             "TMPDIR": str(temporary),
@@ -525,10 +530,13 @@ class AscendTritonBackend(Backend):
         timeout_seconds: float,
         settings: Mapping[str, Any] | None = None,
         compile_debug: bool = False,
+        incumbent_path: Path | None = None,
     ) -> StageResult:
         started = datetime.now(timezone.utc)
         try:
-            attempt, work, env = self._prepare(artifact_dir, stage_name, candidate_path)
+            attempt, work, env = self._prepare(
+                artifact_dir, stage_name, candidate_path, incumbent_path
+            )
             if compile_debug:
                 env.update({"TRITON_DEBUG": "1", "TRITON_ALWAYS_COMPILE": "1"})
             private_cases = bool(cases) and all(
@@ -651,8 +659,10 @@ class AscendTritonBackend(Backend):
         cases: Sequence[CaseSpec],
         artifact_dir: Path,
         baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
     ) -> StageResult:
         settings = dict(self.benchmark_settings)
+        settings.update(benchmark_settings or {})
         if baseline_snapshot:
             # Kept out of the child timing loop; only its digestable metadata is
             # attached for traceability.  The eager baseline is always measured
@@ -669,6 +679,38 @@ class AscendTritonBackend(Backend):
             settings=settings,
         )
         return result
+
+    def candidate_evaluation(
+        self,
+        candidate_path: Path,
+        task: TaskSpec,
+        correctness_cases: Sequence[CaseSpec],
+        benchmark_cases: Sequence[CaseSpec],
+        artifact_dir: Path,
+        baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
+        incumbent_path: Path | None = None,
+    ) -> StageResult:
+        settings = dict(self.benchmark_settings)
+        settings.update(benchmark_settings or {})
+        if baseline_snapshot:
+            settings["baseline_snapshot_available"] = True
+        return self._run_isolated(
+            EvaluationStage.FULL_EVALUATION,
+            "candidate_evaluation",
+            candidate_path,
+            task,
+            (*correctness_cases, *benchmark_cases),
+            artifact_dir,
+            timeout_seconds=(
+                self.compile_timeout_seconds
+                + self.correctness_case_timeout_seconds
+                * max(1, len(correctness_cases))
+                + self.benchmark_timeout_seconds
+            ),
+            settings=settings,
+            incumbent_path=incumbent_path,
+        )
 
     @staticmethod
     def _kernel_names(candidate_path: Path) -> tuple[str, ...]:
@@ -922,6 +964,12 @@ class AscendTritonBackend(Backend):
                 )
             summary = MsprofParser(kernel_patterns).parse(raw_root)
             summary_dict = summary.to_dict()
+            profile_case = {
+                "case_id": cases[0].id,
+                "dtype": cases[0].dtype,
+                "params": dict(cases[0].params),
+            }
+            summary_dict["profile_case"] = profile_case
             summary_dict["profile_mode"] = profile_mode
             summary_dict["collection_warmup"] = profile_warmup
             summary_dict["collection_iterations"] = profile_iterations
@@ -939,6 +987,7 @@ class AscendTritonBackend(Backend):
             details = {
                 "profile_available": summary.profile_available and not missing_groups,
                 "profile_mode": profile_mode,
+                "profile_case": profile_case,
                 "summary": summary_dict,
                 "driver": dict(isolated.get("details", {})),
                 "returncode": run.returncode,

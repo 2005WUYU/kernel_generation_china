@@ -200,6 +200,10 @@ class TimeoutConfig:
 @dataclass(frozen=True, slots=True)
 class BenchmarkConfig:
     comparison_baseline: str = "pytorch_eager"
+    search_warmup: int = 5
+    search_measurement_batches: int = 3
+    search_target_batch_time_ms: float = 40.0
+    search_rerun_if_unstable: bool = False
     warmup: int = 20
     measurement_batches: int = 7
     target_batch_time_ms: float = 200.0
@@ -209,11 +213,46 @@ class BenchmarkConfig:
     def __post_init__(self) -> None:
         if self.comparison_baseline != "pytorch_eager":
             raise ValueError("comparison_baseline must be pytorch_eager")
+        _positive("search_warmup", self.search_warmup)
+        _positive("search_measurement_batches", self.search_measurement_batches)
+        _positive("search_target_batch_time_ms", self.search_target_batch_time_ms)
         _positive("warmup", self.warmup)
         _positive("measurement_batches", self.measurement_batches)
         _positive("target_batch_time_ms", self.target_batch_time_ms)
         if not 0 < self.maximum_cv <= 1:
             raise ValueError("maximum_cv must be in (0, 1]")
+
+    def search_settings(self) -> dict[str, Any]:
+        return {
+            "benchmark_mode": "search",
+            "comparison_baseline": self.comparison_baseline,
+            "warmup": self.search_warmup,
+            "measurement_batches": self.search_measurement_batches,
+            "target_batch_time_ms": self.search_target_batch_time_ms,
+            "maximum_cv": self.maximum_cv,
+            "rerun_if_unstable": self.search_rerun_if_unstable,
+        }
+
+    def final_settings(self) -> dict[str, Any]:
+        return {
+            "benchmark_mode": "final",
+            "comparison_baseline": self.comparison_baseline,
+            "warmup": self.warmup,
+            "measurement_batches": self.measurement_batches,
+            "target_batch_time_ms": self.target_batch_time_ms,
+            "maximum_cv": self.maximum_cv,
+            "rerun_if_unstable": self.rerun_if_unstable,
+        }
+
+    def baseline_settings(self) -> dict[str, Any]:
+        return {
+            "comparison_baseline": self.comparison_baseline,
+            "warmup": self.warmup,
+            "measurement_batches": self.measurement_batches,
+            "target_batch_time_ms": self.target_batch_time_ms,
+            "maximum_cv": self.maximum_cv,
+            "rerun_if_unstable": self.rerun_if_unstable,
+        }
 
 
 @dataclass(frozen=True, slots=True)

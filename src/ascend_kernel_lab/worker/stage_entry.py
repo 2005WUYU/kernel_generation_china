@@ -26,6 +26,7 @@ from ascend_kernel_lab.evaluation.benchmark import (
     speedup_summary,
     summarize_latency_breakdown,
     summarize_samples,
+    weighted_geometric_mean,
 )
 from ascend_kernel_lab.tasks import CaseSpec, TaskSpec
 from ascend_kernel_lab.tasks.runtime import generate_inputs, reference, validate_output
@@ -200,12 +201,14 @@ def _runtime() -> tuple[Any, Any, Any]:
     return torch, torch_npu, triton
 
 
-def _candidate(path: Path) -> tuple[ModuleType, Callable[..., Any]]:
+def _candidate(
+    path: Path, *, module_name: str = "candidate"
+) -> tuple[ModuleType, Callable[..., Any]]:
     resolved = path.resolve()
     cwd = Path.cwd().resolve()
     if resolved.parent != cwd or path.is_symlink() or not resolved.is_file():
         raise ValueError("candidate must be a regular file directly inside the stage cwd")
-    module_spec = importlib.util.spec_from_file_location("candidate", resolved)
+    module_spec = importlib.util.spec_from_file_location(module_name, resolved)
     if module_spec is None or module_spec.loader is None:
         raise ImportError("cannot construct a candidate module loader")
     module = importlib.util.module_from_spec(module_spec)
@@ -422,7 +425,10 @@ def _measurement_session(
     target_batch_time_ms: float,
     candidate_context: Callable[[], contextlib.AbstractContextManager[None]],
     observe_candidate_output: Callable[[Any], None] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any], int]:
+    incumbent: Callable[[], Any] | None = None,
+    incumbent_context: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
+    observe_incumbent_output: Callable[[Any], None] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None, int]:
     def measure_candidate(
         repeats: int, *, timing_sink: list[dict[str, Any]] | None = None
     ) -> float:
@@ -446,19 +452,57 @@ def _measurement_session(
 
     candidate_once = max(measure_candidate(1), 1e-3)
     baseline_once = max(_measure_batch(torch, baseline, 1), 1e-3)
+    incumbent_once = None
+    if incumbent is not None:
+        assert incumbent_context is not None
+        with incumbent_context():
+            incumbent_once = max(_measure_batch(torch, incumbent, 1), 1e-3)
     repeats = max(
         1,
         min(
             1_000_000,
-            math.ceil(target_batch_time_ms * 1000.0 / min(candidate_once, baseline_once)),
+            math.ceil(
+                target_batch_time_ms
+                * 1000.0
+                / min(
+                    candidate_once,
+                    baseline_once,
+                    incumbent_once if incumbent_once is not None else math.inf,
+                )
+            ),
         ),
     )
     candidate_samples: list[float] = []
     baseline_samples: list[float] = []
+    incumbent_samples: list[float] = []
     candidate_batch_timings: list[dict[str, Any]] = []
     baseline_batch_timings: list[dict[str, Any]] = []
+    incumbent_batch_timings: list[dict[str, Any]] = []
+
+    def measure_incumbent(repeats: int) -> float:
+        assert incumbent is not None and incumbent_context is not None
+        last_output: Any = None
+
+        def tracked_incumbent() -> Any:
+            nonlocal last_output
+            last_output = incumbent()
+            return last_output
+
+        with incumbent_context():
+            latency = _measure_batch(
+                torch,
+                tracked_incumbent,
+                repeats,
+                timing_sink=incumbent_batch_timings,
+            )
+        if observe_incumbent_output is not None:
+            observe_incumbent_output(last_output)
+        return latency
+
     for batch in range(batches):
         if batch % 2 == 0:
+            if incumbent is not None:
+                incumbent_samples.append(measure_incumbent(repeats))
             baseline_samples.append(
                 _measure_batch(
                     torch,
@@ -482,6 +526,8 @@ def _measurement_session(
                     timing_sink=baseline_batch_timings,
                 )
             )
+            if incumbent is not None:
+                incumbent_samples.append(measure_incumbent(repeats))
     candidate_statistics = summarize_samples(candidate_samples).to_dict()
     candidate_statistics["latency_breakdown"] = summarize_latency_breakdown(
         candidate_batch_timings
@@ -490,7 +536,13 @@ def _measurement_session(
     baseline_statistics["latency_breakdown"] = summarize_latency_breakdown(
         baseline_batch_timings
     )
-    return candidate_statistics, baseline_statistics, repeats
+    incumbent_statistics = None
+    if incumbent_samples:
+        incumbent_statistics = summarize_samples(incumbent_samples).to_dict()
+        incumbent_statistics["latency_breakdown"] = summarize_latency_breakdown(
+            incumbent_batch_timings
+        )
+    return candidate_statistics, baseline_statistics, incumbent_statistics, repeats
 
 
 def _benchmark(
@@ -500,6 +552,7 @@ def _benchmark(
     cases: Sequence[CaseSpec],
     device: str,
     settings: Mapping[str, Any],
+    incumbent_entry: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     warmup = int(settings.get("warmup", task.benchmark.get("warmup", 20)))
     batches = int(
@@ -517,9 +570,28 @@ def _benchmark(
     for case in cases:
         candidate_inputs = generate_inputs(task, case, torch, device).args
         baseline_inputs = generate_inputs(task, case, torch, device).args
+        incumbent_inputs = (
+            generate_inputs(task, case, torch, device).args
+            if incumbent_entry is not None
+            else None
+        )
         originals = tuple(value.clone() for value in candidate_inputs)
         expected_inputs = tuple(value.clone() for value in candidate_inputs)
         expected = reference(task, expected_inputs, torch)
+        incumbent_originals = (
+            tuple(value.clone() for value in incumbent_inputs)
+            if incumbent_inputs is not None
+            else None
+        )
+        incumbent_expected = (
+            reference(
+                task,
+                tuple(value.clone() for value in incumbent_inputs),
+                torch,
+            )
+            if incumbent_inputs is not None
+            else None
+        )
         _sync(torch)
 
         def candidate_call(inputs: tuple[Any, ...] = candidate_inputs) -> Any:
@@ -527,6 +599,10 @@ def _benchmark(
 
         def baseline_call(inputs: tuple[Any, ...] = baseline_inputs) -> Any:
             return reference(task, inputs, torch)
+
+        def incumbent_call(inputs: tuple[Any, ...] = incumbent_inputs or ()) -> Any:
+            assert incumbent_entry is not None
+            return incumbent_entry(*inputs)
 
         def validate_timed_output(
             output: Any,
@@ -554,21 +630,43 @@ def _benchmark(
                 )
 
         warmup_output: Any = None
+        incumbent_warmup_output: Any = None
         with _candidate_guard(torch):
             for _ in range(warmup):
                 warmup_output = candidate_call()
+            if incumbent_entry is not None:
+                for _ in range(warmup):
+                    incumbent_warmup_output = incumbent_call()
         for _ in range(warmup):
             baseline_call()
         _sync(torch)
         validate_timed_output(warmup_output)
+        if incumbent_inputs is not None and incumbent_originals is not None:
+            incumbent_validation = validate_output(
+                task,
+                case,
+                incumbent_warmup_output,
+                incumbent_expected,
+                torch,
+                inputs=incumbent_inputs,
+            )
+            if not bool(incumbent_validation.get("passed")):
+                raise RuntimeError(
+                    f"case {case.id}: incumbent BEST output failed validation"
+                )
+            if not _unchanged(torch, incumbent_inputs, incumbent_originals):
+                raise RuntimeError(
+                    f"case {case.id}: incumbent BEST modified an input during benchmark"
+                )
         attempts: list[dict[str, Any]] = []
         candidate_stats: dict[str, Any]
         baseline_stats: dict[str, Any]
+        incumbent_stats: dict[str, Any] | None
         repeats = 1
         maximum_observed_cv = math.inf
         attempt_count = 2 if rerun else 1
         for _attempt in range(attempt_count):
-            candidate_stats, baseline_stats, repeats = _measurement_session(
+            candidate_stats, baseline_stats, incumbent_stats, repeats = _measurement_session(
                 torch,
                 candidate_call,
                 baseline_call,
@@ -576,6 +674,12 @@ def _benchmark(
                 target_batch_time_ms=target_ms,
                 candidate_context=lambda: _candidate_guard(torch),
                 observe_candidate_output=validate_timed_output,
+                incumbent=(incumbent_call if incumbent_entry is not None else None),
+                incumbent_context=(
+                    (lambda: _candidate_guard(torch))
+                    if incumbent_entry is not None
+                    else None
+                ),
             )
             maximum_observed_cv = max(
                 float(candidate_stats["cv"]), float(baseline_stats["cv"])
@@ -584,6 +688,7 @@ def _benchmark(
                 {
                     "candidate": candidate_stats,
                     "baseline_eager": baseline_stats,
+                    "incumbent_best": incumbent_stats,
                     "repeats_per_batch": repeats,
                 }
             )
@@ -593,6 +698,11 @@ def _benchmark(
             raise RuntimeError(f"case {case.id}: candidate modified an input during benchmark")
         candidate_median = float(candidate_stats["median_us"])
         baseline_median = float(baseline_stats["median_us"])
+        incumbent_median = (
+            float(incumbent_stats["median_us"])
+            if incumbent_stats is not None
+            else None
+        )
         per_case.append(
             {
                 "case_id": case.id,
@@ -602,6 +712,22 @@ def _benchmark(
                 "candidate": candidate_stats,
                 "baseline_eager": baseline_stats,
                 "speedup_vs_eager": baseline_median / candidate_median,
+                "incumbent_best": incumbent_stats,
+                "speedup_vs_best": (
+                    incumbent_median / candidate_median
+                    if incumbent_median is not None
+                    else None
+                ),
+                "candidate_vs_best_latency_delta_us": (
+                    candidate_median - incumbent_median
+                    if incumbent_median is not None
+                    else None
+                ),
+                "candidate_vs_best_latency_change_fraction": (
+                    candidate_median / incumbent_median - 1.0
+                    if incumbent_median not in {None, 0.0}
+                    else None
+                ),
                 "stable": maximum_observed_cv <= maximum_cv,
                 "measurement_attempts": attempts,
                 "repeats_per_batch": repeats,
@@ -620,15 +746,176 @@ def _benchmark(
     summary = speedup_summary(per_case)
     stable = all(bool(item["stable"]) for item in per_case)
     observed_cvs = [
-        max(float(item["candidate"]["cv"]), float(item["baseline_eager"]["cv"]))
+        max(
+            float(item["candidate"]["cv"]),
+            float(item["baseline_eager"]["cv"]),
+        )
         for item in per_case
     ]
+    paired = [item for item in per_case if item.get("speedup_vs_best") is not None]
+    paired_summary = None
+    if paired:
+        speeds = [float(item["speedup_vs_best"]) for item in paired]
+        weights = [float(item.get("weight", 1.0)) for item in paired]
+        paired_cvs = [
+            max(
+                float(item["candidate"]["cv"]),
+                float(item["incumbent_best"]["cv"]),
+            )
+            for item in paired
+        ]
+        paired_summary = {
+            "measurement": "same_process_interleaved_incumbent_candidate",
+            "geomean_speedup_vs_best": weighted_geometric_mean(speeds, weights),
+            "minimum_speedup_vs_best": min(speeds),
+            "maximum_speedup_vs_best": max(speeds),
+            "maximum_cv": max(paired_cvs, default=0.0),
+            "per_case": [
+                {
+                    "case_id": item["case_id"],
+                    "weight": item["weight"],
+                    "candidate_median_us": item["candidate"]["median_us"],
+                    "best_median_us": item["incumbent_best"]["median_us"],
+                    "speedup_vs_best": item["speedup_vs_best"],
+                    "latency_delta_us": item[
+                        "candidate_vs_best_latency_delta_us"
+                    ],
+                    "latency_change_fraction": item[
+                        "candidate_vs_best_latency_change_fraction"
+                    ],
+                    "candidate_cv": item["candidate"]["cv"],
+                    "best_cv": item["incumbent_best"]["cv"],
+                }
+                for item in paired
+            ],
+        }
     return {
         "passed": True,
+        "measurement_config": {
+            "benchmark_mode": str(settings.get("benchmark_mode", "final")),
+            "warmup": warmup,
+            "measurement_batches": batches,
+            "target_batch_time_ms": target_ms,
+            "maximum_cv": maximum_cv,
+            "rerun_if_unstable": rerun,
+        },
         "measurement_stable": stable,
         "per_case": per_case,
         "maximum_cv": max(observed_cvs, default=0.0),
+        "paired_best_comparison": paired_summary,
         **summary,
+    }
+
+
+def _candidate_stage(
+    name: str,
+    function: Callable[[], Mapping[str, Any]],
+) -> dict[str, Any]:
+    started = _utc_iso()
+    began = time.perf_counter()
+    try:
+        details = dict(function())
+    except BaseException as exc:
+        return {
+            "stage": name.upper(),
+            "status": "fail",
+            "passed": False,
+            "started_at": started,
+            "finished_at": _utc_iso(),
+            "duration_seconds": time.perf_counter() - began,
+            "details": {},
+            "error": {
+                "type": type(exc).__name__,
+                "message": str(exc)[:16_384],
+                "traceback": traceback.format_exc(limit=20)[-32_768:],
+            },
+            "retryable": False,
+        }
+    passed = bool(details.get("passed"))
+    return {
+        "stage": name.upper(),
+        "status": "pass" if passed else "fail",
+        "passed": passed,
+        "started_at": started,
+        "finished_at": _utc_iso(),
+        "duration_seconds": time.perf_counter() - began,
+        "details": details,
+        "error": None,
+        "retryable": False,
+        **details,
+    }
+
+
+def _candidate_evaluation(
+    torch: Any,
+    triton: Any,
+    entry: Callable[..., Any],
+    task: TaskSpec,
+    correctness_cases: Sequence[CaseSpec],
+    benchmark_cases: Sequence[CaseSpec],
+    device: str,
+    settings: Mapping[str, Any],
+    incumbent_entry: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    compile_result = _candidate_stage(
+        "compile",
+        lambda: _compile(
+            torch,
+            triton,
+            entry,
+            task,
+            correctness_cases[:1],
+            device,
+        ),
+    )
+    if not bool(compile_result["passed"]):
+        return {
+            "passed": False,
+            "outcome": "compile_failed",
+            "compile": compile_result,
+            "correctness": None,
+            "benchmark": None,
+        }
+
+    correctness_result = _candidate_stage(
+        "correctness",
+        lambda: _correctness(
+            torch,
+            entry,
+            task,
+            correctness_cases,
+            device,
+        ),
+    )
+    if not bool(correctness_result["passed"]):
+        return {
+            "passed": False,
+            "outcome": "correctness_failed",
+            "compile": compile_result,
+            "correctness": correctness_result,
+            "benchmark": None,
+        }
+
+    benchmark_result = _candidate_stage(
+        "benchmark",
+        lambda: _benchmark(
+            torch,
+            entry,
+            task,
+            benchmark_cases,
+            device,
+            settings,
+            incumbent_entry,
+        ),
+    )
+    return {
+        "passed": bool(benchmark_result["passed"]),
+        "outcome": (
+            "correct" if bool(benchmark_result["passed"]) else "benchmark_failed"
+        ),
+        "compile": compile_result,
+        "correctness": correctness_result,
+        "benchmark": benchmark_result,
     }
 
 
@@ -783,13 +1070,22 @@ def _redact_details(stage: str, details: Mapping[str, Any]) -> dict[str, Any]:
 
 def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
     stage = str(payload.get("stage", ""))
-    if stage not in {"baseline", "compile", "correctness", "benchmark", "profile"}:
+    if stage not in {
+        "baseline",
+        "compile",
+        "correctness",
+        "benchmark",
+        "candidate_evaluation",
+        "profile",
+    }:
         raise ValueError(f"unsupported isolated stage: {stage!r}")
     task_raw = payload.get("task")
     if not isinstance(task_raw, Mapping):
         raise ValueError("stage payload task must be an object")
     task = _task(task_raw)
     cases = _cases(payload.get("cases"))
+    correctness_cases = tuple(case for case in cases if case.kind == "correctness")
+    benchmark_cases = tuple(case for case in cases if case.kind == "benchmark")
     device = str(payload.get("device", "npu:0"))
     if not device.startswith("npu:") or not device.removeprefix("npu:").isdigit():
         raise ValueError("stage device must use npu:<index> syntax")
@@ -803,12 +1099,30 @@ def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
         details = _baselines(torch, task, cases, device, settings_raw)
     else:
         _module, entry = _candidate(Path(str(payload.get("candidate", "candidate.py"))))
+    incumbent_entry = None
+    incumbent_path = Path("incumbent.py")
+    if stage == "candidate_evaluation" and incumbent_path.is_file():
+        _incumbent_module, incumbent_entry = _candidate(
+            incumbent_path, module_name="incumbent"
+        )
     if stage == "compile":
         details = _compile(torch, triton, entry, task, cases, device)
     elif stage == "correctness":
         details = _correctness(torch, entry, task, cases, device)
     elif stage == "benchmark":
         details = _benchmark(torch, entry, task, cases, device, settings_raw)
+    elif stage == "candidate_evaluation":
+        details = _candidate_evaluation(
+            torch,
+            triton,
+            entry,
+            task,
+            correctness_cases,
+            benchmark_cases,
+            device,
+            settings_raw,
+            incumbent_entry,
+        )
     elif stage == "profile":
         details = _profile(torch, entry, task, cases, device, settings_raw)
     if bool(settings_raw.get("redact_case_details", False)):

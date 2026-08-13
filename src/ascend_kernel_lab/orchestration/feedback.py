@@ -3,7 +3,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from ascend_kernel_lab.domain import CandidateScore, compare_public_candidate
+from ascend_kernel_lab.domain import (
+    CandidateScore,
+    PublicCandidateComparison,
+    compare_public_candidate,
+)
 
 
 def _status(result: Mapping[str, Any], key: str) -> str | None:
@@ -176,6 +180,9 @@ def _benchmark_delta(
     best: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     current = candidate if isinstance(candidate, Mapping) else {}
+    paired = current.get("paired_best_comparison")
+    if isinstance(paired, Mapping):
+        return dict(paired)
     incumbent = best if isinstance(best, Mapping) else {}
     current_cases = _benchmark_cases({"benchmark": current})
     best_cases = _benchmark_cases({"benchmark": incumbent})
@@ -262,6 +269,7 @@ def build_feedback(
     best: Mapping[str, Any] | None = None,
     consecutive_non_improvements: int = 0,
     candidate_intent: Mapping[str, Any] | None = None,
+    performance_comparison: PublicCandidateComparison | None = None,
 ) -> dict[str, Any]:
     """Normalize a full evaluation into the bounded evidence sent next round."""
     overall = _overall_status(result, best)
@@ -274,7 +282,11 @@ def build_feedback(
     comparison: dict[str, Any] | None = None
     candidate_score = _score_from_result(result)
     incumbent_score = _best_score(best)
-    decision = compare_public_candidate(candidate_score, incumbent_score) if candidate_score is not None else None
+    decision = performance_comparison or (
+        compare_public_candidate(candidate_score, incumbent_score)
+        if candidate_score is not None
+        else None
+    )
     focus: list[str] = []
     if benchmark is not None and best is not None:
         current_cases = _benchmark_cases(result)
@@ -293,16 +305,13 @@ def build_feedback(
                 improved.append(case_id)
             elif change <= -0.01:
                 regressed.append(case_id)
-        current_geomean = benchmark.get("geomean_speedup_vs_eager")
-        best_geomean = best_benchmark.get(
-            "geomean_speedup_vs_eager", best.get("geomean_speedup")
-        )
         comparison = {
             "best_round": best.get("round", best.get("round_number")),
             "current_round": round_number,
             "geomean_change_percent": (
-                (float(current_geomean) / float(best_geomean) - 1.0) * 100.0
-                if current_geomean is not None and best_geomean not in (None, 0)
+                decision.geomean_change_fraction * 100.0
+                if decision is not None
+                and decision.geomean_change_fraction is not None
                 else None
             ),
             "regressed_cases": regressed,

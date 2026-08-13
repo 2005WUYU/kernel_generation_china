@@ -112,8 +112,9 @@ class FakeBackend(Backend):
         cases: Sequence[CaseSpec],
         artifact_dir: Path,
         baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
     ) -> StageResult:
-        del baseline_snapshot
+        del baseline_snapshot, benchmark_settings
         per_case = [
             {
                 "case_id": case.id,
@@ -155,6 +156,80 @@ class FakeBackend(Backend):
                 "profile_available": True,
                 "kernel_count": 1,
                 "candidate_kernel_coverage": 1.0,
+            },
+        )
+
+    def candidate_evaluation(
+        self,
+        candidate_path: Path,
+        task: TaskSpec,
+        correctness_cases: Sequence[CaseSpec],
+        benchmark_cases: Sequence[CaseSpec],
+        artifact_dir: Path,
+        baseline_snapshot: Mapping[str, Any] | None = None,
+        benchmark_settings: Mapping[str, Any] | None = None,
+        incumbent_path: Path | None = None,
+    ) -> StageResult:
+        self.calls.append(
+            {
+                "stage": EvaluationStage.FULL_EVALUATION.value,
+                "candidate_path": str(candidate_path),
+                "task_id": task.id,
+                "case_ids": [
+                    *(case.id for case in correctness_cases),
+                    *(case.id for case in benchmark_cases),
+                ],
+                "artifact_dir": str(artifact_dir),
+                "incumbent_path": (
+                    str(incumbent_path) if incumbent_path is not None else None
+                ),
+            }
+        )
+        combined_queue = self._scripted[EvaluationStage.FULL_EVALUATION.value]
+        if combined_queue:
+            return combined_queue.popleft()
+        compile_result = self.compile(
+            candidate_path, task, correctness_cases[:1], artifact_dir
+        )
+        if not compile_result.passed:
+            return StageResult.failure(
+                EvaluationStage.FULL_EVALUATION,
+                details={
+                    "outcome": "compile_failed",
+                    "compile": compile_result.to_dict(),
+                    "correctness": None,
+                    "benchmark": None,
+                },
+            )
+        correctness = self.check_correctness(
+            candidate_path, task, correctness_cases, artifact_dir
+        )
+        if not correctness.passed:
+            return StageResult.failure(
+                EvaluationStage.FULL_EVALUATION,
+                details={
+                    "outcome": "correctness_failed",
+                    "compile": compile_result.to_dict(),
+                    "correctness": correctness.to_dict(),
+                    "benchmark": None,
+                },
+            )
+        benchmark = self.benchmark(
+            candidate_path,
+            task,
+            benchmark_cases,
+            artifact_dir,
+            baseline_snapshot,
+            benchmark_settings,
+        )
+        return StageResult(
+            stage=EvaluationStage.FULL_EVALUATION,
+            status=benchmark.status,
+            details={
+                "outcome": "correct" if benchmark.passed else "benchmark_failed",
+                "compile": compile_result.to_dict(),
+                "correctness": correctness.to_dict(),
+                "benchmark": benchmark.to_dict(),
             },
         )
 
