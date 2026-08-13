@@ -333,6 +333,8 @@ start_worker_container() {
         --env "AKG_PROJECT_ROOT=$CONTAINER_PROJECT_ROOT" \
         --env "AKG_CONFIG_PATH=$CONTAINER_CONFIG_PATH" \
         --env "AKG_DEVICE_LOCK_ROOT=/var/lock/ascend-kernel-lab/device-$physical_device" \
+        --env USER=akg-worker \
+        --env LOGNAME=akg-worker \
         --env HOME=/tmp/akg-home \
         --env GIT_CONFIG_COUNT=1 \
         --env GIT_CONFIG_KEY_0=safe.directory \
@@ -402,6 +404,8 @@ case "$ACTION" in
             --env "LD_LIBRARY_PATH=$WORKER_LD_LIBRARY_PATH" \
             --env "ASCEND_VISIBLE_DEVICES=$DEVICE_ID" \
             --env DEVICE_ID=0 \
+            --env USER=akg-worker \
+            --env LOGNAME=akg-worker \
             --env HOME=/tmp/akg-home \
             --env TRITON_CACHE_DIR=/tmp/akg-triton-cache \
             --env TRITON_DUMP_DIR=/tmp/akg-triton-dump \
@@ -491,6 +495,8 @@ case "$ACTION" in
             --env-file "$HIDDEN_ENV_FILE" \
             --env "AKG_PROJECT_ROOT=$CONTAINER_PROJECT_ROOT" \
             --env "AKG_CONFIG_PATH=$CONTAINER_CONFIG_PATH" \
+            --env USER=akg-controller \
+            --env LOGNAME=akg-controller \
             --env HOME=/tmp/akg-home \
             --env GIT_CONFIG_COUNT=1 \
             --env GIT_CONFIG_KEY_0=safe.directory \
