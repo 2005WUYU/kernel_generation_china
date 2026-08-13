@@ -31,8 +31,16 @@ def _benchmark_cases(result: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
 
 
 def _overall_status(result: Mapping[str, Any], best: Mapping[str, Any] | None) -> str:
-    if result.get("overall_status") == "model_failed":
-        return "model_failed"
+    reported = result.get("overall_status")
+    if reported in {
+        "model_failed",
+        "source_failed",
+        "compile_failed",
+        "correctness_failed",
+        "benchmark_failed",
+        "anti_bypass_failed",
+    }:
+        return str(reported)
     source = result.get("source")
     if isinstance(source, Mapping) and not bool(source.get("passed")):
         return "source_failed"
@@ -119,7 +127,7 @@ def build_feedback(
     elif overall == "anti_bypass_failed":
         focus.append("移除高层算子回退, 确保目标计算由候选 Triton kernel 完成")
     elif overall == "benchmark_failed":
-        focus.append("保持正确性并降低资源使用或运行时间, 避免 benchmark 超时")
+        focus.append("保持正确性, 针对本轮 benchmark 的不稳定用例降低测量 CV, 再依据稳定结果优化延迟")
     elif overall == "profile_unavailable":
         focus.append("保持正确性和现有性能; profiler 当前不可用, 不要猜测硬件指标")
     else:

@@ -170,7 +170,7 @@ def _profile_summary(profile: Mapping[str, Any] | None) -> Mapping[str, Any]:
 
 
 def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -> EvaluationResult:
-    """Run the five-stage evaluation with mandatory short-circuit semantics."""
+    """Run evaluation, short-circuiting only before public correctness passes."""
     request.artifact_dir.mkdir(parents=True, exist_ok=True)
     source_stage = backend.source_check(request.candidate_path, request.task)
     source = _stage_dict(source_stage)
@@ -207,32 +207,7 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
         request.baseline_snapshot,
     )
     benchmark = _stage_dict(benchmark_stage)
-    if not benchmark_stage.passed:
-        score = CandidateScore(
-            candidate_id=request.candidate_id,
-            round_number=request.round_number,
-            compile_passed=True,
-            correctness_passed=True,
-            anti_bypass_passed=False,
-            hidden_correctness_passed=True if request.hidden else None,
-        )
-        reward = compute_reward(score)
-        return EvaluationResult(
-            schema_version="ascend_evaluation_result_v1",
-            experiment_id=request.experiment_id,
-            task_id=request.task.id,
-            round_number=request.round_number,
-            candidate_id=request.candidate_id,
-            overall_status="benchmark_failed",
-            source=source,
-            compile=compile_result,
-            correctness=correctness,
-            benchmark=benchmark,
-            profile=None,
-            anti_bypass={"passed": False, "status": "not_evaluated", "reason": "benchmark_failed"},
-            reward_vector=asdict(reward),
-            score=score,
-        )
+    benchmark_passed = benchmark_stage.passed
 
     profile: dict[str, Any] | None = None
     if request.run_profile:
@@ -260,8 +235,16 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
             "kernel_count": kernel_count,
         }
 
-    geomean = _number(benchmark, "geomean_speedup_vs_eager", "speedup_geomean")
-    minimum = _number(benchmark, "minimum_speedup_vs_eager", "minimum_speedup")
+    geomean = (
+        _number(benchmark, "geomean_speedup_vs_eager", "speedup_geomean")
+        if benchmark_passed
+        else None
+    )
+    minimum = (
+        _number(benchmark, "minimum_speedup_vs_eager", "minimum_speedup")
+        if benchmark_passed
+        else None
+    )
     stability = _number(benchmark, "maximum_cv", "stability_cv")
     score = CandidateScore(
         candidate_id=request.candidate_id,
@@ -276,8 +259,18 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
         stability_cv=stability,
     )
     reward = compute_reward(score)
-    overall = "correct" if score.is_publicly_valid else "anti_bypass_failed"
-    if profile is not None and not _passed(profile) and not request.profile_coverage_required:
+    if not benchmark_passed:
+        overall = "benchmark_failed"
+    elif score.is_publicly_valid:
+        overall = "correct"
+    else:
+        overall = "anti_bypass_failed"
+    if (
+        benchmark_passed
+        and profile is not None
+        and not _passed(profile)
+        and not request.profile_coverage_required
+    ):
         overall = "profile_unavailable"
     return EvaluationResult(
         schema_version="ascend_evaluation_result_v1",
