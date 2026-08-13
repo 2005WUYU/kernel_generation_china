@@ -1,7 +1,7 @@
-# 910C 双容器部署
+# 910C Controller + 八 Worker 容器部署
 
 这条路径用于当前 `openEuler 22.03 / aarch64 / Docker 20.10.8` 主机。它不依赖
-Compose：Controller 负责 Claude CLI + AIPing，Worker 负责 910C 执行；两者只共享远端
+Compose：Controller 负责 Claude CLI + AIPing，八个 Worker 分别负责一张 910C；两类容器只共享远端
 干净 clone 的 `runs/`。Worker 没有网络和模型凭据，Controller 不映射 NPU。
 
 > 目前只完成本地代码和 CPU 门禁，尚未声称 910C 验证。候选 Worker 平台镜像
@@ -105,7 +105,7 @@ sudoedit /etc/ascend-kernel-lab/worker-container.env
 ```
 
 Controller 文件填写 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、
-`ANTHROPIC_MODEL=Kimi-K3`；hidden 文件只放 `AKG_HIDDEN_SEED`。Worker 文件不得出现
+`ANTHROPIC_MODEL=deepseek-v4-pro`；hidden 文件只放 `AKG_HIDDEN_SEED`。Worker 文件不得出现
 任何 `ANTHROPIC_`、`KIMI_`、`OPENAI_` 或 `AIPING_` 变量，也不要 source 宿主 CANN。
 环境文件必须是普通文件且权限为 `0600` 或 `0400`。
 
@@ -144,7 +144,8 @@ stat -c '%a %u %g %n' /dev/davinci0 /dev/davinci_manager /dev/devmm_svm
 
 ```bash
 export AKG_PROJECT_ROOT=/opt/ascend-kernel-lab
-export AKG_DEVICE_ID=0
+export AKG_CONFIG_PATH=configs/experiment_910c_deepseek_v4_pro.yaml
+export AKG_DEVICE_IDS=0,1,2,3,4,5,6,7
 export AKG_CONTROLLER_UID=<controller数字UID>
 export AKG_WORKER_UID=<worker数字UID>
 export AKG_SHARED_GID=<runs共享数字GID>
@@ -154,10 +155,16 @@ export AKG_DEVICE_LOCK_ROOT=/var/lock/ascend-kernel-lab
 ./scripts/run-containers-910c.sh init
 ./scripts/run-containers-910c.sh probe
 ./scripts/run-containers-910c.sh baseline
-./scripts/run-containers-910c.sh start-worker
+./scripts/run-containers-910c.sh start-workers
 ./scripts/run-containers-910c.sh status
-docker logs --tail 100 ascend-kernel-worker
+for DEVICE_ID in 0 1 2 3 4 5 6 7; do
+  docker logs --tail 100 "ascend-kernel-worker-$DEVICE_ID"
+done
 ```
+
+`start-workers` 为八张物理卡各启动一个 Worker；每个容器内部仍使用 `npu:0`。Controller
+把十个任务并发提交到 SQLite durable queue，NPU 阶段由八个 Worker 自然限流到最多八路并行，
+同一任务的五轮保持顺序。
 
 Worker 启动会强制验证：没有模型变量、隐藏 seed 合法、只暴露一张 NPU、
 `torch.npu.is_available()` 为真、clean Git clone。它使用 `--runtime=ascend`、
@@ -165,7 +172,9 @@ Worker 启动会强制验证：没有模型变量、隐藏 seed 合法、只暴�
 上限，且不挂 Docker socket。
 
 `probe` 会执行真实 Triton JIT、NPU feature smoke、计时和 profiler 能力探测；
-`baseline` 会对配置中的全部任务生成环境绑定的 B0/B1/B2 基线。任何一步非零退出都停止。
+`baseline` 会对配置中的全部任务生成环境绑定的 PyTorch eager NPU 基线；不再测
+`torch.compile` 或官方/手写实现。实验轨迹用于冷启动 SFT，不设置硬加速目标，benchmark
+只报告候选相对 PyTorch eager 的耗时与 speedup。任何一步非零退出都停止。
 `probe` 使用可执行的临时 Triton cache、验证子进程恰好只能看到一张 NPU，并要求所有必需
 feature、计时方法和 profiler 指标通过；固定输出目录必须为空，避免旧 profiler 数据混入。
 维护期间若项目 Worker 正在运行会直接拒绝。
@@ -177,14 +186,20 @@ if [ -d runs/probe ]; then
 fi
 ```
 
-检查 `runs/probe/` 和 baseline 证据后，再按验收指南完成板端验收。只有这些门禁通过、
-Worker 状态变成 `healthy` 后才运行：
+profile 使用 quick 模式，只做一次 warmup、一次采集，保留 task time、pipe utilization、
+kernel 数和候选 kernel coverage 等短时间可取信息，不运行 full profile。
+
+检查 `runs/probe/` 和 baseline 证据后，再按验收指南完成板端验收。八个 Worker 状态都变成
+`healthy` 后运行：
 
 ```bash
 ./scripts/run-containers-910c.sh start-controller
-./scripts/run-containers-910c.sh status
-docker logs --tail 100 ascend-kernel-controller
+./scripts/watch-experiment-910c.sh "$AKG_EXPERIMENT_ID"
 ```
+
+观察脚本在前台每五秒采样，只在状态变化时打印十个任务的五轮进度、八个 Worker 健康数和
+当前模型请求数；SSH 断开只会终止观察脚本，重新登录后执行同一条命令即可继续观察，容器内
+实验不受影响。
 
 Controller 有 AIPing 网络但不挂 NPU；即使宿主 Docker 把 Ascend 设为默认 runtime，启动
 脚本也会为 Controller 和数据库初始化显式选择 `runc`。生产上再用主机防火墙或 egress

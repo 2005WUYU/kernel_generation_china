@@ -13,7 +13,7 @@ from ascend_kernel_lab.tasks import CaseSpec, TaskRegistry, TaskSpec
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-class _CompileFailingBaselineBackend:
+class _EagerOnlyBaselineBackend:
     def measure_baselines(
         self,
         task: TaskSpec,
@@ -27,27 +27,20 @@ class _CompileFailingBaselineBackend:
                     "case_id": case.id,
                     "weight": case.weight,
                     "pytorch_eager_us": 12.0,
-                    "torch_compile_us": None,
-                    "torch_compile_error": "BackendCompilerFailed: test",
-                    "official_us": None,
                 }
                 for case in cases
             ],
-            "torch_compile_available": False,
-            "official_available": False,
-            "official_status": "not_defined",
-            "unavailable_reasons": {
-                "torch_compile": ["BackendCompilerFailed: test"],
-                "official": "task has no trusted official baseline",
-            },
+            "status": "complete",
+            "mode": "pytorch_eager_only",
+            "comparison_baseline": "pytorch_eager",
         }
 
 
 class BaselineManagerTests(unittest.TestCase):
-    def test_compile_failures_make_snapshot_partial_and_layer_failed(self) -> None:
+    def test_snapshot_records_eager_only_comparison_policy(self) -> None:
         task = TaskRegistry(PROJECT_ROOT / "task_specs").load("k01_vector_add")
         manager = BaselineManager(
-            backend=_CompileFailingBaselineBackend(),
+            backend=_EagerOnlyBaselineBackend(),
             environment_sha256="environment",
             harness_git_commit="commit",
             benchmark_config={},
@@ -56,16 +49,15 @@ class BaselineManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             snapshot = manager.measure(task, Path(temporary))
 
-        self.assertEqual(snapshot["status"], "partial")
-        self.assertEqual(snapshot["torch_compile_status"], "failed")
-        self.assertEqual(snapshot["torch_compile_successful_case_count"], 0)
+        self.assertEqual(snapshot["status"], "complete")
+        self.assertEqual(snapshot["mode"], "pytorch_eager_only")
+        self.assertEqual(snapshot["comparison_baseline"], "pytorch_eager")
+        self.assertEqual(snapshot["compared_baselines"], ["pytorch_eager"])
         self.assertEqual(
-            snapshot["torch_compile_total_case_count"],
-            len(task.benchmark_cases),
+            snapshot["not_measured_baselines"], ["torch_compile", "official"]
         )
-        self.assertEqual(snapshot["official_status"], "not_defined")
 
-    def test_missing_official_layer_does_not_make_snapshot_partial(self) -> None:
+    def test_fake_backend_uses_same_eager_only_policy(self) -> None:
         task = TaskRegistry(PROJECT_ROOT / "task_specs").load("k01_vector_add")
         manager = BaselineManager(
             backend=FakeBackend(),
@@ -78,8 +70,7 @@ class BaselineManagerTests(unittest.TestCase):
             snapshot = manager.measure(task, Path(temporary))
 
         self.assertEqual(snapshot["status"], "complete")
-        self.assertEqual(snapshot["torch_compile_status"], "complete")
-        self.assertEqual(snapshot["official_status"], "unavailable")
+        self.assertEqual(snapshot["compared_baselines"], ["pytorch_eager"])
 
 
 if __name__ == "__main__":

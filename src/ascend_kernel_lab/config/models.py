@@ -199,6 +199,7 @@ class TimeoutConfig:
 
 @dataclass(frozen=True, slots=True)
 class BenchmarkConfig:
+    comparison_baseline: str = "pytorch_eager"
     warmup: int = 20
     measurement_batches: int = 7
     target_batch_time_ms: float = 200.0
@@ -206,6 +207,8 @@ class BenchmarkConfig:
     rerun_if_unstable: bool = True
 
     def __post_init__(self) -> None:
+        if self.comparison_baseline != "pytorch_eager":
+            raise ValueError("comparison_baseline must be pytorch_eager")
         _positive("warmup", self.warmup)
         _positive("measurement_batches", self.measurement_batches)
         _positive("target_batch_time_ms", self.target_batch_time_ms)
@@ -215,12 +218,20 @@ class BenchmarkConfig:
 
 @dataclass(frozen=True, slots=True)
 class ProfileConfig:
+    mode: str = "quick"
     run_after_correctness: bool = True
+    run_for_final_best: bool = True
+    warmup: int = 1
+    iterations: int = 1
     mandatory_groups: tuple[str, ...] = ("task_time", "pipe_utilization")
     optional_groups: tuple[str, ...] = ("memory", "l2_cache", "resource_conflict")
-    full_profile_for_final_best: bool = True
+    full_profile_for_final_best: bool = False
 
     def __post_init__(self) -> None:
+        if self.mode not in {"quick", "full"}:
+            raise ValueError("profile mode must be quick or full")
+        _positive("profile warmup", self.warmup)
+        _positive("profile iterations", self.iterations)
         for group in self.mandatory_groups + self.optional_groups:
             _nonempty("profile group", group)
         if len(set(self.mandatory_groups + self.optional_groups)) != len(
@@ -273,12 +284,14 @@ class ExperimentConfig:
     profile: ProfileConfig
     storage: StorageConfig
     security: SecurityConfig = field(default_factory=SecurityConfig)
+    task_concurrency: int = 1
     config_path: Path = field(default=Path("<memory>"), repr=False, compare=False)
     project_root: Path = field(default_factory=Path.cwd, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _nonempty("experiment.id", self.id)
         _positive("rounds_per_task", self.rounds_per_task)
+        _positive("task_concurrency", self.task_concurrency)
         if not self.tasks:
             raise ValueError("experiment.tasks must not be empty")
         if len(set(self.tasks)) != len(self.tasks):

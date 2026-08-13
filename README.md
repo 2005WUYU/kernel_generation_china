@@ -1,6 +1,9 @@
 # Ascend Kernel Lab
 
-Ascend Kernel Lab 是面向华为 Ascend 910C 与 Triton-Ascend 的完整 Kernel 生成、评测和五轮优化流水线。Kimi K3 只返回完整候选源码；Prompt、状态推进、编译、正确性、计时、`msprof`、历史最佳选择、隐藏评测和训练数据导出全部由本地程序控制。
+Ascend Kernel Lab 是面向华为 Ascend 910C 与 Triton-Ascend 的完整 Kernel 生成、评测和
+五轮优化流水线。模型只返回完整候选源码；Prompt、状态推进、编译、正确性、计时、
+`msprof`、历史最佳选择、隐藏评测和训练数据导出全部由本地程序控制。冷启动 SFT 采集配置
+使用 DeepSeek V4 Pro；轨迹不设硬加速目标，性能只与 PyTorch eager NPU 比较。
 
 项目适合下面的交付方式：
 
@@ -13,8 +16,8 @@ Ascend Kernel Lab 是面向华为 Ascend 910C 与 Triton-Ascend 的完整 Kernel
 910C 主机干净 git clone
         │
         ├── 复用板端已有 torch / torch_npu / Triton-Ascend / CANN
-        ├── AIPing + Claude CLI 调用 Kimi K3
-        └── 独占 NPU 完成真实编译、校验、计时与 profiling
+        ├── AIPing + Claude CLI 调用 DeepSeek V4 Pro
+        └── 八张 NPU 并行完成真实编译、校验、计时与 quick profiling
 ```
 
 > 本机没有 910C 时，CPU 测试只能证明控制面、状态机、存储、解析器和假后端流程正确，不能替代板端验收，也不会伪造 NPU 性能数据。
@@ -23,8 +26,8 @@ Ascend Kernel Lab 是面向华为 Ascend 910C 与 Triton-Ascend 的完整 Kernel
 
 ## 设计边界
 
-- 控制端持有模型凭据，构建 Prompt、调用 Kimi、推进每个任务五轮并选择历史最佳。
-- Worker 不加载模型凭据。它独占一张 NPU，并在全新、受限的子进程中执行每个评测阶段。
+- 控制端持有模型凭据，构建 Prompt、调用模型、推进每个任务五轮并选择历史最佳。十个任务可同时请求模型；同一任务的五轮保持顺序，后续轮只携带候选代码、关键指标、失败原因和下一轮建议。
+- Worker 不加载模型凭据。八个 Worker 各独占一张 NPU，并在全新、受限的子进程中执行每个评测阶段；NPU 阶段并行上限为八。
 - 候选必须通过 AST 策略、真实 JIT 编译和公开正确性，才会进入 benchmark；profiler 使用独立进程，避免污染计时。
 - 五轮只能看到公开用例。隐藏用例从部署端私有 seed 生成，只在最终候选上运行，失败后不使用隐藏集挑选其他轮次。
 - SQLite 保存权威状态和事件；artifact 使用临时文件、`fsync` 与原子 rename 提交。进程中断后从最后一个已提交状态恢复。
@@ -130,7 +133,7 @@ venv 默认放在 checkout 外的 `/opt/ascend-kernel-lab-venv`，避免把未�
 ```bash
 . /opt/ascend-kernel-lab-venv/bin/activate
 akg --help
-akg doctor -c configs/experiment_910c_kimi_k3.yaml --allow-not-ready
+akg doctor -c configs/experiment_910c_deepseek_v4_pro.yaml --allow-not-ready
 ```
 
 此时尚未加载 controller 的 AIPing 凭据和隐藏 seed，预检查会把相关项保留为失败证据；完成 controller 环境配置后必须再运行一次不带 `--allow-not-ready` 的 `doctor`。
@@ -140,9 +143,14 @@ akg doctor -c configs/experiment_910c_kimi_k3.yaml --allow-not-ready
 [910C 双容器部署指南](docs/container-deployment-910c.md)。该方案不依赖 Docker Compose，
 不会在 Worker 镜像中安装或替换板端加速栈。
 
-## AIPing + Claude CLI + Kimi K3
+## AIPing + Claude CLI + DeepSeek V4 Pro
 
-默认配置 `configs/experiment_910c_kimi_k3.yaml` 使用 `model.provider: claude_cli`。Claude CLI 只是一次性、无工具的结构化生成通道；它不控制终端、不读取仓库、不执行候选。适配器强制：
+冷启动 SFT 生产配置是 `configs/experiment_910c_deepseek_v4_pro.yaml`，模型 ID 精确为
+`deepseek-v4-pro`。配置仍走 AIPing 提供的 Anthropic-compatible 地址和现有 Claude CLI
+通道；不要把 endpoint 或 token 写进 YAML。
+
+DeepSeek 与旧的 Kimi 配置都使用 `model.provider: claude_cli`。Claude CLI 只是一次性、无工具的
+结构化生成通道；它不控制终端、不读取仓库、不执行候选。适配器强制：
 
 - `--print` 单次输出；
 - `--output-format json` 与 JSON Schema；
@@ -156,7 +164,7 @@ akg doctor -c configs/experiment_910c_kimi_k3.yaml --allow-not-ready
 ```dotenv
 ANTHROPIC_BASE_URL=https://your-aiping-anthropic-compatible-endpoint.example
 ANTHROPIC_AUTH_TOKEN=replace-with-a-real-token
-ANTHROPIC_MODEL=Kimi-K3
+ANTHROPIC_MODEL=deepseek-v4-pro
 ```
 
 另建仅含隐藏 seed 的共享可信环境文件：
@@ -173,7 +181,7 @@ AKG_HIDDEN_SEED=REPLACE_WITH_HIGH_ENTROPY_BASE10_INTEGER
 
 ```bash
 claude --version
-akg doctor -c configs/experiment_910c_kimi_k3.yaml
+akg doctor -c configs/experiment_910c_deepseek_v4_pro.yaml
 ```
 
 若 AIPing 暴露的是 OpenAI-compatible 接口，可把配置中的 provider 改为 `openai_compatible`，并仅通过配置所引用的环境变量提供 key。两种 provider 都不能把 key 写进 YAML、Prompt、日志或 artifact。
@@ -185,8 +193,8 @@ akg doctor -c configs/experiment_910c_kimi_k3.yaml
 ### 1. 配置和数据库检查
 
 ```bash
-akg doctor -c configs/experiment_910c_kimi_k3.yaml
-akg db upgrade -c configs/experiment_910c_kimi_k3.yaml
+akg doctor -c configs/experiment_910c_deepseek_v4_pro.yaml
+akg db upgrade -c configs/experiment_910c_deepseek_v4_pro.yaml
 ```
 
 `doctor` 检查配置、目录、依赖、Claude CLI/AIPing 引用和 Ascend 工具；`db upgrade` 幂等创建或升级 SQLite schema。数据库必须位于本机文件系统，不要放在 NFS 上。
@@ -195,7 +203,7 @@ akg db upgrade -c configs/experiment_910c_kimi_k3.yaml
 
 ```bash
 akg probe all \
-  -c configs/experiment_910c_kimi_k3.yaml \
+  -c configs/experiment_910c_deepseek_v4_pro.yaml \
   -o runs/probe
 ```
 
@@ -209,32 +217,46 @@ runs/probe/profiler_capabilities.json
 
 实际 SoC 名、CANN 版本和 profiler 字段由机器探测，不在代码中假定。不可用指标必须是 `null` 或带明确 unavailable reason。
 
-### 3. 三层 baseline
+### 3. PyTorch eager baseline
 
 先用 K01 验证计时，再测全部任务：
 
 ```bash
-akg baseline run -c configs/experiment_910c_kimi_k3.yaml --task k01_vector_add
-akg baseline run -c configs/experiment_910c_kimi_k3.yaml
+akg baseline run -c configs/experiment_910c_deepseek_v4_pro.yaml --task k01_vector_add
+akg baseline run -c configs/experiment_910c_deepseek_v4_pro.yaml
 ```
 
-B0 PyTorch eager NPU 是必需基线；B1 `torch.compile` 和 B2 官方/手写实现仅在环境探测确认可用时启用。环境、任务规范、benchmark 配置或 harness commit 变化后，旧 baseline 会因 identity hash 不匹配而失效。
+本轮冷启动 SFT 只测 PyTorch eager NPU 基线，不运行 `torch.compile` 或官方/手写实现对照，
+也不要求候选达到指定加速比。benchmark 只报告候选相对 PyTorch eager 的耗时与 speedup。
+环境、任务规范、benchmark 配置或 harness commit 变化后，旧 baseline 会因 identity hash
+不匹配而失效。
 
-### 4. 启动 Worker
+### 4. 启动八个 Worker
+
+容器部署在八卡主机上使用 `AKG_DEVICE_IDS=0,1,2,3,4,5,6,7` 与 `start-workers`；每个
+Worker 只看到一张物理卡，SQLite durable queue 把十个并发任务自然限流到最多八个 NPU
+阶段同时运行：
+
+```bash
+export AKG_CONFIG_PATH=configs/experiment_910c_deepseek_v4_pro.yaml
+export AKG_DEVICE_IDS=0,1,2,3,4,5,6,7
+./scripts/run-containers-910c.sh start-workers
+./scripts/run-containers-910c.sh status
+```
 
 单卡长期运行：
 
 ```bash
 AKG_CANN_ENV_FILE=/usr/local/Ascend/ascend-toolkit/set_env.sh \
 AKG_VENV_DIR=/opt/ascend-kernel-lab-venv \
-AKG_CONFIG_PATH=/opt/ascend-kernel-lab/configs/experiment_910c_kimi_k3.yaml \
+AKG_CONFIG_PATH=/opt/ascend-kernel-lab/configs/experiment_910c_deepseek_v4_pro.yaml \
 ./scripts/run-worker.sh
 ```
 
 只领取一个 job 后退出，用于调试：
 
 ```bash
-akg worker run -c configs/experiment_910c_kimi_k3.yaml --once
+akg worker run -c configs/experiment_910c_deepseek_v4_pro.yaml --once
 ```
 
 Worker 入口脚本会在启动前拒绝常见模型密钥变量。每个阶段还有独立子进程、清理后的环境、超时、输出上限、进程组终止、私有临时目录、设备独占锁和健康检查。
@@ -244,24 +266,26 @@ Worker 入口脚本会在启动前拒绝常见模型密钥变量。每个阶段�
 控制端 shell 必须有 AIPing 凭据和 `AKG_HIDDEN_SEED`：
 
 ```bash
-akg experiment run -c configs/experiment_910c_kimi_k3.yaml
+akg experiment run -c configs/experiment_910c_deepseek_v4_pro.yaml
 ```
 
-生产默认使用持久 SQLite 队列：controller 只提交阶段 job 并等待，独立 Worker 领取、执行和提交结果。必须先启动上一节的 Worker；不要给生产 controller 加 `--direct` 或 `--with-local-worker`。
+生产默认使用持久 SQLite 队列：controller 以 `task_concurrency: 10` 同时推进十个任务，
+八个独立 Worker 领取、执行和提交 NPU 阶段，五轮在各自任务内部顺序迭代。必须先启动上一节的
+八个 Worker；不要给生产 controller 加 `--direct` 或 `--with-local-worker`。
 
 只跑指定任务：
 
 ```bash
 akg experiment run \
-  -c configs/experiment_910c_kimi_k3.yaml \
+  -c configs/experiment_910c_deepseek_v4_pro.yaml \
   --task k01_vector_add
 ```
 
 查看状态和恢复：
 
 ```bash
-akg experiment status -c configs/experiment_910c_kimi_k3.yaml
-akg experiment resume -c configs/experiment_910c_kimi_k3.yaml
+akg experiment status -c configs/experiment_910c_deepseek_v4_pro.yaml
+akg experiment resume -c configs/experiment_910c_deepseek_v4_pro.yaml
 ```
 
 若要在受控板端调试中临时使用单命令，可加 `--with-local-worker`：它仍经过 durable queue，但 Worker 线程和 controller 位于同一进程，进程级凭据边界不成立。`--direct` 会绕过队列拓扑，仅用于后端调试和定位问题，不用于生产、恢复验收或安全声称。
@@ -270,7 +294,7 @@ akg experiment resume -c configs/experiment_910c_kimi_k3.yaml
 
 ```bash
 akg experiment status \
-  -c configs/experiment_910c_kimi_k3.yaml \
+  -c configs/experiment_910c_deepseek_v4_pro.yaml \
   --experiment-id <same-safe-id>
 ```
 
@@ -280,7 +304,7 @@ akg experiment status \
 
 ```bash
 akg evaluate \
-  -c configs/experiment_910c_kimi_k3.yaml \
+  -c configs/experiment_910c_deepseek_v4_pro.yaml \
   --task k05_row_softmax \
   --candidate /absolute/path/to/candidate.py
 ```
@@ -290,22 +314,25 @@ akg evaluate \
 ### 7. 验证并导出
 
 ```bash
-akg verify-run --experiment-root runs/exp_910c_kimi_k3_v1
+akg verify-run --experiment-root runs/exp_910c_deepseek_v4_pro_cold_sft_v1
 
 akg export sft \
-  --experiment-root runs/exp_910c_kimi_k3_v1 \
-  -o runs/exports/exp_910c_kimi_k3_v1.sft.jsonl
+  --all-samples \
+  --experiment-root runs/exp_910c_deepseek_v4_pro_cold_sft_v1 \
+  -o runs/exports/exp_910c_deepseek_v4_pro_cold_sft_v1.sft.jsonl
 
 akg export rl \
-  --experiment-root runs/exp_910c_kimi_k3_v1 \
-  -o runs/exports/exp_910c_kimi_k3_v1.rl.jsonl
+  --experiment-root runs/exp_910c_deepseek_v4_pro_cold_sft_v1 \
+  -o runs/exports/exp_910c_deepseek_v4_pro_cold_sft_v1.rl.jsonl
 
 akg export report \
-  --experiment-root runs/exp_910c_kimi_k3_v1 \
-  -o runs/exports/exp_910c_kimi_k3_v1.report.json
+  --experiment-root runs/exp_910c_deepseek_v4_pro_cold_sft_v1 \
+  -o runs/exports/exp_910c_deepseek_v4_pro_cold_sft_v1.report.json
 ```
 
-导出器只读取已提交 artifact，并拒绝疑似凭据、hidden seed 或隐藏 case 细节。SFT 主数据集筛选修复成功、性能提升、隐藏正确、未绕过且稳定的轨迹；RL 轨迹明确记录最终采用的轮次。
+导出器只读取已提交 artifact，并拒绝疑似凭据、hidden seed 或隐藏 case 细节。冷启动 SFT
+使用 `akg export sft --all-samples` 导出五轮轨迹，不以达到某个 speedup 作为采集前提；
+RL 轨迹明确记录最终采用的轮次。
 
 ## Artifact 结构
 
@@ -314,7 +341,7 @@ akg export report \
 ```text
 runs/
 ├── metadata.db
-└── exp_910c_kimi_k3_v1/
+└── exp_910c_deepseek_v4_pro_cold_sft_v1/
     ├── experiment.json
     ├── environment_snapshot.json
     ├── baseline_snapshot.json
@@ -398,7 +425,7 @@ set +a
 
 ```bash
 akg acceptance \
-  -c configs/experiment_910c_kimi_k3.yaml \
+  -c configs/experiment_910c_deepseek_v4_pro.yaml \
   --evidence-root runs/acceptance_evidence \
   -o runs/acceptance_report.json
 ```

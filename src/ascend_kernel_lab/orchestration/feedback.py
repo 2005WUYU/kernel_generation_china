@@ -136,7 +136,10 @@ def build_feedback(
             and benchmark.get("minimum_speedup_vs_eager") is not None
             and float(benchmark["minimum_speedup_vs_eager"]) < 1.0
         ):
-            focus.append("优先改善最慢 shape, 使最低加速比达到 1.0 以上")
+            focus.append(
+                "参考 PyTorch eager 对比优先改善最慢 shape; "
+                "本次冷启动 SFT 轨迹不设硬性加速比门槛"
+            )
         if profile is not None:
             observations = profile.get("observations")
             if isinstance(observations, Sequence):

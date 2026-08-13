@@ -62,14 +62,14 @@ class RecordingRunner:
                         "case_id": case["id"],
                         "weight": case.get("weight", 1.0),
                         "pytorch_eager_us": 12.0,
-                        "torch_compile_us": None,
-                        "official_us": None,
                     }
                     for case in request["cases"]
                 ],
-                "torch_compile_available": False,
-                "official_available": False,
-                "unavailable_reasons": {"torch_compile": "test", "official": "test"},
+                "status": "complete",
+                "mode": "pytorch_eager_only",
+                "comparison_baseline": "pytorch_eager",
+                "compared_baselines": ["pytorch_eager"],
+                "not_measured_baselines": ["torch_compile", "official"],
             }
         else:
             details = {"passed": self.passed, "compiled": self.passed}
@@ -350,7 +350,7 @@ def custom_op(x, y):
             {entry["relative_path"] for entry in manifest["files"]},
         )
 
-    def test_baseline_protocol_requires_b0_and_reports_optional_layers(self) -> None:
+    def test_baseline_protocol_measures_only_pytorch_eager(self) -> None:
         runner = RecordingRunner()
         backend = AscendTritonBackend(
             runner=runner,  # type: ignore[arg-type]
@@ -362,54 +362,8 @@ def custom_op(x, y):
             self.root / "baseline-artifacts",
         )
         self.assertEqual(result["per_case"][0]["pytorch_eager_us"], 12.0)
-        self.assertFalse(result["torch_compile_available"])
-        self.assertFalse(result["official_available"])
-
-    def test_strong_baseline_comparisons_are_attached_in_parent(self) -> None:
-        stage = StageResult.success(
-            EvaluationStage.BENCHMARK,
-            details={
-                "passed": True,
-                "per_case": [
-                    {
-                        "case_id": "bench_1",
-                        "weight": 2.0,
-                        "candidate": {"median_us": 5.0},
-                    },
-                    {
-                        "case_id": "bench_2",
-                        "weight": 1.0,
-                        "candidate": {"median_us": 10.0},
-                    },
-                ],
-            },
-        )
-        snapshot = {
-            "identity_sha256": "a" * 64,
-            "per_case": [
-                {
-                    "case_id": "bench_1",
-                    "torch_compile_us": 10.0,
-                    "official_us": 4.0,
-                },
-                {
-                    "case_id": "bench_2",
-                    "torch_compile_us": 5.0,
-                    "official_us": None,
-                },
-            ],
-        }
-        result = AscendTritonBackend._attach_strong_baselines(stage, snapshot)
-        per_case = cast(list[dict[str, Any]], result.details["per_case"])
-        self.assertEqual(per_case[0]["speedup_vs_compile"], 2.0)
-        self.assertEqual(per_case[0]["speedup_vs_official"], 0.8)
-        self.assertEqual(per_case[1]["speedup_vs_compile"], 0.5)
-        self.assertIsNone(per_case[1]["speedup_vs_official"])
-        self.assertAlmostEqual(
-            cast(float, result.details["geomean_speedup_vs_compile"]),
-            (2.0 * 2.0 * 0.5) ** (1 / 3),
-        )
-        self.assertEqual(result.details["official_comparison_case_count"], 1)
+        self.assertEqual(result["mode"], "pytorch_eager_only")
+        self.assertEqual(result["compared_baselines"], ["pytorch_eager"])
 
     def test_profile_is_explicitly_unavailable_without_msprof(self) -> None:
         backend = AscendTritonBackend(
@@ -506,6 +460,17 @@ def custom_op(x, y):
         )
         self.assertEqual(result.status, StageStatus.PASS)
         self.assertEqual(result.details["missing_mandatory_groups"], [])
+        self.assertEqual(result.details["profile_mode"], "quick")
+        self.assertEqual(
+            result.details["summary"]["collection_warmup"], 1
+        )
+        self.assertEqual(
+            result.details["summary"]["collection_iterations"], 1
+        )
+        request = cast(dict[str, Any], runner.calls[0]["request"])
+        self.assertEqual(request["settings"]["mode"], "quick")
+        self.assertEqual(request["settings"]["warmup"], 1)
+        self.assertEqual(request["settings"]["iterations"], 1)
         argv = cast(tuple[str, ...], runner.calls[0]["argv"])
         self.assertIn("--kernel-name=generated_kernel", argv)
 

@@ -630,6 +630,9 @@ def _baselines(
     device: str,
     settings: Mapping[str, Any],
 ) -> dict[str, Any]:
+    comparison_baseline = str(settings.get("comparison_baseline", "pytorch_eager"))
+    if comparison_baseline != "pytorch_eager":
+        raise ValueError("baseline comparison must be pytorch_eager")
     warmup = int(settings.get("warmup", task.benchmark.get("warmup", 20)))
     batches = int(
         settings.get("measurement_batches", task.benchmark.get("measurement_batches", 7))
@@ -640,11 +643,6 @@ def _baselines(
     if warmup < 1 or batches < 1 or target_ms <= 0:
         raise ValueError("invalid baseline benchmark settings")
     per_case: list[dict[str, Any]] = []
-    compile_errors: list[str] = []
-    compile_successes = 0
-    compile_api = getattr(torch, "compile", None)
-    compile_unavailable_reason: str | None = None
-    compile_unavailable_case: str | None = None
     for case in cases:
         eager_inputs = generate_inputs(task, case, torch, device).args
 
@@ -660,56 +658,6 @@ def _baselines(
             batches=batches,
             target_batch_time_ms=target_ms,
         )
-        compiled_us: float | None = None
-        compiled_stats: dict[str, Any] | None = None
-        compile_error: str | None = None
-        if compile_unavailable_reason is not None:
-            compile_error = (
-                "not attempted: torch.compile was already found incompatible with "
-                f"this runtime while measuring {compile_unavailable_case}"
-            )
-        elif not callable(compile_api):
-            compile_error = "torch.compile is not available in this runtime"
-            compile_unavailable_reason = compile_error
-            compile_unavailable_case = case.id
-            compile_errors.append(f"{case.id}: {compile_error}")
-        else:
-            compiled_inputs = generate_inputs(task, case, torch, device).args
-
-            def compile_target(*args: Any) -> Any:
-                return reference(task, args, torch)
-
-            try:
-                compiled = compile_api(compile_target)
-
-                def compiled_call(
-                    compiled_function: Any = compiled,
-                    inputs: tuple[Any, ...] = compiled_inputs,
-                ) -> Any:
-                    return compiled_function(*inputs)
-
-                for _ in range(warmup):
-                    compiled_call()
-                _sync(torch)
-                compiled_stats, _compiled_repeats = _single_measurement_session(
-                    torch,
-                    compiled_call,
-                    batches=batches,
-                    target_batch_time_ms=target_ms,
-                )
-                compiled_us = float(compiled_stats["median_us"])
-                compile_successes += 1
-            except Exception as exc:  # torch.compile backend errors vary by CANN release
-                compile_error = f"{type(exc).__name__}: {exc}"[:4096]
-                if "cannot import name 'triton_key'" in compile_error:
-                    compile_error = (
-                        "BackendCompilerFailed: PyTorch Inductor requires "
-                        "triton.compiler.compiler.triton_key, which this "
-                        "Triton-Ascend runtime does not provide"
-                    )
-                    compile_unavailable_reason = compile_error
-                    compile_unavailable_case = case.id
-                compile_errors.append(f"{case.id}: {compile_error}")
         per_case.append(
             {
                 "case_id": case.id,
@@ -718,42 +666,17 @@ def _baselines(
                 "weight": case.weight,
                 "pytorch_eager_us": float(eager_stats["median_us"]),
                 "pytorch_eager": eager_stats,
-                "torch_compile_us": compiled_us,
-                "torch_compile": compiled_stats,
-                "torch_compile_error": compile_error,
-                "official_us": None,
-                "official": None,
                 "eager_repeats_per_batch": eager_repeats,
             }
         )
-    reasons: dict[str, Any] = {
-        "official": (
-            "task has no trusted official_baseline implementation; "
-            "the shipped task baseline is the B0 eager reference"
-        )
-    }
-    if compile_successes != len(cases):
-        reasons["torch_compile"] = (
-            compile_errors
-            if compile_errors
-            else ["torch.compile is unavailable for every requested case"]
-        )
     return {
         "passed": True,
-        "status": "complete" if compile_successes == len(cases) else "partial",
+        "status": "complete",
+        "mode": "pytorch_eager_only",
+        "comparison_baseline": comparison_baseline,
+        "compared_baselines": [comparison_baseline],
+        "not_measured_baselines": ["torch_compile", "official"],
         "per_case": per_case,
-        "torch_compile_available": compile_successes == len(cases),
-        "torch_compile_partial": 0 < compile_successes < len(cases),
-        "torch_compile_status": (
-            "complete"
-            if compile_successes == len(cases)
-            else "partial"
-            if compile_successes
-            else "failed"
-        ),
-        "official_available": False,
-        "official_status": "not_defined",
-        "unavailable_reasons": reasons,
     }
 
 

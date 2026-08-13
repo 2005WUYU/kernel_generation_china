@@ -65,17 +65,20 @@ class ExportTests(unittest.TestCase):
             exporter = DatasetExporter(experiment)
             self.assertEqual(exporter.export_sft(root / "sft.jsonl"), 1)
             self.assertEqual(exporter.export_rl(root / "rl.jsonl"), 1)
-            self.assertTrue(json.loads((root / "rl.jsonl").read_text())["selected_as_best"])
+            trajectory = json.loads((root / "rl.jsonl").read_text())
+            self.assertTrue(trajectory["selected_as_best"])
+            self.assertEqual(trajectory["feedback"], {"overall_status": "success"})
             ReportExporter(experiment).write(root / "report.json", root / "report.md")
             report = json.loads((root / "report.json").read_text())
             self.assertEqual(report["passed_task_count"], 1)
             self.assertEqual(report["environment"], {"device": "fake"})
             self.assertEqual(
-                report["tasks"][0]["public_best"]["geomean_speedup_vs_compile"],
-                0.9,
+                report["tasks"][0]["public_best"]["geomean_speedup_vs_eager"],
+                1.1,
             )
             markdown = (root / "report.md").read_text(encoding="utf-8")
-            self.assertIn("vs official", markdown)
+            self.assertIn("vs PyTorch eager", markdown)
+            self.assertNotIn("vs official", markdown)
 
     def test_secret_scanner_blocks_export(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -110,6 +113,34 @@ class ExportTests(unittest.TestCase):
                 ),
                 1,
             )
+
+    def test_all_samples_really_exports_unclassified_trajectory_rounds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            experiment = self._run(root)
+            first = experiment / "tasks/k01_vector_add/round_01"
+            second = first.parent / "round_02"
+            second.mkdir()
+            for name in (
+                "prompt.json",
+                "model_response.json",
+                "candidate.py",
+                "evaluation_result.json",
+                "feedback.json",
+                "reward.json",
+            ):
+                second.joinpath(name).write_bytes(first.joinpath(name).read_bytes())
+
+            destination = root / "all.jsonl"
+            self.assertEqual(
+                DatasetExporter(experiment).export_sft(
+                    destination,
+                    main_only=False,
+                ),
+                2,
+            )
+            rows = [json.loads(line) for line in destination.read_text().splitlines()]
+            self.assertEqual(rows[1]["sample_type"], "cold_start_trajectory")
 
     def test_report_scanner_blocks_environment_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -5,6 +5,7 @@ import json
 import math
 import subprocess
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -312,7 +313,20 @@ class ExperimentController:
         unknown = set(selected) - set(self.config.tasks)
         if unknown:
             raise ControllerError(f"tasks are not enabled by the experiment config: {sorted(unknown)}")
-        summaries = tuple(self.run_task(self.registry.load(task_id)) for task_id in selected)
+        tasks = tuple(self.registry.load(task_id) for task_id in selected)
+        if len(tasks) <= 1 or self.config.task_concurrency == 1:
+            summaries = tuple(self.run_task(task) for task in tasks)
+        else:
+            # Tasks are independent durable state machines.  Run distinct tasks
+            # concurrently so the shared queue can keep multiple single-NPU
+            # workers busy.  ``run_task`` itself deliberately keeps each task's
+            # five rounds strictly sequential because round N+1 consumes the
+            # committed feedback from round N.
+            with ThreadPoolExecutor(
+                max_workers=min(self.config.task_concurrency, len(tasks)),
+                thread_name_prefix="akg-task",
+            ) as executor:
+                summaries = tuple(executor.map(self.run_task, tasks))
         experiment = self.store.get_experiment(self.experiment_id)
         all_tasks_terminal = all(
             (record := self.store.get_task(self.experiment_id, task_id)) is not None
@@ -351,25 +365,136 @@ class ExperimentController:
             self._run_round(task, round_number)
         return self._run_final(task)
 
-    def _history(self, task: TaskSpec, before_round: int) -> list[dict[str, Any]]:
-        values: list[dict[str, Any]] = []
-        for round_number in range(1, before_round):
-            feedback_path = self._artifact_path(task.id, round_number, "feedback.json")
-            evaluation_path = self._artifact_path(task.id, round_number, "evaluation_result.json")
-            if feedback_path.is_file():
-                feedback = _read_json(feedback_path)
-                evaluation = _read_json(evaluation_path) if evaluation_path.is_file() else {}
-                benchmark_value = evaluation.get("benchmark")
-                benchmark: Mapping[str, Any] = (
-                    benchmark_value if isinstance(benchmark_value, Mapping) else {}
-                )
-                values.append({
-                    "round": round_number,
-                    "status": feedback.get("overall_status"),
-                    "geomean_speedup": benchmark.get("geomean_speedup_vs_eager"),
-                    "minimum_speedup": benchmark.get("minimum_speedup_vs_eager"),
-                })
-        return values
+    @staticmethod
+    def _follow_up_metrics(evaluation: Mapping[str, Any]) -> dict[str, Any]:
+        """Keep only fast, actionable evidence from the previous evaluation."""
+
+        def stage_status(name: str) -> Any:
+            value = evaluation.get(name)
+            if not isinstance(value, Mapping):
+                return None
+            return {
+                "status": value.get("status"),
+                "passed": value.get("passed"),
+            }
+
+        correctness = evaluation.get("correctness")
+        correctness_summary: dict[str, Any] | None = None
+        if isinstance(correctness, Mapping):
+            correctness_summary = {
+                **(stage_status("correctness") or {}),
+                "passed_cases": correctness.get("passed_cases"),
+                "total_cases": correctness.get("total_cases"),
+            }
+
+        benchmark = evaluation.get("benchmark")
+        benchmark_summary: dict[str, Any] | None = None
+        if isinstance(benchmark, Mapping):
+            cases: list[dict[str, Any]] = []
+            per_case = benchmark.get("per_case")
+            if isinstance(per_case, Sequence) and not isinstance(per_case, (str, bytes)):
+                for value in per_case:
+                    if not isinstance(value, Mapping):
+                        continue
+                    candidate = value.get("candidate")
+                    eager = value.get("baseline_eager")
+                    cases.append({
+                        "case_id": value.get("case_id"),
+                        "candidate_us": (
+                            candidate.get("median_us") if isinstance(candidate, Mapping) else None
+                        ),
+                        "pytorch_eager_us": (
+                            eager.get("median_us") if isinstance(eager, Mapping) else None
+                        ),
+                        "speedup_vs_pytorch_eager": value.get("speedup_vs_eager"),
+                        "stable": value.get("stable"),
+                    })
+            benchmark_summary = {
+                **(stage_status("benchmark") or {}),
+                "geomean_speedup_vs_pytorch_eager": benchmark.get(
+                    "geomean_speedup_vs_eager"
+                ),
+                "minimum_speedup_vs_pytorch_eager": benchmark.get(
+                    "minimum_speedup_vs_eager"
+                ),
+                "maximum_cv": benchmark.get("maximum_cv"),
+                "cases": cases,
+            }
+
+        profile = evaluation.get("profile")
+        profile_summary: dict[str, Any] | None = None
+        if isinstance(profile, Mapping):
+            summary_value = profile.get("summary")
+            summary = summary_value if isinstance(summary_value, Mapping) else profile
+            scheduling_value = summary.get("scheduling")
+            scheduling = (
+                scheduling_value if isinstance(scheduling_value, Mapping) else {}
+            )
+            pipeline_value = summary.get("pipeline")
+            pipeline = pipeline_value if isinstance(pipeline_value, Mapping) else {}
+            memory_value = summary.get("memory")
+            memory = memory_value if isinstance(memory_value, Mapping) else {}
+            profile_summary = {
+                "status": profile.get("status"),
+                "passed": profile.get("passed"),
+                "mode": summary.get("profile_mode", profile.get("profile_mode")),
+                "kernel_count": summary.get("kernel_count"),
+                "candidate_kernel_coverage": summary.get("candidate_kernel_coverage"),
+                "candidate_device_execution_us": scheduling.get(
+                    "candidate_device_execution_us"
+                ),
+                "total_device_execution_us": scheduling.get(
+                    "total_device_execution_us"
+                ),
+                "pipeline_utilization": dict(pipeline),
+                "memory": dict(memory),
+                "observations": summary.get("observations", []),
+            }
+
+        return {
+            "overall_status": evaluation.get("overall_status"),
+            "source": stage_status("source"),
+            "compile": stage_status("compile"),
+            "correctness": correctness_summary,
+            "benchmark_vs_pytorch_eager": benchmark_summary,
+            "quick_profile": profile_summary,
+        }
+
+    @staticmethod
+    def _follow_up_failure_reasons(
+        evaluation: Mapping[str, Any], feedback: Mapping[str, Any]
+    ) -> list[str]:
+        overall = str(evaluation.get("overall_status", "unknown"))
+        if overall in {"correct", "success"}:
+            return []
+        reasons = [overall]
+        for stage_name in ("source", "compile", "correctness", "benchmark", "profile"):
+            stage = evaluation.get(stage_name)
+            if not isinstance(stage, Mapping):
+                continue
+            error = stage.get("error")
+            if isinstance(error, Mapping) and error.get("message"):
+                reasons.append(f"{stage_name}: {error['message']}")
+        focus = feedback.get("next_round_requirement")
+        if len(reasons) == 1 and isinstance(focus, Mapping):
+            suggestions = focus.get("focus")
+            if isinstance(suggestions, Sequence) and not isinstance(suggestions, (str, bytes)):
+                reasons.extend(str(item) for item in suggestions[:1])
+        return reasons
+
+    @staticmethod
+    def _follow_up_suggestions(feedback: Mapping[str, Any]) -> list[str]:
+        requirement = feedback.get("next_round_requirement")
+        if not isinstance(requirement, Mapping):
+            return ["保持正确性并依据 PyTorch eager 对比信息尝试下一次修改"]
+        focus = requirement.get("focus")
+        if not isinstance(focus, Sequence) or isinstance(focus, (str, bytes)):
+            return ["保持正确性并依据 PyTorch eager 对比信息尝试下一次修改"]
+        result = []
+        for item in focus:
+            text = str(item)
+            result.append(text)
+        return result
 
     def _best_context(
         self, task: TaskSpec, *, before_round: int | None = None
@@ -402,23 +527,26 @@ class ExperimentController:
         }
         if round_number == 1:
             return self.prompt_builder.build_first_round(**common)
-        previous_response = _read_json(self._artifact_path(task.id, round_number - 1, "model_response.json"))
         previous_evaluation_path = self._artifact_path(task.id, round_number - 1, "evaluation_result.json")
         previous_feedback_path = self._artifact_path(task.id, round_number - 1, "feedback.json")
         previous_evaluation = _read_json(previous_evaluation_path) if previous_evaluation_path.is_file() else {
             "overall_status": "model_failed",
-            "feedback": _read_json(previous_feedback_path) if previous_feedback_path.is_file() else {},
         }
+        previous_feedback = (
+            _read_json(previous_feedback_path) if previous_feedback_path.is_file() else {}
+        )
+        previous_code = self._artifact_path(
+            task.id, round_number - 1, "candidate.py"
+        ).read_text(encoding="utf-8")
         return self.prompt_builder.build_follow_up(
-            task=common["task"],
-            environment=common["environment"],
-            baseline=common["baseline"],
             round_number=round_number,
             maximum_rounds=self.config.rounds_per_task,
-            best_candidate=self._best_context(task),
-            last_candidate=previous_response,
-            last_evaluation=previous_evaluation,
-            history_summary=self._history(task, round_number),
+            last_candidate_code=previous_code,
+            key_metrics=self._follow_up_metrics(previous_evaluation),
+            failure_reasons=self._follow_up_failure_reasons(
+                previous_evaluation, previous_feedback
+            ),
+            next_round_suggestions=self._follow_up_suggestions(previous_feedback),
             model=self.config.model.model,
             timeout_seconds=self.config.model.request_timeout_seconds,
         )
@@ -1073,7 +1201,7 @@ class ExperimentController:
                     benchmark_cases=hidden_benchmark,
                     profile_cases=hidden_benchmark[:1],
                     baseline_snapshot=self.baseline.get(task.id) if isinstance(self.baseline.get(task.id), Mapping) else self.baseline,
-                    run_profile=self.config.profile.full_profile_for_final_best,
+                    run_profile=self.config.profile.run_for_final_best,
                     profile_coverage_required=self.profile_coverage_required,
                     hidden=True,
                 ),

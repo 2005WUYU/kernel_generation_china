@@ -10,7 +10,7 @@ import stat
 import threading
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -353,10 +353,14 @@ class SQLiteDatabase:
         ensure_shared_directory(self.path.parent, mode=self._directory_mode)
         ensure_shared_regular_file(self.path, mode=self._file_mode, create=True)
         for suffix in ("-wal", "-shm"):
-            ensure_shared_regular_file(
-                Path(f"{self.path}{suffix}"),
-                mode=self._file_mode,
-            )
+            # SQLite creates and removes these sidecars as the last WAL
+            # connection opens/closes.  Concurrent controller/worker
+            # connections can therefore remove one between lexists/lstat.
+            with suppress(FileNotFoundError):
+                ensure_shared_regular_file(
+                    Path(f"{self.path}{suffix}"),
+                    mode=self._file_mode,
+                )
 
     def _open_connection(self) -> sqlite3.Connection:
         self._repair_file_modes()

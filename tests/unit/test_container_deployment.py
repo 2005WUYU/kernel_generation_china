@@ -15,6 +15,7 @@ class ContainerDeploymentContractTests(unittest.TestCase):
             CONTAINER / "worker-entrypoint.sh",
             ROOT / "scripts/build-container-images.sh",
             ROOT / "scripts/run-containers-910c.sh",
+            ROOT / "scripts/watch-experiment-910c.sh",
         ]
         for path in paths:
             with self.subTest(path=path):
@@ -23,6 +24,22 @@ class ContainerDeploymentContractTests(unittest.TestCase):
                 )
                 self.assertEqual(process.returncode, 0, process.stderr)
                 self.assertIn("set -eu", path.read_text(encoding="utf-8"))
+
+    def test_experiment_watcher_tracks_multicard_rounds_without_secrets(self) -> None:
+        watcher = (ROOT / "scripts/watch-experiment-910c.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("exp_910c_deepseek_v4_pro_cold_sft_v1", watcher)
+        self.assertIn("0,1,2,3,4,5,6,7", watcher)
+        self.assertIn("round_%02d", watcher)
+        self.assertIn("sleep 5", watcher)
+        self.assertIn("docker top", watcher)
+        self.assertIn("final_result.json", watcher)
+        self.assertIn("只生成了 $finals/10 个最终结果", watcher)
+        self.assertIn('docker logs --tail 100 "$CONTROLLER_NAME"', watcher)
+        self.assertNotIn("AUTH_TOKEN", watcher)
+        self.assertNotIn("hidden", watcher.lower())
+        self.assertEqual(watcher.count("prompt.json"), 1)
 
     def test_build_context_cannot_include_checkout_or_secrets(self) -> None:
         script = (ROOT / "scripts/build-container-images.sh").read_text(encoding="utf-8")
@@ -71,8 +88,22 @@ class ContainerDeploymentContractTests(unittest.TestCase):
             "        ;;", 1
         )[0]
         self.assertIn("--tmpfs /tmp:rw,nosuid,nodev,exec,mode=1777", maintenance_block)
-        worker_block = runner.split("start-worker)", 1)[1].split(";;", 1)[0]
+        self.assertNotIn("\n             shift\n", maintenance_block)
+        self.assertIn('exec "$@"\' sh "$@"', maintenance_block)
+        worker_block = runner.split("start-worker|start-workers)", 1)[1].split(
+            ";;", 1
+        )[0]
         self.assertNotIn('"$CONTROLLER_ENV_FILE"', worker_block)
+        self.assertIn("AKG_DEVICE_IDS:-0,1,2,3,4,5,6,7", runner)
+        self.assertIn('start_worker_container "$physical_device"', worker_block)
+        self.assertIn('ASCEND_VISIBLE_DEVICES=$physical_device', runner)
+        self.assertIn('--env DEVICE_ID=0', runner)
+        self.assertIn(
+            "AKG_DEVICE_LOCK_ROOT=/var/lock/ascend-kernel-lab/device-$physical_device",
+            runner,
+        )
+        self.assertIn('AKG_CONFIG_PATH=$CONTAINER_CONFIG_PATH', runner)
+        self.assertNotIn("experiment_910c_kimi_k3.yaml", runner)
         self.assertIn("reject_model_environment", entrypoint)
         self.assertIn("torch.npu.device_count() != 1", entrypoint)
         self.assertIn("*','*", entrypoint)
@@ -90,7 +121,9 @@ class ContainerDeploymentContractTests(unittest.TestCase):
 
     def test_controller_is_oneshot_while_worker_restarts_after_failure(self) -> None:
         runner = (ROOT / "scripts/run-containers-910c.sh").read_text(encoding="utf-8")
-        worker_block = runner.split("    start-worker)", 1)[1].split("        ;;", 1)[0]
+        worker_block = runner.split("start_worker_container()", 1)[1].split(
+            "\n}", 1
+        )[0]
         controller_block = runner.split("    start-controller)", 1)[1].split(
             "        ;;", 1
         )[0]

@@ -305,6 +305,12 @@ class MsprofParser:
         scheduling = {
             "host_enqueue_us": average("host_enqueue_us"),
             "device_execution_us": candidate_device_us if records else None,
+            "candidate_device_execution_us": (
+                candidate_device_us if records else None
+            ),
+            "total_device_execution_us": (
+                total_device_us if normalized_rows else None
+            ),
         }
         observations = self._observations(records, pipeline, coverage)
         return ProfileSummary(

@@ -51,7 +51,7 @@ class _TorchWithEvents:
 
 
 class StageEntryTimingTests(unittest.TestCase):
-    def test_known_inductor_incompatibility_is_attempted_once(self) -> None:
+    def test_baseline_measures_only_pytorch_eager(self) -> None:
         task = TaskRegistry(PROJECT_ROOT / "task_specs").load("k01_vector_add")
 
         class IncompatibleTorch:
@@ -97,16 +97,14 @@ class StageEntryTimingTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(torch.compile_calls, 1)
-        self.assertEqual(result["status"], "partial")
-        self.assertEqual(result["torch_compile_status"], "failed")
-        self.assertIn("triton_key", result["per_case"][0]["torch_compile_error"])
-        self.assertTrue(
-            all(
-                str(case["torch_compile_error"]).startswith("not attempted:")
-                for case in result["per_case"][1:]
-            )
+        self.assertEqual(torch.compile_calls, 0)
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["mode"], "pytorch_eager_only")
+        self.assertEqual(result["compared_baselines"], ["pytorch_eager"])
+        self.assertEqual(
+            result["not_measured_baselines"], ["torch_compile", "official"]
         )
+        self.assertNotIn("torch_compile_us", result["per_case"][0])
 
     def test_measurement_observes_last_materialized_output_outside_timer(self) -> None:
         calls = 0

@@ -2,7 +2,7 @@
 set -eu
 
 usage() {
-    echo "usage: $0 init|probe|baseline|start-worker|start-controller|status|stop" >&2
+    echo "usage: $0 init|probe|baseline|start-worker|start-workers|start-controller|status|stop" >&2
 }
 
 if [ "$#" -ne 1 ]; then
@@ -11,7 +11,7 @@ if [ "$#" -ne 1 ]; then
 fi
 ACTION=$1
 case "$ACTION" in
-    init|probe|baseline|start-worker|start-controller|status|stop) ;;
+    init|probe|baseline|start-worker|start-workers|start-controller|status|stop) ;;
     *) usage; exit 2 ;;
 esac
 
@@ -26,9 +26,11 @@ HIDDEN_ENV_FILE=${AKG_HIDDEN_ENV_FILE:-/etc/ascend-kernel-lab/hidden.env}
 WORKER_ENV_FILE=${AKG_WORKER_ENV_FILE:-/etc/ascend-kernel-lab/worker-container.env}
 WORKER_IMAGE=${AKG_WORKER_IMAGE:-ascend-kernel-lab-worker:local}
 CONTROLLER_IMAGE=${AKG_CONTROLLER_IMAGE:-ascend-kernel-lab-controller:local}
-WORKER_NAME=${AKG_WORKER_CONTAINER:-ascend-kernel-worker}
+WORKER_PREFIX=${AKG_WORKER_CONTAINER_PREFIX:-ascend-kernel-worker}
+WORKER_NAME=${AKG_WORKER_CONTAINER:-$WORKER_PREFIX-${AKG_DEVICE_ID:-0}}
 CONTROLLER_NAME=${AKG_CONTROLLER_CONTAINER:-ascend-kernel-controller}
 DEVICE_ID=${AKG_DEVICE_ID:-0}
+DEVICE_IDS=${AKG_DEVICE_IDS:-0,1,2,3,4,5,6,7}
 TASK_ID=${AKG_TASK_ID:-}
 EXPERIMENT_ID=${AKG_EXPERIMENT_ID:-}
 CONTROLLER_UID=${AKG_CONTROLLER_UID:-}
@@ -37,17 +39,46 @@ SHARED_GID=${AKG_SHARED_GID:-}
 NPU_DEVICE_GID=${AKG_NPU_DEVICE_GID:-}
 CONTAINER_PROJECT_ROOT=/workspace
 LOCK_ROOT=${AKG_DEVICE_LOCK_ROOT:-/var/lock/ascend-kernel-lab}
+CONFIG_REQUESTED=${AKG_CONFIG_PATH:-configs/experiment_910c_deepseek_v4_pro.yaml}
+
+worker_names() {
+    if [ -n "${AKG_WORKER_CONTAINER:-}" ]; then
+        printf '%s\n' "$AKG_WORKER_CONTAINER"
+        return
+    fi
+    old_ifs=$IFS
+    IFS=,
+    for worker_device in $DEVICE_IDS; do
+        printf '%s-%s\n' "$WORKER_PREFIX" "$worker_device"
+    done
+    IFS=$old_ifs
+}
+
+managed_worker_names() {
+    if [ -n "${AKG_WORKER_CONTAINER:-}" ]; then
+        printf '%s\n' "$AKG_WORKER_CONTAINER"
+        return
+    fi
+    # Include the pre-multicard name so an upgrade stops the old queue
+    # consumer before launching the eight device-specific workers.
+    printf '%s\n' "$WORKER_PREFIX"
+    worker_names
+}
 
 # Status and emergency stop must remain available even if the checkout or its
 # permissions are damaged. They deliberately require no environment files.
 case "$ACTION" in
     status)
+        for name in $(managed_worker_names); do
+            docker container inspect --format '{{.Name}} running={{.State.Running}} health={{if .State.Health}}{{.State.Health.Status}}{{end}} exit={{.State.ExitCode}} image={{.Image}}' \
+                "$name" 2>/dev/null || true
+        done
         docker container inspect --format '{{.Name}} running={{.State.Running}} exit={{.State.ExitCode}} image={{.Image}}' \
-            "$WORKER_NAME" "$CONTROLLER_NAME" 2>/dev/null || true
+            "$CONTROLLER_NAME" 2>/dev/null || true
         exit 0
         ;;
     stop)
-        for name in "$CONTROLLER_NAME" "$WORKER_NAME"; do
+        for name in "$CONTROLLER_NAME" $(managed_worker_names); do
             if docker container inspect "$name" >/dev/null 2>&1; then
                 docker container stop --time 45 "$name" >/dev/null
                 docker container rm "$name" >/dev/null
@@ -57,6 +88,26 @@ case "$ACTION" in
         exit 0
         ;;
 esac
+
+case "$DEVICE_IDS" in
+    ""|,*|*,|*,,*|*[!0-9,]*)
+        echo "error: AKG_DEVICE_IDS must be a comma-separated list of numeric NPUs" >&2
+        exit 2
+        ;;
+esac
+seen_devices=,
+old_ifs=$IFS
+IFS=,
+for listed_device in $DEVICE_IDS; do
+    case "$seen_devices" in
+        *,$listed_device,*)
+            echo "error: AKG_DEVICE_IDS contains duplicate NPU $listed_device" >&2
+            exit 2
+            ;;
+    esac
+    seen_devices=$seen_devices$listed_device,
+done
+IFS=$old_ifs
 
 case "$DEVICE_ID" in
     ""|*','*|*[!0-9]*)
@@ -112,6 +163,34 @@ case "$PROJECT_ROOT" in
     *) echo "error: AKG_PROJECT_ROOT must be the absolute path of the remote clean clone" >&2; exit 2 ;;
 esac
 PROJECT_ROOT=$(CDPATH= cd -- "$PROJECT_ROOT" && pwd -P)
+
+case "$CONFIG_REQUESTED" in
+    "$PROJECT_ROOT"/*)
+        CONFIG_RELATIVE=${CONFIG_REQUESTED#"$PROJECT_ROOT"/}
+        ;;
+    "$CONTAINER_PROJECT_ROOT"/*)
+        CONFIG_RELATIVE=${CONFIG_REQUESTED#"$CONTAINER_PROJECT_ROOT"/}
+        ;;
+    /*)
+        echo "error: AKG_CONFIG_PATH must be inside AKG_PROJECT_ROOT" >&2
+        exit 2
+        ;;
+    *)
+        CONFIG_RELATIVE=$CONFIG_REQUESTED
+        ;;
+esac
+case "$CONFIG_RELATIVE" in
+    ""|.|..|../*|*/../*|*/..|./*|*//*|*\\*)
+        echo "error: AKG_CONFIG_PATH must be a normalized project-relative path" >&2
+        exit 2
+        ;;
+esac
+HOST_CONFIG_PATH=$PROJECT_ROOT/$CONFIG_RELATIVE
+CONTAINER_CONFIG_PATH=$CONTAINER_PROJECT_ROOT/$CONFIG_RELATIVE
+if [ ! -f "$HOST_CONFIG_PATH" ] || [ -L "$HOST_CONFIG_PATH" ]; then
+    echo "error: experiment config is missing or unsafe: $HOST_CONFIG_PATH" >&2
+    exit 3
+fi
 
 if [ ! -d "$PROJECT_ROOT/.git" ]; then
     echo "error: AKG_PROJECT_ROOT must be a complete Git clone" >&2
@@ -220,6 +299,52 @@ worker_library_path() {
     fi
 }
 
+start_worker_container() {
+    physical_device=$1
+    worker_container=$2
+    docker run --detach \
+        --name "$worker_container" \
+        --user "$WORKER_UID:$SHARED_GID" \
+        --group-add "$NPU_DEVICE_GID" \
+        --restart on-failure:3 \
+        --health-cmd 'kill -0 1' \
+        --health-interval 10s \
+        --health-timeout 3s \
+        --health-retries 3 \
+        --health-start-period 5s \
+        --runtime=ascend \
+        --network none \
+        --read-only \
+        --cap-drop ALL \
+        --security-opt no-new-privileges \
+        --pids-limit 1024 \
+        --memory "${AKG_WORKER_MEMORY:-48g}" \
+        --log-opt "max-size=${AKG_LOG_MAX_SIZE:-20m}" \
+        --log-opt "max-file=${AKG_LOG_MAX_FILES:-5}" \
+        --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
+        --tmpfs /root/ascend:rw,nosuid,nodev,noexec,mode=0700 \
+        --env-file "$WORKER_ENV_FILE" \
+        --env-file "$HIDDEN_ENV_FILE" \
+        --env "LD_LIBRARY_PATH=$WORKER_LD_LIBRARY_PATH" \
+        --env "ASCEND_VISIBLE_DEVICES=$physical_device" \
+        --env DEVICE_ID=0 \
+        --env "AKG_PROJECT_ROOT=$CONTAINER_PROJECT_ROOT" \
+        --env "AKG_CONFIG_PATH=$CONTAINER_CONFIG_PATH" \
+        --env "AKG_DEVICE_LOCK_ROOT=/var/lock/ascend-kernel-lab/device-$physical_device" \
+        --env HOME=/tmp/akg-home \
+        --env GIT_CONFIG_COUNT=1 \
+        --env GIT_CONFIG_KEY_0=safe.directory \
+        --env "GIT_CONFIG_VALUE_0=$CONTAINER_PROJECT_ROOT" \
+        --env GIT_OPTIONAL_LOCKS=0 \
+        --volume "$PROJECT_ROOT:$CONTAINER_PROJECT_ROOT:ro" \
+        --volume "$PROJECT_ROOT/runs:$CONTAINER_PROJECT_ROOT/runs:rw" \
+        --volume "$LOCK_ROOT:/var/lock/ascend-kernel-lab:rw" \
+        "$WORKER_IMAGE" \
+        python3 -m ascend_kernel_lab worker run \
+        -c "$CONTAINER_CONFIG_PATH" \
+        --worker-id "$worker_container:physical-$physical_device"
+}
+
 case "$ACTION" in
     init)
         docker run --rm \
@@ -236,22 +361,27 @@ case "$ACTION" in
             --volume "$PROJECT_ROOT/runs:$CONTAINER_PROJECT_ROOT/runs:rw" \
             --entrypoint /bin/sh \
             "$CONTROLLER_IMAGE" -c \
-            'umask 0007; export PYTHONPATH=/workspace/src; cd /workspace; python3 -m ascend_kernel_lab db upgrade -c configs/experiment_910c_kimi_k3.yaml'
+            'umask 0007; export PYTHONPATH=/workspace/src; cd /workspace; python3 -m ascend_kernel_lab db upgrade -c "$1"' \
+            sh "$CONTAINER_CONFIG_PATH"
         ;;
     probe|baseline)
         WORKER_LD_LIBRARY_PATH=$(worker_library_path)
-        if docker container inspect "$WORKER_NAME" --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
-            echo "error: stop the project Worker before probe or baseline maintenance" >&2
-            exit 3
-        fi
+        for name in $(managed_worker_names); do
+            if docker container inspect "$name" --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
+                echo "error: stop the project Worker before probe or baseline maintenance" >&2
+                exit 3
+            fi
+        done
         validate_env_file "$WORKER_ENV_FILE" worker
         reject_worker_model_env_file
         if [ "$ACTION" = probe ]; then
-            MAINTENANCE_COMMAND='python3 -m ascend_kernel_lab probe all -c configs/experiment_910c_kimi_k3.yaml -o runs/probe'
+            set -- python3 -m ascend_kernel_lab probe all \
+                -c "$CONTAINER_CONFIG_PATH" -o runs/probe
         else
-            MAINTENANCE_COMMAND='python3 -m ascend_kernel_lab baseline run -c configs/experiment_910c_kimi_k3.yaml'
+            set -- python3 -m ascend_kernel_lab baseline run \
+                -c "$CONTAINER_CONFIG_PATH"
             if [ -n "$TASK_ID" ]; then
-                MAINTENANCE_COMMAND="$MAINTENANCE_COMMAND --task $TASK_ID"
+                set -- "$@" --task "$TASK_ID"
             fi
         fi
         docker run --rm \
@@ -292,73 +422,55 @@ case "$ACTION" in
              export PYTHONPATH=/workspace/src
              cd /workspace
              python3 -c '\''import torch, torch_npu, triton; assert torch.npu.is_available(); assert torch.npu.device_count() == 1'\''
-             exec /bin/sh -c "$1"' sh "$MAINTENANCE_COMMAND"
+             exec "$@"' sh "$@"
         ;;
-    start-worker)
+    start-worker|start-workers)
         WORKER_LD_LIBRARY_PATH=$(worker_library_path)
         validate_env_file "$HIDDEN_ENV_FILE" hidden
         validate_env_file "$WORKER_ENV_FILE" worker
         reject_hidden_model_env_file
         reject_worker_model_env_file
-        ensure_absent "$WORKER_NAME"
-        docker run --detach \
-            --name "$WORKER_NAME" \
-            --user "$WORKER_UID:$SHARED_GID" \
-            --group-add "$NPU_DEVICE_GID" \
-            --restart on-failure:3 \
-            --health-cmd 'kill -0 1' \
-            --health-interval 10s \
-            --health-timeout 3s \
-            --health-retries 3 \
-            --health-start-period 5s \
-            --runtime=ascend \
-            --network none \
-            --read-only \
-            --cap-drop ALL \
-            --security-opt no-new-privileges \
-            --pids-limit 1024 \
-            --memory "${AKG_WORKER_MEMORY:-48g}" \
-            --log-opt "max-size=${AKG_LOG_MAX_SIZE:-20m}" \
-            --log-opt "max-file=${AKG_LOG_MAX_FILES:-5}" \
-            --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
-            --tmpfs /root/ascend:rw,nosuid,nodev,noexec,mode=0700 \
-            --env-file "$WORKER_ENV_FILE" \
-            --env-file "$HIDDEN_ENV_FILE" \
-            --env "LD_LIBRARY_PATH=$WORKER_LD_LIBRARY_PATH" \
-            --env "ASCEND_VISIBLE_DEVICES=$DEVICE_ID" \
-            --env "DEVICE_ID=0" \
-            --env "AKG_PROJECT_ROOT=$CONTAINER_PROJECT_ROOT" \
-            --env "AKG_CONFIG_PATH=$CONTAINER_PROJECT_ROOT/configs/experiment_910c_kimi_k3.yaml" \
-            --env AKG_DEVICE_LOCK_ROOT=/var/lock/ascend-kernel-lab \
-            --env HOME=/tmp/akg-home \
-            --env GIT_CONFIG_COUNT=1 \
-            --env GIT_CONFIG_KEY_0=safe.directory \
-            --env "GIT_CONFIG_VALUE_0=$CONTAINER_PROJECT_ROOT" \
-            --env GIT_OPTIONAL_LOCKS=0 \
-            --volume "$PROJECT_ROOT:$CONTAINER_PROJECT_ROOT:ro" \
-            --volume "$PROJECT_ROOT/runs:$CONTAINER_PROJECT_ROOT/runs:rw" \
-            --volume "$LOCK_ROOT:/var/lock/ascend-kernel-lab:rw" \
-            "$WORKER_IMAGE"
+        if [ "$ACTION" = start-worker ]; then
+            if [ -z "${AKG_WORKER_CONTAINER:-}" ]; then
+                ensure_absent "$WORKER_PREFIX"
+            fi
+            ensure_absent "$WORKER_NAME"
+            start_worker_container "$DEVICE_ID" "$WORKER_NAME"
+        else
+            if [ -n "${AKG_WORKER_CONTAINER:-}" ]; then
+                echo "error: AKG_WORKER_CONTAINER cannot name multiple workers; use AKG_WORKER_CONTAINER_PREFIX" >&2
+                exit 2
+            fi
+            for name in $(managed_worker_names); do
+                ensure_absent "$name"
+            done
+            old_ifs=$IFS
+            IFS=,
+            for physical_device in $DEVICE_IDS; do
+                start_worker_container "$physical_device" "$WORKER_PREFIX-$physical_device"
+            done
+            IFS=$old_ifs
+        fi
         ;;
     start-controller)
         validate_env_file "$HIDDEN_ENV_FILE" hidden
         validate_env_file "$CONTROLLER_ENV_FILE" controller
         reject_hidden_model_env_file
         validate_secret_separation
-        if ! docker container inspect "$WORKER_NAME" --format '{{.State.Running}} {{.State.Health.Status}}' 2>/dev/null | grep -qx 'true healthy'; then
-            echo "error: Worker must be healthy before controller startup" >&2
-            exit 3
-        fi
-        ensure_absent "$CONTROLLER_NAME"
-        if [ -n "$TASK_ID" ]; then
-            set -- python3 -m ascend_kernel_lab experiment resume \
-                -c "$CONTAINER_PROJECT_ROOT/configs/experiment_910c_kimi_k3.yaml" \
-                --task "$TASK_ID" --allow-missing-baseline
-            if [ -n "$EXPERIMENT_ID" ]; then
-                set -- "$@" --experiment-id "$EXPERIMENT_ID"
+        for name in $(worker_names); do
+            if ! docker container inspect "$name" --format '{{.State.Running}} {{.State.Health.Status}}' 2>/dev/null | grep -qx 'true healthy'; then
+                echo "error: Worker $name must be healthy before controller startup" >&2
+                exit 3
             fi
-        else
-            set --
+        done
+        ensure_absent "$CONTROLLER_NAME"
+        set -- python3 -m ascend_kernel_lab experiment resume \
+            -c "$CONTAINER_CONFIG_PATH" --allow-missing-baseline
+        if [ -n "$TASK_ID" ]; then
+            set -- "$@" --task "$TASK_ID"
+        fi
+        if [ -n "$EXPERIMENT_ID" ]; then
+            set -- "$@" --experiment-id "$EXPERIMENT_ID"
         fi
         docker run --detach \
             --name "$CONTROLLER_NAME" \
@@ -376,7 +488,7 @@ case "$ACTION" in
             --env-file "$CONTROLLER_ENV_FILE" \
             --env-file "$HIDDEN_ENV_FILE" \
             --env "AKG_PROJECT_ROOT=$CONTAINER_PROJECT_ROOT" \
-            --env "AKG_CONFIG_PATH=$CONTAINER_PROJECT_ROOT/configs/experiment_910c_kimi_k3.yaml" \
+            --env "AKG_CONFIG_PATH=$CONTAINER_CONFIG_PATH" \
             --env HOME=/tmp/akg-home \
             --env GIT_CONFIG_COUNT=1 \
             --env GIT_CONFIG_KEY_0=safe.directory \

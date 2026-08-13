@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -314,6 +315,39 @@ class ControllerRecoveryTests(unittest.TestCase):
             assert experiment is not None
             self.assertIs(experiment.state, ExperimentState.FINISHED)
             self.assertEqual(len(gateway.requests), 2)
+
+    def test_distinct_tasks_run_concurrently_with_stable_summary_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            backend = FakeBackend()
+            tasks = ("k01_vector_add", "k02_bias_gelu")
+            controller, _gateway, _store = self._controller(
+                root, backend, tasks=tasks
+            )
+            controller.config = replace(controller.config, task_concurrency=2)
+            rendezvous = threading.Barrier(2)
+            active = 0
+            maximum_active = 0
+            active_lock = threading.Lock()
+
+            def respond(request: Any) -> dict[str, object]:
+                nonlocal active, maximum_active
+                with active_lock:
+                    active += 1
+                    maximum_active = max(maximum_active, active)
+                try:
+                    rendezvous.wait(timeout=5)
+                    return _candidate(int(request.metadata.get("round", 1)))
+                finally:
+                    with active_lock:
+                        active -= 1
+
+            controller.model_gateway = FakeGateway(respond)
+            summaries = controller.run()
+
+            self.assertEqual(maximum_active, 2)
+            self.assertEqual(tuple(item.task_id for item in summaries), tasks)
+            self.assertTrue(all(item.status == "passed" for item in summaries))
 
     def test_hidden_benchmark_failure_is_terminal_failure(self) -> None:
         public = StageResult.success(

@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 from ascend_kernel_lab.domain import EvaluationStage
-from ascend_kernel_lab.evaluation.benchmark import weighted_geometric_mean
 from ascend_kernel_lab.evaluation.source_guard import (
     SourceGuard,
     candidate_kernel_pattern,
@@ -669,89 +668,7 @@ class AscendTritonBackend(Backend):
             timeout_seconds=self.benchmark_timeout_seconds,
             settings=settings,
         )
-        return self._attach_strong_baselines(result, baseline_snapshot)
-
-    @staticmethod
-    def _attach_strong_baselines(
-        result: StageResult,
-        baseline_snapshot: Mapping[str, Any] | None,
-    ) -> StageResult:
-        """Attach B1/B2 comparisons without putting snapshots in candidate cwd."""
-
-        if not result.passed or not baseline_snapshot:
-            return result
-        measured = result.details.get("per_case")
-        reference = baseline_snapshot.get("per_case")
-        if not isinstance(measured, Sequence) or isinstance(measured, (str, bytes)):
-            return result
-        if not isinstance(reference, Sequence) or isinstance(reference, (str, bytes)):
-            return result
-        by_id = {
-            str(item.get("case_id")): item
-            for item in reference
-            if isinstance(item, Mapping) and item.get("case_id") is not None
-        }
-        enriched: list[dict[str, Any]] = []
-        for raw in measured:
-            if not isinstance(raw, Mapping):
-                return result
-            item = dict(raw)
-            stats = item.get("candidate")
-            candidate_us: float | None = None
-            if isinstance(stats, Mapping):
-                try:
-                    raw_median = stats.get("median_us")
-                    if raw_median is not None:
-                        value = float(raw_median)
-                        candidate_us = (
-                            value if math.isfinite(value) and value > 0 else None
-                        )
-                except (TypeError, ValueError):
-                    candidate_us = None
-            baseline = by_id.get(str(item.get("case_id")))
-            for label, source_key in (
-                ("compile", "torch_compile_us"),
-                ("official", "official_us"),
-            ):
-                latency: float | None = None
-                if baseline is not None and baseline.get(source_key) is not None:
-                    try:
-                        parsed = float(baseline[source_key])
-                        latency = parsed if math.isfinite(parsed) and parsed > 0 else None
-                    except (TypeError, ValueError):
-                        latency = None
-                item[source_key] = latency
-                item[f"speedup_vs_{label}"] = (
-                    latency / candidate_us
-                    if latency is not None and candidate_us is not None
-                    else None
-                )
-            enriched.append(item)
-
-        details = dict(result.details)
-        details["per_case"] = enriched
-        details["baseline_identity_sha256"] = baseline_snapshot.get("identity_sha256")
-        for label in ("compile", "official"):
-            key = f"speedup_vs_{label}"
-            valid = [item for item in enriched if item.get(key) is not None]
-            speeds = [float(item[key]) for item in valid]
-            weights = [float(item.get("weight", 1.0)) for item in valid]
-            details[f"geomean_{key}"] = (
-                weighted_geometric_mean(speeds, weights) if speeds else None
-            )
-            details[f"minimum_{key}"] = min(speeds) if speeds else None
-            details[f"maximum_{key}"] = max(speeds) if speeds else None
-            details[f"{label}_comparison_case_count"] = len(speeds)
-        return StageResult(
-            stage=result.stage,
-            status=result.status,
-            started_at=result.started_at,
-            finished_at=result.finished_at,
-            details=details,
-            artifacts=result.artifacts,
-            error=result.error,
-            retryable=result.retryable,
-        )
+        return result
 
     @staticmethod
     def _kernel_names(candidate_path: Path) -> tuple[str, ...]:
@@ -856,6 +773,18 @@ class AscendTritonBackend(Backend):
                 case.id.startswith("hidden_") for case in cases
             )
             settings = dict(self.profile_settings)
+            profile_mode = str(settings.get("mode", "quick"))
+            if profile_mode not in {"quick", "full"}:
+                raise ValueError("profile mode must be quick or full")
+            profile_warmup = int(settings.get("warmup", 1 if profile_mode == "quick" else 5))
+            profile_iterations = int(
+                settings.get("iterations", 1 if profile_mode == "quick" else 10)
+            )
+            if profile_warmup < 1 or profile_iterations < 1:
+                raise ValueError("profile warmup and iterations must be positive")
+            settings["mode"] = profile_mode
+            settings["warmup"] = profile_warmup
+            settings["iterations"] = profile_iterations
             raw_mandatory = settings.get(
                 "mandatory_groups", ("task_time", "pipe_utilization")
             )
@@ -874,7 +803,11 @@ class AscendTritonBackend(Backend):
             mandatory_groups = tuple(raw_mandatory)
             optional_groups = tuple(raw_optional)
             requested_groups = mandatory_groups
-            if private_cases and bool(settings.get("full_profile_for_final_best", True)):
+            if (
+                profile_mode == "full"
+                and private_cases
+                and bool(settings.get("full_profile_for_final_best", False))
+            ):
                 requested_groups = tuple(
                     dict.fromkeys((*mandatory_groups, *optional_groups))
                 )
@@ -989,6 +922,10 @@ class AscendTritonBackend(Backend):
                 )
             summary = MsprofParser(kernel_patterns).parse(raw_root)
             summary_dict = summary.to_dict()
+            summary_dict["profile_mode"] = profile_mode
+            summary_dict["collection_warmup"] = profile_warmup
+            summary_dict["collection_iterations"] = profile_iterations
+            summary_dict["collection_duration_seconds"] = run.duration_seconds
             missing_groups = self._missing_profile_groups(
                 summary_dict, mandatory_groups
             )
@@ -1001,9 +938,11 @@ class AscendTritonBackend(Backend):
             )
             details = {
                 "profile_available": summary.profile_available and not missing_groups,
+                "profile_mode": profile_mode,
                 "summary": summary_dict,
                 "driver": dict(isolated.get("details", {})),
                 "returncode": run.returncode,
+                "collection_duration_seconds": run.duration_seconds,
                 "mandatory_groups": list(mandatory_groups),
                 "requested_groups": list(requested_groups),
                 "missing_mandatory_groups": list(missing_groups),
@@ -1062,11 +1001,11 @@ class AscendTritonBackend(Backend):
         cases: Sequence[CaseSpec],
         artifact_dir: Path,
     ) -> Mapping[str, Any]:
-        """Measure B0 eagerly and opportunistically measure B1/B2.
+        """Measure the only configured comparison baseline: PyTorch eager.
 
-        B0 failure is an infrastructure failure and raises, because a baseline
-        snapshot without eager latency cannot be consumed safely. B1/B2 absence
-        is encoded per the baseline protocol and never guessed.
+        A missing eager latency is an infrastructure failure because no
+        candidate comparison can be computed without it.  torch.compile and
+        task-specific "official" implementations are intentionally not run.
         """
 
         started = datetime.now(timezone.utc)

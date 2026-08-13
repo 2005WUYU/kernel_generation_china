@@ -93,6 +93,17 @@ class ControllerIntegrationTests(unittest.TestCase):
             self.assertEqual(summaries[0].status, "passed")
             self.assertEqual(summaries[0].best_round, 2)
             self.assertEqual(len(gateway.requests), 3)
+            follow_up = json.loads(gateway.requests[1].user_prompt)
+            self.assertIn("last_candidate_code", follow_up["round_context"])
+            self.assertNotIn("environment", follow_up)
+            self.assertNotIn("baseline", follow_up)
+            self.assertNotIn("best_candidate", follow_up["round_context"])
+            self.assertNotIn("last_evaluation", follow_up["round_context"])
+            self.assertNotIn("task_contract", follow_up)
+            self.assertNotIn("collection_strategy", follow_up)
+            self.assertNotIn("objective", follow_up)
+            self.assertNotIn("history_summary", follow_up["round_context"])
+            self.assertNotIn("measurement_attempts", gateway.requests[1].user_prompt)
             for round_number in range(1, 4):
                 round_record = store.get_round(
                     controller.experiment_id, "k01_vector_add", round_number

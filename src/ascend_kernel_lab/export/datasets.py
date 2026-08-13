@@ -160,7 +160,9 @@ class DatasetExporter:
             sample_type = self._quality_type(item, previous)
             by_task[item.task_id] = item
             if sample_type is None:
-                continue
+                if main_only:
+                    continue
+                sample_type = "cold_start_trajectory"
             final = _read_json(
                 self.root / "tasks" / item.task_id / "final_result.json", {}
             )
@@ -230,6 +232,7 @@ class DatasetExporter:
             "observation": item.prompt,
             "action": {"raw_model_response": item.response, "candidate_code": item.code},
             "result": item.evaluation,
+            "feedback": item.feedback,
             "reward_vector": item.reward,
             "done": item.round_id == task_last[item.task_id],
             "selected_as_best": item.round_id == task_best.get(item.task_id),

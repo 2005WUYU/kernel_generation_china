@@ -1,0 +1,108 @@
+experiment:
+  id: exp_910c_deepseek_v4_pro_cold_sft_v1
+  rounds_per_task: 5
+  task_concurrency: 10
+  tasks:
+    - k01_vector_add
+    - k02_bias_gelu
+    - k03_swiglu
+    - k04_transpose
+    - k05_row_softmax
+    - k06_rmsnorm
+    - k07_layernorm
+    - k08_rope
+    - k09_gemm
+    - k10_gemm_bias_gelu
+
+model:
+  provider: claude_cli
+  model: deepseek-v4-pro
+  reasoning_effort: high
+  structured_output: true
+  request_timeout_seconds: 1800
+  claude_capability_timeout_seconds: 15
+  maximum_request_bytes: 4194304
+  maximum_response_bytes: 4194304
+  maximum_error_bytes: 65536
+  maximum_format_repair_retries: 1
+  claude_executable: claude
+  claude_extra_args: []
+  anthropic_base_url_env: ANTHROPIC_BASE_URL
+  anthropic_auth_token_env: ANTHROPIC_AUTH_TOKEN
+  anthropic_model_env: ANTHROPIC_MODEL
+  retry:
+    maximum_attempts: 4
+    initial_backoff_seconds: 1
+    maximum_backoff_seconds: 20
+    maximum_retry_after_seconds: 120
+    multiplier: 2
+    jitter_fraction: 0.1
+
+worker:
+  device: npu:0
+  exclusive_device: true
+  fresh_process_per_stage: true
+  heartbeat_seconds: 10
+  lease_seconds: 120
+  poll_seconds: 1
+  maximum_job_attempts: 3
+
+timeouts:
+  source_check_seconds: 10
+  compile_seconds: 180
+  correctness_case_seconds: 30
+  benchmark_seconds: 300
+  profile_seconds: 180
+
+benchmark:
+  comparison_baseline: pytorch_eager
+  warmup: 20
+  measurement_batches: 7
+  target_batch_time_ms: 200
+  maximum_cv: 0.05
+  rerun_if_unstable: true
+
+profile:
+  mode: quick
+  run_after_correctness: true
+  run_for_final_best: true
+  warmup: 1
+  iterations: 1
+  mandatory_groups:
+    - task_time
+    - pipe_utilization
+  optional_groups: []
+  full_profile_for_final_best: false
+
+storage:
+  database: sqlite:///runs/metadata.db
+  artifact_root: runs
+  task_root: task_specs
+
+security:
+  allowed_import_roots:
+    - torch
+    - triton
+  forbidden_import_roots:
+    - ctypes
+    - http
+    - multiprocessing
+    - os
+    - pathlib
+    - requests
+    - shutil
+    - socket
+    - subprocess
+    - urllib
+  forbidden_call_prefixes:
+    - torch.matmul
+    - torch.mm
+    - torch.bmm
+    - torch.softmax
+    - torch.sum
+    - torch.nn
+    - torch.nn.functional
+    - torch.compile
+    - torch.ops
+  maximum_source_bytes: 262144
+  required_entrypoint: custom_op

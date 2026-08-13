@@ -173,19 +173,31 @@ class PromptTests(unittest.TestCase):
         self.assertNotIn("DO_NOT_LEAK", first.user_prompt)
         payload = json.loads(first.user_prompt)
         self.assertEqual(payload["round_context"]["round"], 1)
+        self.assertTrue(payload["collection_strategy"]["cold_start_sft"])
+        self.assertIsNone(payload["collection_strategy"]["target_speedup"])
         followup = builder.build_follow_up(
-            task={"task_id": "k01"},
-            environment={},
-            baseline={},
             round_number=2,
             maximum_rounds=5,
-            best_candidate=candidate(),
-            last_candidate=candidate(),
-            last_evaluation={"hidden_correctness": "DO_NOT_LEAK", "compile": {"status": "pass"}},
-            history_summary=[],
+            last_candidate_code="def custom_op(x):\n    return x\n",
+            key_metrics={
+                "benchmark_vs_pytorch_eager": {"geomean": 0.8},
+                "hidden_correctness": "DO_NOT_LEAK",
+            },
+            failure_reasons=["benchmark_failed"],
+            next_round_suggestions=["try a different block size"],
         )
+        followup_payload = json.loads(followup.user_prompt)
         self.assertNotIn("DO_NOT_LEAK", followup.user_prompt)
-        self.assertIn("last_evaluation", followup.user_prompt)
+        self.assertEqual(
+            followup_payload["round_context"]["last_candidate_code"],
+            "def custom_op(x):\n    return x\n",
+        )
+        self.assertNotIn("environment", followup_payload)
+        self.assertNotIn("baseline", followup_payload)
+        self.assertNotIn("task_contract", followup_payload)
+        self.assertNotIn("history_summary", followup_payload["round_context"])
+        self.assertNotIn("best_candidate", followup.user_prompt)
+        self.assertNotIn("last_evaluation", followup.user_prompt)
 
 
 class ProviderSafetyTests(unittest.TestCase):

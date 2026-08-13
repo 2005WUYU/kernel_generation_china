@@ -29,6 +29,19 @@ SYSTEM_PROMPT = """你负责生成可在华为昇腾 Triton-Ascend 环境运行�
 12. custom_op 不得调用自定义 Python 辅助函数; host 侧的 shape、grid 和 launch 参数选择逻辑必须直接内联在 custom_op 中。
 """
 
+def _cold_start_sft_strategy(maximum_rounds: int) -> dict[str, Any]:
+    return {
+        "purpose": "cold_start_sft",
+        "cold_start_sft": True,
+        "round_count": maximum_rounds,
+        "target_speedup": None,
+        "comparison_baseline": "pytorch_eager",
+        "policy": (
+            f"采集正确、可追溯的 {maximum_rounds} 轮迭代轨迹; "
+            "不设定硬性加速比门槛"
+        ),
+    }
+
 _SENSITIVE_EXACT = {
     "api_key", "auth_token", "authorization", "credential", "credentials",
     "hidden", "hidden_case", "hidden_cases", "hidden_input", "hidden_inputs",
@@ -120,6 +133,7 @@ class PromptBuilder:
             raise ValueError("maximum_rounds must be at least one")
         payload = {
             "protocol_version": self.protocol_version,
+            "collection_strategy": _cold_start_sft_strategy(maximum_rounds),
             "task": task,
             "environment": environment,
             "baseline": baseline,
@@ -131,8 +145,8 @@ class PromptBuilder:
             },
             "objective": objective or {
                 "first": "保证所有公开用例正确",
-                "second": "降低多 shape 的总体延迟",
-                "third": "避免只针对单一 shape 优化",
+                "second": "与 PyTorch eager baseline 对比并记录可学习的修改与效果",
+                "third": "完成五轮迭代; 不要为达到特定加速比牺牲正确性",
             },
         }
         return ModelRequest(
@@ -146,16 +160,12 @@ class PromptBuilder:
     def build_follow_up(
         self,
         *,
-        task: Mapping[str, Any],
-        environment: Mapping[str, Any],
-        baseline: Mapping[str, Any],
         round_number: int,
         maximum_rounds: int,
-        best_candidate: Mapping[str, Any] | None,
-        last_candidate: Mapping[str, Any],
-        last_evaluation: Mapping[str, Any],
-        history_summary: Sequence[Mapping[str, Any]],
-        objective: Mapping[str, Any] | None = None,
+        last_candidate_code: str,
+        key_metrics: Mapping[str, Any],
+        failure_reasons: Sequence[str],
+        next_round_suggestions: Sequence[str],
         model: str | None = None,
         timeout_seconds: float | None = None,
     ) -> ModelRequest:
@@ -163,21 +173,13 @@ class PromptBuilder:
             raise ValueError("follow-up round must be between 2 and maximum_rounds")
         payload = {
             "protocol_version": self.protocol_version,
-            "task": task,
-            "environment": environment,
-            "baseline": baseline,
             "round_context": {
                 "round": round_number,
                 "maximum_rounds": maximum_rounds,
-                "best_candidate": best_candidate,
-                "last_candidate": last_candidate,
-                "last_evaluation": last_evaluation,
-                "history_summary": history_summary,
-            },
-            "objective": objective or {
-                "first": "保持所有公开用例正确",
-                "second": "依据本轮结构化证据提高最差 shape 与几何平均加速比",
-                "third": "保持稳定且避免高层算子回退",
+                "last_candidate_code": last_candidate_code,
+                "key_metrics": key_metrics,
+                "failure_reasons": list(failure_reasons),
+                "next_round_suggestions": list(next_round_suggestions),
             },
         }
         return ModelRequest(

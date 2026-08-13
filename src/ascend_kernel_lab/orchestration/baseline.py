@@ -84,7 +84,6 @@ class BaselineManager:
             raise ValueError("baseline backend must return a per_case list")
         eager_values: list[float] = []
         weights: list[float] = []
-        torch_compile_successes = 0
         for case in cases:
             if not isinstance(case, Mapping) or case.get("pytorch_eager_us") is None:
                 raise ValueError("B0 PyTorch eager latency is mandatory for every case")
@@ -93,24 +92,18 @@ class BaselineManager:
                 raise ValueError("baseline latencies must be finite and positive")
             eager_values.append(eager)
             weights.append(float(case.get("weight", 1.0)))
-            if case.get("torch_compile_us") is not None:
-                torch_compile_successes += 1
-        if torch_compile_successes == len(cases):
-            torch_compile_status = "complete"
-        elif torch_compile_successes:
-            torch_compile_status = "partial"
-        else:
-            torch_compile_status = "failed"
-        official_status = (
-            "complete"
-            if measured.get("official_available", False)
-            else str(measured.get("official_status", "unavailable"))
+        comparison_baseline = str(
+            measured.get("comparison_baseline", "pytorch_eager")
         )
+        if comparison_baseline != "pytorch_eager":
+            raise ValueError("baseline backend must compare against PyTorch eager")
         return {
             "schema_version": "ascend_baseline_snapshot_v1",
-            "status": (
-                "complete" if torch_compile_status == "complete" else "partial"
-            ),
+            "status": "complete",
+            "mode": "pytorch_eager_only",
+            "comparison_baseline": comparison_baseline,
+            "compared_baselines": [comparison_baseline],
+            "not_measured_baselines": ["torch_compile", "official"],
             "identity_sha256": identity,
             "task_id": task.id,
             "task_spec_sha256": task.digest(),
@@ -122,12 +115,4 @@ class BaselineManager:
                 if eager_values
                 else None
             ),
-            "torch_compile_status": torch_compile_status,
-            "torch_compile_successful_case_count": torch_compile_successes,
-            "torch_compile_total_case_count": len(cases),
-            "torch_compile_available": torch_compile_status == "complete",
-            "torch_compile_partial": torch_compile_status == "partial",
-            "official_status": official_status,
-            "official_available": measured.get("official_available", False),
-            "unavailable_reasons": measured.get("unavailable_reasons", {}),
         }

@@ -1033,7 +1033,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     baseline = commands.add_parser(
         "baseline",
-        help="measure required B0 and probe optional B1/B2 baselines",
+        help="measure the PyTorch eager comparison baseline",
     )
     baseline_commands = baseline.add_subparsers(dest="baseline_command", required=True)
     baseline_run = baseline_commands.add_parser("run", help="measure and atomically snapshot baselines")
@@ -1044,7 +1044,7 @@ def build_parser() -> argparse.ArgumentParser:
     baseline_run.add_argument(
         "--require-complete",
         action="store_true",
-        help="return nonzero when any optional torch.compile baseline is incomplete",
+        help="return nonzero unless the eager-only baseline is complete",
     )
     baseline_run.set_defaults(handler=_cmd_baseline_run)
 

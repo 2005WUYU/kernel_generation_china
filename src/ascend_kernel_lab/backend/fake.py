@@ -185,14 +185,12 @@ class FakeBackend(Backend):
                     "case_id": case.id,
                     "weight": case.weight,
                     "pytorch_eager_us": 12.0,
-                    "torch_compile_us": 10.0,
-                    "official_us": None,
                 }
                 for case in cases
             ],
-            "torch_compile_available": True,
-            "official_available": False,
-            "unavailable_reasons": {
-                "official": "fake backend has no official operator baseline"
-            },
+            "status": "complete",
+            "mode": "pytorch_eager_only",
+            "comparison_baseline": "pytorch_eager",
+            "compared_baselines": ["pytorch_eager"],
+            "not_measured_baselines": ["torch_compile", "official"],
         }

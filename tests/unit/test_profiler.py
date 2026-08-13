@@ -31,6 +31,12 @@ class MsprofParserTests(unittest.TestCase):
             summary = parser.parse(temporary)
         self.assertEqual(summary.kernel_count, 2)
         self.assertAlmostEqual(summary.scheduling["device_execution_us"] or 0, 30.0)
+        self.assertAlmostEqual(
+            summary.scheduling["candidate_device_execution_us"] or 0, 30.0
+        )
+        self.assertAlmostEqual(
+            summary.scheduling["total_device_execution_us"] or 0, 31.0
+        )
         self.assertAlmostEqual(summary.candidate_kernel_coverage or 0, 30 / 31)
 
     def test_mixed_csv_schemas_are_normalized_per_file(self) -> None:

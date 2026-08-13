@@ -1,7 +1,11 @@
 # Standalone documented profile policy. The experiment file embeds the same
 # values so that every committed run is fully reproducible from one manifest.
 profile:
+  mode: quick
   run_after_correctness: true
+  run_for_final_best: true
+  warmup: 1
+  iterations: 1
   mandatory_groups:
     - task_time
     - pipe_utilization
@@ -9,4 +13,4 @@ profile:
     - memory
     - l2_cache
     - resource_conflict
-  full_profile_for_final_best: true
+  full_profile_for_final_best: false

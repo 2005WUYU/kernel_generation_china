@@ -14,15 +14,36 @@ from ascend_kernel_lab.config import (
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "configs" / "experiment_910c_kimi_k3.yaml"
+DEEPSEEK_CONFIG = ROOT / "configs" / "experiment_910c_deepseek_v4_pro.yaml"
 
 
 class ConfigTests(unittest.TestCase):
+    def test_deepseek_cold_sft_config_uses_ten_model_tasks_and_eight_card_queue(self) -> None:
+        config = load_config(DEEPSEEK_CONFIG)
+
+        self.assertEqual(config.model.provider, "claude_cli")
+        self.assertEqual(config.model.model, "deepseek-v4-pro")
+        self.assertEqual(config.rounds_per_task, 5)
+        self.assertEqual(config.task_concurrency, 10)
+        self.assertEqual(len(config.tasks), 10)
+        self.assertEqual(config.benchmark.comparison_baseline, "pytorch_eager")
+        self.assertEqual(config.profile.mode, "quick")
+        self.assertEqual((config.profile.warmup, config.profile.iterations), (1, 1))
+        self.assertEqual(config.profile.optional_groups, ())
+        self.assertTrue(config.profile.run_for_final_best)
+        self.assertFalse(config.profile.full_profile_for_final_best)
+
     def test_loads_full_config_and_resolves_paths(self) -> None:
         config = load_config(CONFIG)
         self.assertEqual(config.id, "exp_910c_kimi_k3_v1")
         self.assertEqual(config.model.provider, "claude_cli")
         self.assertEqual(config.model.api_attempts, 4)
         self.assertEqual(config.model.maximum_response_bytes, 4_194_304)
+        self.assertEqual(config.benchmark.comparison_baseline, "pytorch_eager")
+        self.assertEqual(config.profile.mode, "quick")
+        self.assertEqual(config.profile.warmup, 1)
+        self.assertEqual(config.profile.iterations, 1)
+        self.assertTrue(config.profile.run_for_final_best)
         self.assertEqual(config.artifact_root, ROOT / "runs")
         self.assertEqual(config.task_root, ROOT / "task_specs")
         self.assertEqual(config.db_path, ROOT / "runs" / "metadata.db")

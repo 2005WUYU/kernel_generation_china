@@ -57,18 +57,6 @@ class ReportExporter:
                     "minimum_speedup_vs_eager": benchmark.get(
                         "minimum_speedup_vs_eager"
                     ),
-                    "geomean_speedup_vs_compile": benchmark.get(
-                        "geomean_speedup_vs_compile"
-                    ),
-                    "minimum_speedup_vs_compile": benchmark.get(
-                        "minimum_speedup_vs_compile"
-                    ),
-                    "geomean_speedup_vs_official": benchmark.get(
-                        "geomean_speedup_vs_official"
-                    ),
-                    "minimum_speedup_vs_official": benchmark.get(
-                        "minimum_speedup_vs_official"
-                    ),
                     "candidate_kernel_coverage": score.get(
                         "candidate_kernel_coverage"
                     ),
@@ -108,8 +96,8 @@ class ReportExporter:
                 "",
                 f"Passed tasks: {report['passed_task_count']} / {report['task_count']}",
                 "",
-                "| Task | Status | Best round | vs eager | vs compile | vs official | Coverage |",
-                "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+                "| Task | Status | Best round | vs PyTorch eager | Coverage |",
+                "| --- | --- | ---: | ---: | ---: |",
             ]
             for task in report["tasks"]:
                 public_best = task.get("public_best", {})
@@ -117,8 +105,6 @@ class ReportExporter:
                     f"| {task['task_id']} | {task.get('status', 'unknown')} | "
                     f"{task.get('best_round', '-')} | "
                     f"{public_best.get('geomean_speedup_vs_eager', '-')} | "
-                    f"{public_best.get('geomean_speedup_vs_compile', '-')} | "
-                    f"{public_best.get('geomean_speedup_vs_official', '-')} | "
                     f"{public_best.get('candidate_kernel_coverage', '-')} |"
                 )
             self._atomic(Path(markdown_path), "\n".join(lines) + "\n")

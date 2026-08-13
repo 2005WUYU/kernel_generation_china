@@ -115,7 +115,7 @@ def _run_source(source: str, *args: Any) -> Any:
 
 def run_feature(feature: str) -> dict[str, Any]:
     if feature in {"vector_add", "masked_load_store", "fp16", "bfloat16", "fp32", "multiple_kernels"}:
-        import torch
+        import torch  # type: ignore[import-not-found]
 
         dtype = {"bfloat16": torch.bfloat16, "fp32": torch.float32}.get(feature, torch.float16)
         n = 1003 if feature == "masked_load_store" else 1024
