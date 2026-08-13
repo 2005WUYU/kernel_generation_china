@@ -106,14 +106,6 @@ class KernelRecord:
 
 
 @dataclass(frozen=True)
-class Observation:
-    type: str
-    confidence: float
-    evidence: Mapping[str, Any]
-    suggestion: str
-
-
-@dataclass(frozen=True)
 class ProfileSummary:
     profile_available: bool
     executed_candidate_kernels: tuple[KernelRecord, ...] = ()
@@ -122,7 +114,6 @@ class ProfileSummary:
     pipeline: Mapping[str, float | None] = field(default_factory=dict)
     memory: Mapping[str, float | None] = field(default_factory=dict)
     scheduling: Mapping[str, float | None] = field(default_factory=dict)
-    observations: tuple[Observation, ...] = ()
     # source_files are schema-usable operation tables. readable_source_files
     # also includes CSVs that could be decoded but did not expose the required
     # kernel-name and duration columns.
@@ -312,7 +303,6 @@ class MsprofParser:
                 total_device_us if normalized_rows else None
             ),
         }
-        observations = self._observations(records, pipeline, coverage)
         return ProfileSummary(
             profile_available=True,
             executed_candidate_kernels=tuple(records),
@@ -321,38 +311,6 @@ class MsprofParser:
             pipeline=pipeline,
             memory=memory,
             scheduling=scheduling,
-            observations=observations,
             source_files=tuple(usable),
             readable_source_files=tuple(readable),
         )
-
-    @staticmethod
-    def _observations(
-        records: Sequence[KernelRecord],
-        pipeline: Mapping[str, float | None],
-        coverage: float | None,
-    ) -> tuple[Observation, ...]:
-        observations: list[Observation] = []
-        scalar = pipeline.get("scalar_ratio")
-        if scalar is not None and scalar >= 0.15:
-            observations.append(Observation(
-                type="scalar_operations_high",
-                confidence=min(0.98, 0.65 + scalar),
-                evidence={"scalar_ratio": scalar},
-                suggestion="Inspect index arithmetic and comparisons for scalar fallback.",
-            ))
-        if len(records) >= 4:
-            observations.append(Observation(
-                type="many_candidate_kernels",
-                confidence=0.8,
-                evidence={"kernel_count": len(records)},
-                suggestion="Consider fusing short kernels to reduce launch and intermediate-memory overhead.",
-            ))
-        if coverage is not None and coverage < 0.9:
-            observations.append(Observation(
-                type="candidate_coverage_low",
-                confidence=0.95,
-                evidence={"candidate_kernel_coverage": coverage},
-                suggestion="Remove high-level operator fallback; candidate Triton kernels must own the computation.",
-            ))
-        return tuple(observations)

@@ -421,14 +421,6 @@ class ExperimentController:
         return repair, optimization
 
     def _trajectory_termination_reason(self, task: TaskSpec) -> str:
-        _repair_rounds, optimization_rounds = self._trajectory_counts(task)
-        if optimization_rounds >= self.config.rounds_per_task:
-            return "optimization_round_budget_completed"
-        task_record = self.store.get_task(self.experiment_id, task.id)
-        if task_record is None or task_record.current_round < 1:
-            return "optimization_round_budget_completed"
-        if self._optimization_stop_recommended(task, task_record.current_round):
-            return "host_dispatch_limited"
         return "optimization_round_budget_completed"
 
     def _round_evaluation(
@@ -446,54 +438,6 @@ class ExperimentController:
         return all(
             _passed_stage(evaluation.get(stage))
             for stage in ("source", "compile", "correctness")
-        )
-
-    def _optimization_stop_recommended(
-        self, task: TaskSpec, round_number: int
-    ) -> bool:
-        evaluation = self._round_evaluation(task, round_number)
-        feedback_path = self._artifact_path(task.id, round_number, "feedback.json")
-        feedback = _read_json(feedback_path) if feedback_path.is_file() else {}
-        if feedback.get("stop_recommended") is not True:
-            return False
-        # A host-bound observation may terminate optimization only when it is
-        # the committed BEST.  A slower branch can be host-bound while the
-        # incumbent still has useful device-side optimization headroom.
-        best_after = feedback.get("best_after")
-        if (
-            not isinstance(best_after, Mapping)
-            or best_after.get("round") != round_number
-            or feedback.get("performance_decision")
-            not in {"INITIAL_BEST", "NEW_BEST"}
-        ):
-            return False
-        benchmark = evaluation.get("benchmark")
-        if not isinstance(benchmark, Mapping):
-            return False
-        score = evaluation.get("score")
-        if not isinstance(score, Mapping) or not all(
-            score.get(key) is True
-            for key in (
-                "compile_passed",
-                "correctness_passed",
-                "anti_bypass_passed",
-            )
-        ):
-            return False
-        if (
-            score.get("geomean_speedup") is None
-            or score.get("minimum_speedup") is None
-            or not _passed_stage(benchmark)
-            or str(benchmark.get("status", "")).lower() not in {"pass", "stable"}
-        ):
-            return False
-        bottleneck = benchmark.get("bottleneck")
-        return bool(
-            benchmark.get("host_dispatch_limited") is True
-            or (
-                isinstance(bottleneck, Mapping)
-                and bottleneck.get("host_dispatch_limited") is True
-            )
         )
 
     def _finish_repair_exhausted(
@@ -611,7 +555,6 @@ class ExperimentController:
                             "end_to_end_latency_us"
                         ),
                         "host_overhead_us": value.get("host_overhead_us"),
-                        "bottleneck_type": value.get("bottleneck_type"),
                     })
             benchmark_summary = {
                 **(stage_status("benchmark") or {}),
@@ -622,11 +565,6 @@ class ExperimentController:
                     "minimum_speedup_vs_eager"
                 ),
                 "maximum_cv": benchmark.get("maximum_cv"),
-                "bottleneck": benchmark.get("bottleneck"),
-                "bottleneck_type": benchmark.get("bottleneck_type"),
-                "host_dispatch_limited": benchmark.get(
-                    "host_dispatch_limited"
-                ),
                 "cases": cases,
             }
 
@@ -665,10 +603,6 @@ class ExperimentController:
                 "memory": {
                     str(key): value for key, value in list(memory.items())[:4]
                 },
-                "observations": list(summary.get("observations", []))[:3]
-                if isinstance(summary.get("observations"), Sequence)
-                and not isinstance(summary.get("observations"), (str, bytes))
-                else [],
             }
 
         return {
@@ -1023,7 +957,6 @@ class ExperimentController:
                     "minimum_speedup_vs_pytorch_eager": benchmark.get(
                         "minimum_speedup_vs_eager"
                     ),
-                    "bottleneck_type": benchmark.get("bottleneck_type"),
                 }
             )
         # The durable artifacts retain every branch.  The model only needs a

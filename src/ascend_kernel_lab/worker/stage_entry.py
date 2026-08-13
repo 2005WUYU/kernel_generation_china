@@ -23,7 +23,6 @@ from types import ModuleType
 from typing import Any
 
 from ascend_kernel_lab.evaluation.benchmark import (
-    bottleneck_summary,
     speedup_summary,
     summarize_latency_breakdown,
     summarize_samples,
@@ -616,13 +615,9 @@ def _benchmark(
                 "host_overhead_us": candidate_stats["latency_breakdown"][
                     "host_overhead_us"
                 ],
-                "bottleneck_type": candidate_stats["latency_breakdown"][
-                    "bottleneck_type"
-                ],
             }
         )
     summary = speedup_summary(per_case)
-    bottleneck = bottleneck_summary(per_case)
     stable = all(bool(item["stable"]) for item in per_case)
     observed_cvs = [
         max(float(item["candidate"]["cv"]), float(item["baseline_eager"]["cv"]))
@@ -633,9 +628,6 @@ def _benchmark(
         "status": "stable" if stable else "unstable",
         "per_case": per_case,
         "maximum_cv": max(observed_cvs, default=0.0),
-        "bottleneck": bottleneck,
-        "bottleneck_type": bottleneck["bottleneck_type"],
-        "host_dispatch_limited": bottleneck["host_dispatch_limited"],
         **summary,
     }
 
@@ -776,8 +768,6 @@ def _redact_details(stage: str, details: Mapping[str, Any]) -> dict[str, Any]:
             "minimum_speedup_vs_eager": details.get("minimum_speedup_vs_eager"),
             "maximum_speedup_vs_eager": details.get("maximum_speedup_vs_eager"),
             "maximum_cv": details.get("maximum_cv"),
-            "bottleneck_type": details.get("bottleneck_type"),
-            "host_dispatch_limited": details.get("host_dispatch_limited"),
             "measured_case_count": len(details.get("per_case", ())),
             "case_details_redacted": True,
         }

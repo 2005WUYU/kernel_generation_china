@@ -32,11 +32,9 @@ def _benchmark_cases(result: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     return cases
 
 
-def _latency_bottleneck(benchmark: Mapping[str, Any] | None) -> dict[str, Any] | None:
+def _latency_measurements(benchmark: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if benchmark is None:
         return None
-    summary = benchmark.get("bottleneck")
-    compact: dict[str, Any] = dict(summary) if isinstance(summary, Mapping) else {}
     cases: list[dict[str, Any]] = []
     values = benchmark.get("per_case", ())
     if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
@@ -49,17 +47,9 @@ def _latency_bottleneck(benchmark: Mapping[str, Any] | None) -> dict[str, Any] |
                     "device_latency_us": value.get("device_latency_us"),
                     "end_to_end_latency_us": value.get("end_to_end_latency_us"),
                     "host_overhead_us": value.get("host_overhead_us"),
-                    "bottleneck_type": value.get("bottleneck_type"),
                 }
             )
-    if not compact and not cases:
-        return None
-    compact.setdefault("bottleneck_type", benchmark.get("bottleneck_type"))
-    compact.setdefault(
-        "host_dispatch_limited", benchmark.get("host_dispatch_limited", False)
-    )
-    compact["cases"] = cases
-    return compact
+    return {"cases": cases} if cases else None
 
 
 def _score_from_result(result: Mapping[str, Any]) -> CandidateScore | None:
@@ -279,7 +269,7 @@ def build_feedback(
     compile_result = result.get("compile") if isinstance(result.get("compile"), Mapping) else None
     correctness = result.get("correctness") if isinstance(result.get("correctness"), Mapping) else None
     profile = result.get("profile") if isinstance(result.get("profile"), Mapping) else None
-    latency_bottleneck = _latency_bottleneck(benchmark)
+    latency_measurements = _latency_measurements(benchmark)
 
     comparison: dict[str, Any] | None = None
     candidate_score = _score_from_result(result)
@@ -358,14 +348,6 @@ def build_feedback(
         focus.append("保持正确性和现有性能; profiler 当前不可用, 不要猜测硬件指标")
     else:
         if (
-            latency_bottleneck is not None
-            and latency_bottleneck.get("host_dispatch_limited") is True
-        ):
-            focus.append(
-                "瓶颈已判定为 host_dispatch: 端到端延迟主要来自主机发射开销; "
-                "若规则禁止修改 launch path, 不要继续反复调整 kernel body 的 BLOCK 或 grid"
-            )
-        elif (
             benchmark is not None
             and benchmark.get("minimum_speedup_vs_eager") is not None
             and float(benchmark["minimum_speedup_vs_eager"]) < 1.0
@@ -374,24 +356,10 @@ def build_feedback(
                 "参考 PyTorch eager 对比优先改善最慢 shape; "
                 "本次冷启动 SFT 轨迹不设硬性加速比门槛"
             )
-        if profile is not None:
-            observations = profile.get("observations")
-            if isinstance(observations, Sequence):
-                for observation in observations[:3]:
-                    if isinstance(observation, Mapping) and observation.get("suggestion"):
-                        focus.append(str(observation["suggestion"]))
     if consecutive_non_improvements >= 2:
         focus.append("连续两轮未提升, 请采用明显不同的 tiling、grid 或融合方案")
     if not focus:
         focus.append("保持全部公开正确性, 并改善最低 shape 与加权几何平均性能")
-
-    host_dispatch_limited = bool(
-        latency_bottleneck is not None
-        and latency_bottleneck.get("host_dispatch_limited") is True
-    )
-    optimization_action = (
-        "stop_host_bound" if host_dispatch_limited else "continue_optimization"
-    )
 
     performance_decision = (
         decision.decision
@@ -430,15 +398,15 @@ def build_feedback(
         "compile": compile_result,
         "correctness": correctness,
         "benchmark": benchmark,
-        "latency_bottleneck": latency_bottleneck,
+        "latency_measurements": latency_measurements,
         "profile": profile,
         "anti_bypass": result.get("anti_bypass"),
         "comparison_with_best": comparison,
         "candidate_generation_intent": dict(candidate_intent or {}),
         "performance_decision": performance_decision,
         "next_prompt_mode": next_prompt_mode,
-        "optimization_action": optimization_action,
-        "stop_recommended": host_dispatch_limited,
+        "optimization_action": "continue_optimization",
+        "stop_recommended": False,
         "next_round_requirement": {
             "must_keep_correctness": True,
             "must_return_full_code": True,
