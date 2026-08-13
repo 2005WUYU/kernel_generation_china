@@ -543,10 +543,50 @@ class ExperimentController:
         correctness = evaluation.get("correctness")
         correctness_summary: dict[str, Any] | None = None
         if isinstance(correctness, Mapping):
+            failed_cases: list[dict[str, Any]] = []
+            case_results = correctness.get("case_results")
+            diagnostic_fields = (
+                "case_id",
+                "error",
+                "shape_ok",
+                "dtype_ok",
+                "device_ok",
+                "layout_ok",
+                "output_alias_ok",
+                "finite_ok",
+                "inputs_unchanged",
+                "maximum_absolute_error",
+                "maximum_relative_error",
+                "actual_at_maximum_error",
+                "expected_at_maximum_error",
+                "maximum_error_flat_index",
+            )
+            if isinstance(case_results, Sequence) and not isinstance(
+                case_results, (str, bytes)
+            ):
+                for case in case_results:
+                    if not isinstance(case, Mapping) or bool(case.get("passed")):
+                        continue
+                    failed_cases.append(
+                        {
+                            field: case[field]
+                            for field in diagnostic_fields
+                            if field in case
+                        }
+                    )
+                    if len(failed_cases) == 2:
+                        break
             correctness_summary = {
                 **(stage_status("correctness") or {}),
                 "passed_cases": correctness.get("passed_cases"),
                 "total_cases": correctness.get("total_cases"),
+                "maximum_absolute_error": correctness.get(
+                    "maximum_absolute_error"
+                ),
+                "maximum_relative_error": correctness.get(
+                    "maximum_relative_error"
+                ),
+                "failed_cases": failed_cases,
             }
 
         benchmark = evaluation.get("benchmark")
@@ -672,6 +712,51 @@ class ExperimentController:
                             code = finding.get("code", "source_check")
                             message = finding.get("message", "rejected")
                             reasons.append(f"source[{code}]: {message}")
+        if overall == "correctness_failed":
+            correctness_metrics = ExperimentController._follow_up_metrics(
+                evaluation
+            ).get("correctness")
+            if isinstance(correctness_metrics, Mapping):
+                failed_cases = correctness_metrics.get("failed_cases")
+                if isinstance(failed_cases, Sequence) and not isinstance(
+                    failed_cases, (str, bytes)
+                ):
+                    summaries: list[str] = []
+                    for case in failed_cases:
+                        if not isinstance(case, Mapping):
+                            continue
+                        checks = [
+                            name
+                            for name in (
+                                "shape_ok",
+                                "dtype_ok",
+                                "device_ok",
+                                "layout_ok",
+                                "output_alias_ok",
+                                "finite_ok",
+                                "inputs_unchanged",
+                            )
+                            if case.get(name) is False
+                        ]
+                        values = [f"case={case.get('case_id')}"]
+                        if case.get("error") is not None:
+                            values.append(f"error={case['error']}")
+                        if checks:
+                            values.append(f"failed_checks={','.join(checks)}")
+                        for name in (
+                            "maximum_absolute_error",
+                            "maximum_relative_error",
+                            "actual_at_maximum_error",
+                            "expected_at_maximum_error",
+                            "maximum_error_flat_index",
+                        ):
+                            if case.get(name) is not None:
+                                values.append(f"{name}={case[name]}")
+                        summaries.append("; ".join(values))
+                    if summaries:
+                        reasons.append(
+                            "correctness diagnostics: " + " | ".join(summaries)
+                        )
         focus = feedback.get("next_round_requirement")
         if len(reasons) == 1 and isinstance(focus, Mapping):
             suggestions = focus.get("focus")

@@ -30,6 +30,7 @@ SYSTEM_PROMPT = """你负责生成可在华为昇腾 Triton-Ascend 环境运行�
 13. 源码只能 import torch、triton 或 triton.language; host 侧只能分配输出、读取 Tensor 元数据、计算标量 launch 参数并启动候选 Kernel。
 14. 不要在候选源码中实现 cache、warmup、benchmark、计时、异常捕获或任何运行时探测; 这些由评测框架负责。
 15. Triton Kernel 名称必须是至少 8 个字符的具体标识符; custom_op 是普通 Python host wrapper, 不能用 @triton.jit 装饰。
+16. 对每个公开用例, launch grid 的 program 总数(coreDim)必须小于等于 65535; 不要为每个元素或每行盲目启动一个 program, 应通过 BLOCK/tiling 让每个 program 处理多个元素。
 """
 
 
@@ -79,6 +80,10 @@ SOURCE_CHECKER_CONTRACT: dict[str, Any] = {
         "every custom_op control-flow return launches a candidate kernel first",
         "complete standalone Python source, never a patch or Markdown fence",
     ],
+    "runtime_launch_constraints": [
+        "for every public case, the total launch-grid program count/coreDim must be <= 65535",
+        "tile multiple elements or rows per program instead of launching one program per element when the grid can reach 65536",
+    ],
     "legal_structure_template": LEGAL_SOURCE_TEMPLATE,
 }
 
@@ -122,7 +127,9 @@ def _phase_context(
         "maximum_repair_rounds": maximum_repair_rounds,
         "optimization_rounds": optimization_rounds,
         "directive": (
-            "只修复 source/compile/correctness; 保留已正确部分, 不以性能改写掩盖错误"
+            "从 current_candidate 完整源码出发, 保留已通过的阶段; "
+            "优先使用 previous_round 中的编译错误或 failed_cases 精确修复 "
+            "source/compile/correctness, 不做无关性能改写"
             if phase == "repair"
             else "从已正确候选出发做一次可解释的性能修改; 始终保持 source/compile/correctness"
         ),

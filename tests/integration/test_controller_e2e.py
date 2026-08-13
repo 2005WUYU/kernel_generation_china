@@ -271,6 +271,132 @@ class ControllerIntegrationTests(unittest.TestCase):
             ).verify()
             self.assertTrue(verification["passed"], verification["issues"])
 
+    def test_correctness_repair_prompt_contains_only_compact_failed_cases(self) -> None:
+        correctness_failure = StageResult.failure(
+            EvaluationStage.CORRECTNESS,
+            details={
+                "passed": False,
+                "passed_cases": 5,
+                "total_cases": 8,
+                "maximum_absolute_error": 9.0,
+                "maximum_relative_error": 8.0,
+                "case_results": [
+                    {
+                        "case_id": "metadata_failure",
+                        "passed": False,
+                        "error": "output metadata or finiteness check failed",
+                        "shape_ok": False,
+                        "dtype_ok": True,
+                        "device_ok": True,
+                        "layout_ok": True,
+                        "output_alias_ok": True,
+                        "finite_ok": False,
+                        "inputs_unchanged": True,
+                        "maximum_absolute_error": None,
+                        "maximum_relative_error": None,
+                        "unbounded_debug_payload": "must-not-enter-prompt",
+                    },
+                    {
+                        "case_id": "numeric_failure",
+                        "passed": False,
+                        "shape_ok": True,
+                        "dtype_ok": True,
+                        "device_ok": True,
+                        "layout_ok": True,
+                        "output_alias_ok": True,
+                        "finite_ok": True,
+                        "inputs_unchanged": True,
+                        "maximum_absolute_error": 0.5,
+                        "maximum_relative_error": 0.25,
+                        "actual_at_maximum_error": 1.5,
+                        "expected_at_maximum_error": 1.0,
+                        "maximum_error_flat_index": 7,
+                    },
+                    {
+                        "case_id": "third_failure_not_forwarded",
+                        "passed": False,
+                        "maximum_absolute_error": 9.0,
+                        "maximum_relative_error": 8.0,
+                    },
+                ],
+            },
+        )
+        backend = FakeBackend(
+            {EvaluationStage.CORRECTNESS: [correctness_failure]}
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(
+                self._config(root, rounds=1), maximum_repair_rounds=2
+            )
+            gateway = FakeGateway(
+                lambda request: candidate(int(request.metadata["round"]))
+            )
+            store = SQLiteStateStore(config.db_path)
+            controller = ExperimentController(
+                config=config,
+                store=store,
+                artifacts=AtomicArtifactStore(config.artifact_root),
+                registry=TaskRegistry(config.task_root),
+                model_gateway=gateway,
+                backend=backend,
+                environment={},
+                hidden_seed=12345,
+                allow_insecure_hidden_seed_for_testing=True,
+            )
+
+            controller.run()
+
+            follow_up = json.loads(
+                (
+                    controller.experiment_root
+                    / "tasks/k01_vector_add/round_02/prompt.json"
+                ).read_text(encoding="utf-8")
+            )["user_prompt"]["round_context"]["previous_round"]
+            correctness = follow_up["key_metrics"]["correctness"]
+            self.assertEqual(correctness["passed_cases"], 5)
+            self.assertEqual(correctness["total_cases"], 8)
+            self.assertEqual(correctness["maximum_absolute_error"], 9.0)
+            self.assertEqual(correctness["maximum_relative_error"], 8.0)
+            self.assertEqual(
+                [case["case_id"] for case in correctness["failed_cases"]],
+                ["metadata_failure", "numeric_failure"],
+            )
+            self.assertEqual(
+                correctness["failed_cases"][0]["error"],
+                "output metadata or finiteness check failed",
+            )
+            self.assertFalse(correctness["failed_cases"][0]["shape_ok"])
+            self.assertFalse(correctness["failed_cases"][0]["finite_ok"])
+            self.assertEqual(
+                correctness["failed_cases"][1]["maximum_error_flat_index"],
+                7,
+            )
+            self.assertEqual(
+                correctness["failed_cases"][1]["actual_at_maximum_error"],
+                1.5,
+            )
+            self.assertEqual(
+                correctness["failed_cases"][1]["expected_at_maximum_error"],
+                1.0,
+            )
+            rendered = json.dumps(follow_up, ensure_ascii=False)
+            self.assertNotIn("case_results", rendered)
+            self.assertNotIn("unbounded_debug_payload", rendered)
+            self.assertNotIn("third_failure_not_forwarded", rendered)
+            diagnostic_reason = next(
+                reason
+                for reason in follow_up["failure_reasons"]
+                if reason.startswith("correctness diagnostics:")
+            )
+            self.assertIn("metadata_failure", diagnostic_reason)
+            self.assertIn("failed_checks=shape_ok,finite_ok", diagnostic_reason)
+            self.assertIn("numeric_failure", diagnostic_reason)
+            self.assertIn("maximum_absolute_error=0.5", diagnostic_reason)
+            self.assertIn("actual_at_maximum_error=1.5", diagnostic_reason)
+            self.assertIn("expected_at_maximum_error=1.0", diagnostic_reason)
+            self.assertIn("maximum_error_flat_index=7", diagnostic_reason)
+
     def test_repair_exhaustion_finishes_without_optimization(self) -> None:
         backend = FakeBackend(
             {

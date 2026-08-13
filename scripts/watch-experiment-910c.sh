@@ -74,16 +74,20 @@ stage_label = {
     "PROFILE": "PROFILE",
 }
 latest = {}
-maximum_rounds = 5
+optimization_budget = 5
+repair_budget = 0
+maximum_rounds = optimization_budget
 manifest_path = run_root / "experiment.json"
 if manifest_path.is_file():
     try:
         manifest_document = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest = manifest_document.get("experiment", {})
-        optimization_rounds = int(manifest.get("rounds_per_task", 5))
-        repair_rounds = int(manifest.get("maximum_repair_rounds", 0))
-        maximum_rounds = optimization_rounds + repair_rounds
+        optimization_budget = int(manifest.get("rounds_per_task", 5))
+        repair_budget = int(manifest.get("maximum_repair_rounds", 0))
+        maximum_rounds = optimization_budget + repair_budget
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        optimization_budget = 5
+        repair_budget = 0
         maximum_rounds = 5
 
 if database_path.is_file():
@@ -137,7 +141,7 @@ def queue_stage(task_id, round_number):
     error = json_object(raw_error)
     result = json_object(raw_result)
     error_type = str(error.get("type", ""))
-    result_status = str(result.get("status", ""))
+    result_status = str(result.get("status", "")).lower()
     result_error = result.get("error")
     if isinstance(result_error, dict) and not error_type:
         error_type = str(result_error.get("type", ""))
@@ -155,24 +159,40 @@ def queue_stage(task_id, round_number):
     if status == "CANCELLED":
         return f"{label}取消"
     if status == "SUCCEEDED":
-        if result_status in {"error", "unavailable"}:
+        if result_status in {"error", "unavailable", "fail", "failed"} or result.get(
+            "passed"
+        ) is False:
             return f"{label}失败"
         return f"{label}完成"
     return f"{label}:{status}"
 
 
 for task_id in task_ids:
-    fields = [task_id]
     final_path = run_root / "tasks" / task_id / "final_result.json"
     final_rounds = None
+    final_status = None
+    termination_reason = None
+    completed_repairs = 0
+    completed_optimizations = 0
     if final_path.is_file():
         try:
             final_value = json.loads(final_path.read_text(encoding="utf-8"))
-            final_rounds = int(final_value.get("repair_rounds", 0)) + int(
-                final_value.get("optimization_rounds", 0)
-            )
+            final_status = str(final_value.get("status", "-"))
+            termination_reason = str(final_value.get("termination_reason", "-"))
+            completed_repairs = int(final_value.get("repair_rounds", 0))
+            completed_optimizations = int(final_value.get("optimization_rounds", 0))
+            final_rounds = completed_repairs + completed_optimizations
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             final_rounds = None
+    fields = [task_id]
+    if final_rounds is not None:
+        fields.extend(
+            (
+                f"FINAL={final_status}",
+                f"STOP={termination_reason}",
+                f"ROUNDS=REP{completed_repairs}/OPT{completed_optimizations}",
+            )
+        )
     for round_number in range(1, maximum_rounds + 1):
         round_root = (
             run_root / "tasks" / task_id / f"round_{round_number:02d}"
@@ -190,12 +210,27 @@ for task_id in task_ids:
                     phase = f"[{short}{phase_index}]"
             except (OSError, json.JSONDecodeError):
                 pass
+        evaluation_path = round_root / "evaluation_result.json"
         if final_rounds is not None and round_number > final_rounds:
-            stage = "未运行(预算未用或早停)"
-        elif (
-            (round_root / "feedback.json").is_file()
-            or (round_root / "evaluation_result.json").is_file()
-        ):
+            if final_status == "repair_exhausted":
+                stage = "未运行(Repair耗尽/无正确Seed)"
+            elif termination_reason == "host_dispatch_limited":
+                stage = "未运行(Host瓶颈早停)"
+            elif (
+                completed_repairs < repair_budget
+                and completed_optimizations >= optimization_budget
+            ):
+                stage = "空槽(Repair提前通过)"
+            else:
+                stage = "未运行(任务已结束)"
+        elif evaluation_path.is_file():
+            try:
+                evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+                overall_status = str(evaluation.get("overall_status", "unknown"))
+            except (OSError, json.JSONDecodeError):
+                overall_status = "unknown"
+            stage = f"完成[{overall_status}]"
+        elif (round_root / "feedback.json").is_file():
             stage = "完成"
         elif (round_root / "candidate.py").is_file():
             stage = queue_stage(task_id, round_number)
@@ -251,6 +286,9 @@ for task_id in sys.argv[2:]:
 
     print(
         f"{task_id} status={status} "
+        f"termination={show(result.get('termination_reason'))} "
+        f"REP={show(result.get('repair_rounds'))} "
+        f"OPT={show(result.get('optimization_rounds'))} "
         f"best_round={show(result.get('best_round'))} "
         f"hidden_correct={show(result.get('hidden_correctness_passed'))} "
         f"hidden_geo={show(result.get('speedup_geomean'))} "

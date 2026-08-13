@@ -162,6 +162,7 @@ class PromptTests(unittest.TestCase):
         self.assertIn("每一条返回路径都必须先启动候选 Triton Kernel", SYSTEM_PROMPT)
         self.assertIn("包括 n == 0 等提前返回", SYSTEM_PROMPT)
         self.assertIn("不得调用自定义 Python 辅助函数", SYSTEM_PROMPT)
+        self.assertIn("coreDim)必须小于等于 65535", SYSTEM_PROMPT)
 
     def test_first_and_followup_prompts_remove_hidden_content_recursively(self) -> None:
         builder = PromptBuilder()
@@ -224,6 +225,12 @@ class PromptTests(unittest.TestCase):
         payload = json.loads(request.user_prompt)
         self.assertEqual(payload["phase"]["name"], "repair")
         self.assertEqual(payload["phase"]["index"], 3)
+        self.assertIn("failed_cases", payload["phase"]["directive"])
+        self.assertIn("current_candidate", payload["phase"]["directive"])
+        self.assertIn(
+            "coreDim must be <= 65535",
+            payload["source_checker_contract"]["runtime_launch_constraints"][0],
+        )
         self.assertEqual(request.metadata["phase"], "repair")
         self.assertGreater(request.metadata["user_prompt_utf8_bytes"], 0)
         self.assertGreater(request.metadata["system_prompt_utf8_bytes"], 0)
