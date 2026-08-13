@@ -354,7 +354,12 @@ class EnvironmentProber:
             torch = importlib.import_module("torch")
             torch_npu = importlib.import_module("torch_npu")
             triton = importlib.import_module("triton")
-            triton_driver = importlib.import_module("triton.runtime.driver")
+            # Triton exposes the active driver config from the runtime package.
+            # In Triton-Ascend this package attribute is a DriverConfig object,
+            # while importing the same-named submodule with importlib returns
+            # the implementation module (which has no module-level ``active``).
+            triton_runtime = importlib.import_module("triton.runtime")
+            triton_driver = triton_runtime.driver
             device = int(torch.npu.current_device())
             visible_device_count = int(torch.npu.device_count())
             properties = torch.npu.get_device_properties(device)

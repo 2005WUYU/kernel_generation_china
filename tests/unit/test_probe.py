@@ -197,7 +197,7 @@ def run():
                 npu=types.SimpleNamespace(get_soc_version=lambda: 253),
             ),
             "triton": types.SimpleNamespace(__version__="3.5.1"),
-            "triton.runtime.driver": fake_driver,
+            "triton.runtime": types.SimpleNamespace(driver=fake_driver),
         }
         capabilities = {
             "schema_version": "ascend_triton_capabilities_v1",
