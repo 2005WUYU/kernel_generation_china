@@ -30,7 +30,9 @@ WORKER_PREFIX=${AKG_WORKER_CONTAINER_PREFIX:-ascend-kernel-worker}
 WORKER_NAME=${AKG_WORKER_CONTAINER:-$WORKER_PREFIX-${AKG_DEVICE_ID:-0}}
 CONTROLLER_NAME=${AKG_CONTROLLER_CONTAINER:-ascend-kernel-controller}
 DEVICE_ID=${AKG_DEVICE_ID:-0}
-DEVICE_IDS=${AKG_DEVICE_IDS:-0,1,2,3,4,5,6,7}
+# This 910C host exposes two Phy-IDs per physical card.  Select chip 0 from
+# each of the eight cards by default; callers may override occupied chips.
+DEVICE_IDS=${AKG_DEVICE_IDS:-0,2,4,6,8,10,12,14}
 TASK_ID=${AKG_TASK_ID:-}
 EXPERIMENT_ID=${AKG_EXPERIMENT_ID:-}
 CONTROLLER_UID=${AKG_CONTROLLER_UID:-}

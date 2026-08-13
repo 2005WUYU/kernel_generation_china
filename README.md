@@ -233,13 +233,14 @@ akg baseline run -c configs/experiment_910c_deepseek_v4_pro.yaml
 
 ### 4. 启动八个 Worker
 
-容器部署在八卡主机上使用 `AKG_DEVICE_IDS=0,1,2,3,4,5,6,7` 与 `start-workers`；每个
+容器部署在这台双芯片 910C 八卡主机上使用 `AKG_DEVICE_IDS=0,2,4,6,8,10,12,14`
+与 `start-workers`；每个
 Worker 只看到一张物理卡，SQLite durable queue 把十个并发任务自然限流到最多八个 NPU
 阶段同时运行：
 
 ```bash
 export AKG_CONFIG_PATH=configs/experiment_910c_deepseek_v4_pro.yaml
-export AKG_DEVICE_IDS=0,1,2,3,4,5,6,7
+export AKG_DEVICE_IDS=0,2,4,6,8,10,12,14
 ./scripts/run-containers-910c.sh start-workers
 ./scripts/run-containers-910c.sh status
 ```

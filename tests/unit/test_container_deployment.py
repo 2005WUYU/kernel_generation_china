@@ -30,7 +30,7 @@ class ContainerDeploymentContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("exp_910c_deepseek_v4_pro_cold_sft_v1", watcher)
-        self.assertIn("0,1,2,3,4,5,6,7", watcher)
+        self.assertIn("0,2,4,6,8,10,12,14", watcher)
         self.assertIn("round_%02d", watcher)
         self.assertIn("sleep 5", watcher)
         self.assertIn("docker top", watcher)
@@ -100,7 +100,7 @@ class ContainerDeploymentContractTests(unittest.TestCase):
             ";;", 1
         )[0]
         self.assertNotIn('"$CONTROLLER_ENV_FILE"', worker_block)
-        self.assertIn("AKG_DEVICE_IDS:-0,1,2,3,4,5,6,7", runner)
+        self.assertIn("AKG_DEVICE_IDS:-0,2,4,6,8,10,12,14", runner)
         self.assertIn('start_worker_container "$physical_device"', worker_block)
         self.assertIn('ASCEND_VISIBLE_DEVICES=$physical_device', runner)
         self.assertIn('--env DEVICE_ID=0', runner)

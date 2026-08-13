@@ -145,7 +145,7 @@ stat -c '%a %u %g %n' /dev/davinci0 /dev/davinci_manager /dev/devmm_svm
 ```bash
 export AKG_PROJECT_ROOT=/opt/ascend-kernel-lab
 export AKG_CONFIG_PATH=configs/experiment_910c_deepseek_v4_pro.yaml
-export AKG_DEVICE_IDS=0,1,2,3,4,5,6,7
+export AKG_DEVICE_IDS=0,2,4,6,8,10,12,14
 export AKG_CONTROLLER_UID=<controller数字UID>
 export AKG_WORKER_UID=<worker数字UID>
 export AKG_SHARED_GID=<runs共享数字GID>
