@@ -643,6 +643,8 @@ def _baselines(
     compile_errors: list[str] = []
     compile_successes = 0
     compile_api = getattr(torch, "compile", None)
+    compile_unavailable_reason: str | None = None
+    compile_unavailable_case: str | None = None
     for case in cases:
         eager_inputs = generate_inputs(task, case, torch, device).args
 
@@ -661,8 +663,16 @@ def _baselines(
         compiled_us: float | None = None
         compiled_stats: dict[str, Any] | None = None
         compile_error: str | None = None
-        if not callable(compile_api):
+        if compile_unavailable_reason is not None:
+            compile_error = (
+                "not attempted: torch.compile was already found incompatible with "
+                f"this runtime while measuring {compile_unavailable_case}"
+            )
+        elif not callable(compile_api):
             compile_error = "torch.compile is not available in this runtime"
+            compile_unavailable_reason = compile_error
+            compile_unavailable_case = case.id
+            compile_errors.append(f"{case.id}: {compile_error}")
         else:
             compiled_inputs = generate_inputs(task, case, torch, device).args
 
@@ -691,6 +701,14 @@ def _baselines(
                 compile_successes += 1
             except Exception as exc:  # torch.compile backend errors vary by CANN release
                 compile_error = f"{type(exc).__name__}: {exc}"[:4096]
+                if "cannot import name 'triton_key'" in compile_error:
+                    compile_error = (
+                        "BackendCompilerFailed: PyTorch Inductor requires "
+                        "triton.compiler.compiler.triton_key, which this "
+                        "Triton-Ascend runtime does not provide"
+                    )
+                    compile_unavailable_reason = compile_error
+                    compile_unavailable_case = case.id
                 compile_errors.append(f"{case.id}: {compile_error}")
         per_case.append(
             {
@@ -722,10 +740,19 @@ def _baselines(
         )
     return {
         "passed": True,
+        "status": "complete" if compile_successes == len(cases) else "partial",
         "per_case": per_case,
         "torch_compile_available": compile_successes == len(cases),
         "torch_compile_partial": 0 < compile_successes < len(cases),
+        "torch_compile_status": (
+            "complete"
+            if compile_successes == len(cases)
+            else "partial"
+            if compile_successes
+            else "failed"
+        ),
         "official_available": False,
+        "official_status": "not_defined",
         "unavailable_reasons": reasons,
     }
 

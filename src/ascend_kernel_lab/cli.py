@@ -563,20 +563,43 @@ def _cmd_baseline_run(args: argparse.Namespace) -> int:
     for task_id in selected:
         task = registry.load(task_id)
         directory = _baseline_root(config) / task_id
-        snapshot = manager.measure(task, directory / "measurements")
+        try:
+            snapshot = manager.measure(task, directory / "measurements")
+        except (RuntimeError, ValueError) as exc:
+            snapshots[task_id] = {
+                "task_id": task_id,
+                "status": "failed",
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            }
+            break
         identity = str(snapshot["identity_sha256"])
         relative_root = Path("baselines") / task_id
         artifacts.put_json((relative_root / f"{identity}.json").as_posix(), snapshot)
         artifacts.put_json((relative_root / "latest.json").as_posix(), snapshot, overwrite=True)
         snapshots[task_id] = snapshot
+    task_statuses = [str(snapshot.get("status", "failed")) for snapshot in snapshots.values()]
+    if "failed" in task_statuses or len(snapshots) != len(selected):
+        status = "failed"
+    elif "partial" in task_statuses:
+        status = "partial"
+    else:
+        status = "complete"
     report = {
         "schema_version": "ascend_baseline_run_result_v1",
+        "status": status,
         "environment_sha256": environment_sha,
         "task_count": len(snapshots),
         "tasks": snapshots,
     }
     artifacts.put_json("baselines/latest_collection.json", report, overwrite=True)
     _print_json(report)
+    if status == "failed":
+        return EXIT_FAILED
+    if status == "partial" and args.require_complete:
+        return EXIT_NOT_READY
     return 0
 
 
@@ -1008,13 +1031,21 @@ def build_parser() -> argparse.ArgumentParser:
     probe_all.add_argument("--command-timeout", type=float, default=20.0)
     probe_all.set_defaults(handler=_cmd_probe_all)
 
-    baseline = commands.add_parser("baseline", help="measure trusted B0/B1/B2 baselines")
+    baseline = commands.add_parser(
+        "baseline",
+        help="measure required B0 and probe optional B1/B2 baselines",
+    )
     baseline_commands = baseline.add_subparsers(dest="baseline_command", required=True)
     baseline_run = baseline_commands.add_parser("run", help="measure and atomically snapshot baselines")
     _add_config(baseline_run)
     _add_tasks(baseline_run)
     baseline_run.add_argument("--probe-root")
     baseline_run.add_argument("--skip-health-check", action="store_true")
+    baseline_run.add_argument(
+        "--require-complete",
+        action="store_true",
+        help="return nonzero when any optional torch.compile baseline is incomplete",
+    )
     baseline_run.set_defaults(handler=_cmd_baseline_run)
 
     worker = commands.add_parser("worker", help="run the durable single-device worker")

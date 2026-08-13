@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
-from ascend_kernel_lab.worker.stage_entry import _measure_batch, _measurement_session
+from ascend_kernel_lab.tasks import TaskRegistry
+from ascend_kernel_lab.worker.stage_entry import (
+    _baselines,
+    _measure_batch,
+    _measurement_session,
+)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class _NpuWithoutEvents:
@@ -41,6 +51,63 @@ class _TorchWithEvents:
 
 
 class StageEntryTimingTests(unittest.TestCase):
+    def test_known_inductor_incompatibility_is_attempted_once(self) -> None:
+        task = TaskRegistry(PROJECT_ROOT / "task_specs").load("k01_vector_add")
+
+        class IncompatibleTorch:
+            compile_calls = 0
+
+            def compile(self, _function: Any) -> Any:
+                self.compile_calls += 1
+
+                def compiled(*_args: Any) -> Any:
+                    raise RuntimeError(
+                        "cannot import name 'triton_key' from "
+                        "'triton.compiler.compiler'"
+                    )
+
+                return compiled
+
+        torch = IncompatibleTorch()
+        stats = {"median_us": 12.0}
+        with (
+            patch(
+                "ascend_kernel_lab.worker.stage_entry.generate_inputs",
+                return_value=SimpleNamespace(args=(object(),)),
+            ),
+            patch(
+                "ascend_kernel_lab.worker.stage_entry.reference",
+                return_value=object(),
+            ),
+            patch("ascend_kernel_lab.worker.stage_entry._sync"),
+            patch(
+                "ascend_kernel_lab.worker.stage_entry._single_measurement_session",
+                return_value=(stats, 1),
+            ),
+        ):
+            result = _baselines(
+                torch,
+                task,
+                task.benchmark_cases,
+                "npu:0",
+                {
+                    "warmup": 1,
+                    "measurement_batches": 1,
+                    "target_batch_time_ms": 1.0,
+                },
+            )
+
+        self.assertEqual(torch.compile_calls, 1)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["torch_compile_status"], "failed")
+        self.assertIn("triton_key", result["per_case"][0]["torch_compile_error"])
+        self.assertTrue(
+            all(
+                str(case["torch_compile_error"]).startswith("not attempted:")
+                for case in result["per_case"][1:]
+            )
+        )
+
     def test_measurement_observes_last_materialized_output_outside_timer(self) -> None:
         calls = 0
         observed: list[Any] = []

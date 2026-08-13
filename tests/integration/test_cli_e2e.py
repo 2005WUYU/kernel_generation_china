@@ -10,7 +10,9 @@ from unittest.mock import patch
 
 import yaml
 
+from ascend_kernel_lab.backend import StageResult
 from ascend_kernel_lab.cli import (
+    EXIT_FAILED,
     EXIT_NOT_READY,
     CommandError,
     _require_clean_git_release,
@@ -185,6 +187,82 @@ class CliEndToEndTests(unittest.TestCase):
                 _require_clean_git_release(config)
 
             self.assertEqual(raised.exception.exit_code, EXIT_NOT_READY)
+
+    def test_partial_baseline_is_explicit_and_strict_exit_is_opt_in(self) -> None:
+        for require_complete, expected_code in ((False, 0), (True, EXIT_NOT_READY)):
+            with self.subTest(require_complete=require_complete), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = self._config(root)
+                backend = type(
+                    "HealthyBackend",
+                    (),
+                    {"health_check": lambda self: StageResult.success("HEALTH_CHECK")},
+                )()
+                snapshot = {
+                    "schema_version": "ascend_baseline_snapshot_v1",
+                    "status": "partial",
+                    "identity_sha256": "a" * 64,
+                    "task_id": "k01_vector_add",
+                    "torch_compile_status": "failed",
+                }
+                argv = ["baseline", "run", "-c", str(config)]
+                if require_complete:
+                    argv.append("--require-complete")
+
+                with (
+                    patch("ascend_kernel_lab.cli._require_clean_git_release"),
+                    patch(
+                        "ascend_kernel_lab.cli._load_probe_snapshot",
+                        return_value={"probe_snapshot_sha256": "probe"},
+                    ),
+                    patch("ascend_kernel_lab.cli._real_backend", return_value=backend),
+                    patch(
+                        "ascend_kernel_lab.cli.BaselineManager.measure",
+                        return_value=snapshot,
+                    ),
+                ):
+                    code, output, error = self._main(argv)
+
+                self.assertEqual(code, expected_code, error)
+                report = json.loads(output)
+                self.assertEqual(report["status"], "partial")
+                self.assertEqual(
+                    report["tasks"]["k01_vector_add"]["torch_compile_status"],
+                    "failed",
+                )
+
+    def test_failed_baseline_has_failed_report_and_nonzero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = self._config(root)
+            backend = type(
+                "HealthyBackend",
+                (),
+                {"health_check": lambda self: StageResult.success("HEALTH_CHECK")},
+            )()
+            with (
+                patch("ascend_kernel_lab.cli._require_clean_git_release"),
+                patch(
+                    "ascend_kernel_lab.cli._load_probe_snapshot",
+                    return_value={"probe_snapshot_sha256": "probe"},
+                ),
+                patch("ascend_kernel_lab.cli._real_backend", return_value=backend),
+                patch(
+                    "ascend_kernel_lab.cli.BaselineManager.measure",
+                    side_effect=RuntimeError("B0 failed"),
+                ),
+            ):
+                code, output, error = self._main(
+                    ["baseline", "run", "-c", str(config)]
+                )
+
+            self.assertEqual(code, EXIT_FAILED, error)
+            report = json.loads(output)
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(
+                report["tasks"]["k01_vector_add"]["status"],
+                "failed",
+            )
 
 
 if __name__ == "__main__":
