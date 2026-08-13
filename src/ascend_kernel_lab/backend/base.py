@@ -169,12 +169,15 @@ class StageResult:
         details: Mapping[str, Any] | None = None,
         artifacts: Mapping[str, str] | None = None,
     ) -> StageResult:
+        failure_details = dict(details or {})
+        failure_details.setdefault("failure_origin", "infrastructure")
+        failure_details.setdefault("failure_type", error_type)
         return cls(
             stage=stage,
             status=StageStatus.TIMEOUT if timed_out else StageStatus.ERROR,
             started_at=started_at or _utc_now(),
             finished_at=_utc_now(),
-            details=details or {},
+            details=failure_details,
             artifacts=artifacts or {},
             error={"type": error_type, "message": message},
             retryable=retryable,

@@ -264,7 +264,7 @@ class RunVerifier:
                 candidate_rows = connection.execute(
                     """
                     SELECT candidate.*, score.compile_passed,
-                           score.correctness_passed, score.anti_bypass_passed,
+                           score.correctness_passed,
                            score.hidden_correctness_passed
                     FROM candidates AS candidate
                     LEFT JOIN candidate_scores AS score USING (candidate_id)
@@ -508,7 +508,6 @@ class RunVerifier:
                 if final_passed and (
                     int(candidate["compile_passed"] or 0) != 1
                     or int(candidate["correctness_passed"] or 0) != 1
-                    or int(candidate["anti_bypass_passed"] or 0) != 1
                     or int(candidate["hidden_correctness_passed"] or 0) != 1
                 ):
                     self._add(

@@ -110,6 +110,48 @@ def _finite_positive_number(value: Any) -> bool:
     return number > 0 and math.isfinite(number)
 
 
+def _candidate_failed(evaluation: Mapping[str, Any]) -> bool:
+    candidate = evaluation.get("candidate")
+    if isinstance(candidate, Mapping):
+        return str(candidate.get("status", "")).upper() == "INVALID"
+    source = evaluation.get("source")
+    if isinstance(source, Mapping) and str(
+        source.get("status", "")
+    ).lower() == "model_failed":
+        return False
+    return any(
+        isinstance(evaluation.get(name), Mapping)
+        and not _passed_stage(evaluation.get(name))
+        for name in ("source", "compile", "correctness")
+    )
+
+
+def _model_unevaluated(evaluation: Mapping[str, Any]) -> bool:
+    if str(evaluation.get("overall_status", "")).upper() == "UNEVALUATED":
+        return True
+    source = evaluation.get("source")
+    return isinstance(source, Mapping) and str(
+        source.get("status", "")
+    ).lower() == "model_failed"
+
+
+def _infrastructure_retry(evaluation: Mapping[str, Any]) -> bool:
+    infrastructure = evaluation.get("infrastructure")
+    if isinstance(infrastructure, Mapping) and str(
+        infrastructure.get("status", "")
+    ).upper() == "RETRY":
+        return True
+    return any(
+        isinstance(evaluation.get(name), Mapping)
+        and (
+            str(evaluation[name].get("status", "")).lower()
+            in {"error", "timeout", "unavailable"}
+            or evaluation[name].get("failure_origin") == "infrastructure"
+        )
+        for name in ("source", "compile", "correctness", "benchmark")
+    )
+
+
 def _online_public_comparison(
     evaluation: Mapping[str, Any],
     candidate: CandidateScore,
@@ -155,6 +197,11 @@ def _final_gate_status(
     *,
     profile_coverage_required: bool,
 ) -> tuple[str, bool]:
+    del profile_coverage_required
+    if _infrastructure_retry(evaluation):
+        return "failed_final_infrastructure", _passed_stage(
+            evaluation.get("correctness")
+        )
     correctness = evaluation.get("correctness")
     if not _passed_stage(correctness):
         return "failed_hidden_correctness", False
@@ -171,12 +218,12 @@ def _final_gate_status(
         )
     ):
         return "failed_final_benchmark", True
-    profile = evaluation.get("profile")
-    anti_bypass = evaluation.get("anti_bypass")
-    profile_verified = _passed_stage(profile) and _passed_stage(anti_bypass)
-    if profile_coverage_required and not profile_verified:
-        return "failed_final_profile", True
-    if not profile_coverage_required and not profile_verified:
+    attribution = evaluation.get("attribution", evaluation.get("anti_bypass"))
+    profile_verified = isinstance(attribution, Mapping) and (
+        str(attribution.get("status", "")).upper() == "VERIFIED"
+        or _passed_stage(attribution)
+    )
+    if not profile_verified:
         return "passed_profile_unverified", True
     return "passed", True
 
@@ -300,9 +347,7 @@ class ExperimentController:
             ).hexdigest()
         manifest["runtime_policy"] = {
             "schema_version": "ascend_runtime_policy_v1",
-            "final_profile_gate": (
-                "required" if self.profile_coverage_required else "advisory"
-            ),
+            "final_profile_gate": "advisory",
             "blind_suite_generator": "hidden-v1",
             "blind_suite_identity_sha256": suite_identity,
             "harness_git_commit": self.harness_commit,
@@ -438,6 +483,11 @@ class ExperimentController:
                 repair_attempt=repair_attempt,
             )
             previous_evaluation = self._round_evaluation(task, round_number)
+            if _infrastructure_retry(previous_evaluation):
+                raise ControllerError(
+                    f"round {round_number} requires an infrastructure retry; "
+                    "no later model round was consumed"
+                )
             if self._repair_seed_ready(previous_evaluation):
                 seed_ready = True
         return self._run_final(task)
@@ -472,6 +522,16 @@ class ExperimentController:
                 f"finished round {round_number} is missing evaluation_result.json"
             )
         return _read_json(path)
+
+    def _search_profiles_run(self, task: TaskSpec, *, before_round: int) -> int:
+        count = 0
+        for round_number in range(1, before_round):
+            path = self._artifact_path(
+                task.id, round_number, "evaluation_result.json"
+            )
+            if path.is_file() and isinstance(_read_json(path).get("profile"), Mapping):
+                count += 1
+        return count
 
     @staticmethod
     def _repair_seed_ready(evaluation: Mapping[str, Any]) -> bool:
@@ -649,6 +709,9 @@ class ExperimentController:
             profile_summary = {
                 "status": profile.get("status"),
                 "passed": profile.get("passed"),
+                "attribution": evaluation.get(
+                    "attribution", evaluation.get("anti_bypass")
+                ),
                 "mode": summary.get("profile_mode", profile.get("profile_mode")),
                 "profile_case": profile_case,
                 "kernel_count": summary.get("kernel_count"),
@@ -668,9 +731,17 @@ class ExperimentController:
                     for key, value in list(pipeline.items())[:8]
                 },
             }
+        attribution = evaluation.get(
+            "attribution", evaluation.get("anti_bypass")
+        )
+        if profile_summary is None and isinstance(attribution, Mapping):
+            profile_summary = {"attribution": dict(attribution)}
 
         return {
             "overall_status": evaluation.get("overall_status"),
+            "candidate": evaluation.get("candidate"),
+            "performance": evaluation.get("performance"),
+            "infrastructure": evaluation.get("infrastructure"),
             "source": stage_status("source"),
             "compile": stage_status("compile"),
             "correctness": correctness_summary,
@@ -683,7 +754,7 @@ class ExperimentController:
         evaluation: Mapping[str, Any], feedback: Mapping[str, Any]
     ) -> list[str]:
         overall = str(evaluation.get("overall_status", "unknown"))
-        if overall in {"correct", "success"}:
+        if overall in {"VALID", "correct", "success"}:
             return []
         reasons = [overall]
         for stage_name in ("source", "compile", "correctness", "benchmark", "profile"):
@@ -706,7 +777,8 @@ class ExperimentController:
                             code = finding.get("code", "source_check")
                             message = finding.get("message", "rejected")
                             reasons.append(f"source[{code}]: {message}")
-        if overall == "correctness_failed":
+        correctness = evaluation.get("correctness")
+        if isinstance(correctness, Mapping) and not _passed_stage(correctness):
             correctness_metrics = ExperimentController._follow_up_metrics(
                 evaluation
             ).get("correctness")
@@ -922,13 +994,7 @@ class ExperimentController:
             if previous_evaluation_path.is_file()
             else {}
         )
-        if phase in {"repair", "optimization_repair"} and previous.get(
-            "overall_status"
-        ) in {
-            "source_failed",
-            "compile_failed",
-            "correctness_failed",
-        }:
+        if phase in {"repair", "optimization_repair"} and _candidate_failed(previous):
             candidate_path = self._artifact_path(
                 task.id, before_round - 1, "candidate.py"
             )
@@ -1132,7 +1198,7 @@ class ExperimentController:
         previous_evaluation_path = self._artifact_path(task.id, round_number - 1, "evaluation_result.json")
         previous_feedback_path = self._artifact_path(task.id, round_number - 1, "feedback.json")
         previous_evaluation = _read_json(previous_evaluation_path) if previous_evaluation_path.is_file() else {
-            "overall_status": "model_failed",
+            "overall_status": "UNEVALUATED",
         }
         previous_feedback = (
             _read_json(previous_feedback_path) if previous_feedback_path.is_file() else {}
@@ -1152,9 +1218,50 @@ class ExperimentController:
             else ""
         )
         previous_intent = self._candidate_intent(task, round_number - 1)
-        previous_overall = str(
-            previous_evaluation.get("overall_status", "unknown")
-        )
+        if _model_unevaluated(previous_evaluation):
+            feedback_instruction = (
+                "刚才的模型响应没有通过结构化响应校验; 不要沿用内部失败占位源码。"
+                "请从当前任务或 BEST 重新生成完整 Kernel 和模型原生 optimization_summary。"
+            )
+        elif _infrastructure_retry(previous_evaluation):
+            feedback_instruction = (
+                "刚才的评测因锁、超时、设备或子进程基础设施错误未完成; "
+                "不要把该错误归因于候选实现，也不要依据它修改算法。"
+            )
+        elif candidate["role"] == "failed_candidate_under_repair":
+            feedback_instruction = (
+                "刚才的候选未通过 compile/correctness; 必须从该失败候选继续修复, "
+                "保留其模型原生 optimization_summary, 并只依据原始错误修改。"
+            )
+        elif (
+            isinstance(
+                previous_performance := previous_evaluation.get("performance"),
+                Mapping,
+            )
+            and str(previous_performance.get("status", "")).upper()
+            == "NOT_MEASURED"
+        ):
+            feedback_instruction = (
+                "刚才的候选没有完成 benchmark 测量; 该候选不能替换 BEST。"
+                "从 BEST 完整实现重新出发，并只依据真实 benchmark 结果优化。"
+            )
+        elif previous_feedback.get("performance_decision") == "REGRESSION":
+            feedback_instruction = (
+                "刚才的尝试造成确定性性能倒退; BEST 保持不变。"
+                "从 BEST 完整实现重新出发, 不要沿倒退候选继续优化。"
+            )
+        elif previous_feedback.get("performance_decision") == "TIE":
+            feedback_instruction = (
+                "候选与 BEST 的差异落在测量噪声范围, BEST 保持不变; "
+                "从 BEST 继续尝试新的优化方案。"
+            )
+        elif best is not None:
+            feedback_instruction = "这是当前真实运行得到的 BEST; 从 BEST 继续优化。"
+        else:
+            feedback_instruction = (
+                "这是正确但尚未形成可比较 BEST 的工作候选; 请从它继续并完成 benchmark。"
+                "profile attribution 仅作参考，不是通过门槛。"
+            )
         feedback_state: dict[str, Any] = {
             "mode": previous_feedback.get(
                 "next_prompt_mode", "REPAIR_FAILED_CANDIDATE"
@@ -1162,48 +1269,7 @@ class ExperimentController:
             "performance_decision": previous_feedback.get(
                 "performance_decision", "INVALID"
             ),
-            "instruction": (
-                "刚才的模型响应没有通过结构化响应校验; 不要沿用内部失败占位源码。"
-                "请从当前任务或 BEST 重新生成完整 Kernel 和模型原生 optimization_summary。"
-                if previous_overall == "model_failed"
-                else (
-                    "刚才的候选未通过 compile/correctness; 必须从该失败候选继续修复, "
-                    "保留其模型原生 optimization_summary, 并只依据原始错误修改。"
-                    if candidate["role"] == "failed_candidate_under_repair"
-                    else (
-                        "刚才的候选虽然通过 source/compile/correctness, 但没有形成可信的 "
-                        "benchmark/smoke-profile 性能证据; 该候选不能替换 BEST。"
-                        "丢弃该分支并从 BEST 完整实现重新出发, 依据 failed_candidate 中的 "
-                        "模型原生优化思路、代码差异、失败证据和实测指标尝试新方案。"
-                        if previous_overall
-                        in {
-                            "benchmark_failed",
-                            "anti_bypass_failed",
-                            "profile_unavailable",
-                        }
-                        else (
-                        "刚才的尝试造成确定性性能倒退; BEST 保持不变。"
-                        "从 BEST 完整实现重新出发, 不要沿倒退候选继续优化。"
-                        if previous_feedback.get("performance_decision")
-                        == "REGRESSION"
-                        else (
-                            "候选与 BEST 的差异落在测量噪声范围, BEST 保持不变; "
-                            "从 BEST 继续尝试新的优化方案。"
-                            if previous_feedback.get("performance_decision")
-                            == "TIE"
-                            else (
-                                "这是当前真实运行得到的 BEST; 从 BEST 继续优化。"
-                                if best is not None
-                                else (
-                                    "这是正确但尚未形成可比较 BEST 的工作候选; "
-                                    "请从它继续并取得 benchmark 和 smoke profile。"
-                                )
-                            )
-                        )
-                        )
-                    )
-                )
-            ),
+            "instruction": feedback_instruction,
             "successful_best_history": self._successful_best_history(
                 task, before_round=round_number
             ),
@@ -1215,7 +1281,7 @@ class ExperimentController:
             "repair_attempt": repair_attempt,
         }
         failed_candidate: dict[str, Any] | None = None
-        if previous_overall == "model_failed":
+        if _model_unevaluated(previous_evaluation):
             failure_path = self._artifact_path(
                 task.id, round_number - 1, "model_failure.json"
             )
@@ -1260,13 +1326,14 @@ class ExperimentController:
             failed_stage = next(
                 (
                     name
-                    for name in ("benchmark", "profile", "anti_bypass")
-                    if previous_overall
-                    in {
-                        "benchmark_failed",
-                        "profile_unavailable",
-                        "anti_bypass_failed",
-                    }
+                    for name in (
+                        "source",
+                        "compile",
+                        "correctness",
+                        "benchmark",
+                        "profile",
+                    )
+                    if _infrastructure_retry(previous_evaluation)
                     and isinstance(previous_evaluation.get(name), Mapping)
                     and not _passed_stage(previous_evaluation.get(name))
                 ),
@@ -1732,7 +1799,7 @@ class ExperimentController:
                     "task_id": task.id,
                     "round": round_number,
                     "candidate_id": candidate_id,
-                    "overall_status": "model_failed",
+                    "overall_status": "UNEVALUATED",
                     "source": {
                         "stage": "SOURCE_CHECK",
                         "passed": False,
@@ -1742,10 +1809,34 @@ class ExperimentController:
                     "correctness": None,
                     "benchmark": None,
                     "profile": None,
+                    "candidate": {
+                        "source": "NOT_RUN",
+                        "compile": "NOT_RUN",
+                        "correctness": "NOT_RUN",
+                        "status": "UNEVALUATED",
+                        "reason": "model_response_invalid",
+                    },
+                    "performance": {
+                        "status": "NOT_MEASURED",
+                        "vs_baseline": None,
+                        "metrics": {},
+                    },
+                    "attribution": {
+                        "passed": False,
+                        "status": "UNAVAILABLE",
+                        "advisory": True,
+                        "reason": "model_response_invalid",
+                    },
+                    "infrastructure": {
+                        "status": "OK",
+                        "stage": None,
+                        "reason": None,
+                    },
                     "anti_bypass": {
                         "passed": False,
-                        "status": "not_evaluated",
-                        "reason": "model_failed",
+                        "status": "UNAVAILABLE",
+                        "advisory": True,
+                        "reason": "model_response_invalid",
                     },
                     "reward_vector": asdict(compute_reward(score)),
                     "score": asdict(score),
@@ -1795,7 +1886,14 @@ class ExperimentController:
                             combine_candidate_stages=(
                                 not self.config.worker.fresh_process_per_stage
                             ),
-                            run_profile=self.config.profile.run_after_correctness,
+                            run_profile=(
+                                self.config.profile.run_after_correctness
+                                and self._search_profiles_run(
+                                    task, before_round=round_number
+                                )
+                                < self.config.profile.search_profile_budget_per_task
+                            ),
+                            search_profile_policy=True,
                             profile_coverage_required=self.profile_coverage_required,
                         ),
                     )
@@ -1868,6 +1966,14 @@ class ExperimentController:
             if hashlib.sha256(source.read_bytes()).hexdigest() != source_sha:
                 continue
             value = json.loads(json.dumps(_read_json(evaluation)))
+            if (
+                value.get("overall_status")
+                not in {"VALID", "INVALID_CANDIDATE", "INFRA_RETRY", "UNEVALUATED"}
+                or not isinstance(value.get("candidate"), Mapping)
+                or not isinstance(value.get("performance"), Mapping)
+                or not isinstance(value.get("infrastructure"), Mapping)
+            ):
+                continue
             value["round"] = round_number
             value["candidate_id"] = candidate_id
             score_mapping = dict(value["score"])
@@ -1895,12 +2001,23 @@ class ExperimentController:
             RoundState.PROFILE_FINISHED,
         ]
         overall = str(evaluation.get("overall_status"))
-        last = {
-            "model_failed": RoundState.SOURCE_VALIDATED,
-            "source_failed": RoundState.SOURCE_VALIDATED,
-            "compile_failed": RoundState.COMPILE_FINISHED,
-            "correctness_failed": RoundState.CORRECTNESS_FINISHED,
-        }.get(overall, RoundState.PROFILE_FINISHED)
+        if _model_unevaluated(evaluation):
+            last = RoundState.SOURCE_VALIDATED
+        else:
+            last = next(
+                (
+                    state
+                    for stage_name, state in (
+                        ("source", RoundState.SOURCE_VALIDATED),
+                        ("compile", RoundState.COMPILE_FINISHED),
+                        ("correctness", RoundState.CORRECTNESS_FINISHED),
+                        ("benchmark", RoundState.BENCHMARK_FINISHED),
+                    )
+                    if isinstance(evaluation.get(stage_name), Mapping)
+                    and not _passed_stage(evaluation.get(stage_name))
+                ),
+                RoundState.PROFILE_FINISHED,
+            )
         if record.state not in {RoundState.FEEDBACK_COMMITTED, RoundState.ROUND_FINISHED}:
             current_index = -1 if record.state is RoundState.MODEL_RESPONSE_COMMITTED else ordered.index(record.state)
             target_index = ordered.index(last)

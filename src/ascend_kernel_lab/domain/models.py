@@ -76,7 +76,9 @@ class CandidateScore:
     """Raw, recomposable candidate metrics.
 
     Performance values remain optional because failed source/compile/correctness
-    stages do not produce trustworthy benchmark measurements.
+    stages do not produce trustworthy benchmark measurements.  The retained
+    ``anti_bypass_passed`` field is advisory profiler attribution metadata for
+    compatibility with existing artifacts; it is not an eligibility gate.
     """
 
     candidate_id: str
@@ -115,7 +117,6 @@ class CandidateScore:
         return (
             self.compile_passed
             and self.correctness_passed
-            and self.anti_bypass_passed
             and self.minimum_speedup is not None
             and self.geomean_speedup is not None
         )

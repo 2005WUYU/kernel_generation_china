@@ -25,11 +25,11 @@ SYSTEM_PROMPT = """你负责生成可在华为昇腾 Triton-Ascend 环境运行�
 8. 必须正确处理任务中所有公开 shape 和 dtype, 不得猜测或索取隐藏用例。
 9. 只能依据提供的实际编译、正确性、延迟和 profiler 摘要进行修改。
 10. 返回结果必须严格符合给定 JSON Schema; code 字段始终返回完整源码。
-11. custom_op 的每一条返回路径都必须先启动候选 Triton Kernel; 禁止在 Kernel 启动前返回刚分配的输出, 包括 n == 0 等提前返回。
-12. custom_op 不得调用自定义 Python 辅助函数; host 侧的 shape、grid 和 launch 参数选择逻辑必须直接内联在 custom_op 中。
-13. 源码只能 import torch、triton 或 triton.language; host 侧只能分配输出、读取 Tensor 元数据、计算标量 launch 参数并启动候选 Kernel。
+11. custom_op 或可达 helper 必须分配并返回输出, 且实际启动候选 Triton Kernel。
+12. 可以使用 Python 辅助函数组织纯标量 shape/grid/config 计算或封装候选 Triton Kernel launch; 不得在 helper 中执行 Tensor 计算或高层算子回退。
+13. 源码可以 import torch、triton、triton.language、math、typing 和 __future__; host 侧可以自由组织正常 Python 结构来分配输出、读取 Tensor 元数据、计算 launch 参数、构造 autotune 配置并启动候选 Kernel。
 14. 不要在候选源码中实现 cache、warmup、benchmark、计时、异常捕获或任何运行时探测; 这些由评测框架负责。
-15. Triton Kernel 名称必须是至少 8 个字符的具体标识符; custom_op 是普通 Python host wrapper, 不能用 @triton.jit 装饰。
+15. Triton Kernel 名称必须是有效 Python 标识符; custom_op 是普通 Python host wrapper, 不能用 @triton.jit 装饰。
 16. 对每个公开用例, launch grid 的 program 总数(coreDim)必须小于等于 65535; 不要为每个元素或每行盲目启动一个 program, 应通过 BLOCK/tiling 让每个 program 处理多个元素。
 17. optimization_summary 必须在生成候选时同步概括 code 中实际采用的具体修改或初始实现选择; 不得留给评测系统事后推断, expected_effect 则单独写预期影响。
 """
@@ -58,23 +58,22 @@ def custom_op(x):
 
 SOURCE_CHECKER_CONTRACT: dict[str, Any] = {
     "purpose": "prevent_host_fallback_and_unsafe_side_effects",
-    "allowed_import_roots": ["torch", "triton"],
+    "allowed_import_roots": ["torch", "triton", "math", "typing", "__future__"],
     "host_allowed": [
         "torch.empty/empty_like/empty_strided output allocation",
         "Tensor shape/stride/dtype/device/numel metadata",
         "scalar shape/grid/launch-parameter arithmetic",
-        "module-level scalar helper calls with scalar arguments",
-        "local scalar mapping lookups",
+        "helpers for scalar/grid/config logic or candidate kernel launches",
+        "normal Python control flow, mappings, lambdas, and comprehensions",
+        "module docstrings and top-level Triton autotune configuration",
         "triton.cdiv/triton.next_power_of_2/triton.Config",
         "launching a declared @triton.jit kernel",
     ],
     "source_checker_rejects": [
-        "high-level torch computation or Tensor indexing/view/copy/data_ptr/item",
-        "getattr, try/except, file/network/process/runtime probing",
-        "candidate-side cache, warmup, benchmark, timing, or dynamic installation",
+        "high-level torch calls or Tensor compute/copy/data-access methods on the host",
+        "reflection, file/network/process access, or runtime probing",
         "@triton.jit on custom_op",
-        "returning an output that is never passed to a candidate kernel launch",
-        "top-level executable code or non-literal dynamic assignments",
+        "omitting an output allocator, custom_op return, or candidate kernel launch",
     ],
     "required": [
         "one ordinary Python host entry point named custom_op",

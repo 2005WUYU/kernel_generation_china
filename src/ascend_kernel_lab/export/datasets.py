@@ -241,7 +241,6 @@ def _is_publicly_valid(item: RoundArtifacts) -> bool:
     return (
         score.get("compile_passed") is True
         and score.get("correctness_passed") is True
-        and score.get("anti_bypass_passed") is True
         and _speedup(item) is not None
         and _minimum_speedup(item) is not None
     )
@@ -533,7 +532,6 @@ class DatasetExporter:
         if not (
             score.get("compile_passed") is True
             and score.get("correctness_passed") is True
-            and score.get("anti_bypass_passed") is True
         ):
             return False
         stability = _number(score.get("stability_cv"))

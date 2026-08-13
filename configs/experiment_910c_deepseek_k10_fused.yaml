@@ -38,7 +38,7 @@ worker:
   heartbeat_seconds: 10
   lease_seconds: 120
   poll_seconds: 1
-  maximum_job_attempts: 1
+  maximum_job_attempts: 2
 
 timeouts:
   source_check_seconds: 10
@@ -63,6 +63,7 @@ profile:
   mode: quick
   run_after_correctness: true
   run_for_final_best: true
+  search_profile_budget_per_task: 2
   warmup: 1
   iterations: 1
   mandatory_groups:

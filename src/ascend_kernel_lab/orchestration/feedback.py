@@ -230,35 +230,40 @@ def _benchmark_delta(
 
 
 def _overall_status(result: Mapping[str, Any], best: Mapping[str, Any] | None) -> str:
-    reported = result.get("overall_status")
-    if reported in {
-        "model_failed",
-        "source_failed",
-        "compile_failed",
-        "correctness_failed",
-        "benchmark_failed",
-        "anti_bypass_failed",
-    }:
-        return str(reported)
+    del best
+    reported = str(result.get("overall_status", ""))
+    if reported in {"VALID", "INVALID_CANDIDATE", "INFRA_RETRY", "UNEVALUATED"}:
+        return reported
+    if reported == "model_failed":
+        return "UNEVALUATED"
+    infrastructure = result.get("infrastructure")
+    if isinstance(infrastructure, Mapping) and str(
+        infrastructure.get("status", "")
+    ).upper() == "RETRY":
+        return "INFRA_RETRY"
+    for stage_name in ("source", "compile", "correctness", "benchmark"):
+        stage = result.get(stage_name)
+        if isinstance(stage, Mapping) and (
+            str(stage.get("status", "")).lower()
+            in {"error", "timeout", "unavailable"}
+            or stage.get("failure_origin") == "infrastructure"
+        ):
+            return "INFRA_RETRY"
     source = result.get("source")
     if isinstance(source, Mapping) and not bool(source.get("passed")):
-        return "source_failed"
+        return "INVALID_CANDIDATE"
     compile_result = result.get("compile")
     if not isinstance(compile_result, Mapping) or not bool(compile_result.get("compiled", compile_result.get("passed", False))):
-        return "compile_failed"
+        return "INVALID_CANDIDATE"
     correctness = result.get("correctness")
     if not isinstance(correctness, Mapping) or not bool(correctness.get("passed")):
-        return "correctness_failed"
-    anti_bypass = result.get("anti_bypass")
-    if isinstance(anti_bypass, Mapping) and anti_bypass.get("passed") is False:
-        return "anti_bypass_failed"
+        return "INVALID_CANDIDATE"
     benchmark = result.get("benchmark")
-    if not isinstance(benchmark, Mapping) or benchmark.get("status") in {"failed", "timeout"}:
-        return "benchmark_failed"
-    profile = result.get("profile")
-    if isinstance(profile, Mapping) and profile.get("profile_available") is False:
-        return "profile_unavailable"
-    return "correct"
+    if not isinstance(benchmark, Mapping) or benchmark.get("passed") is False or str(
+        benchmark.get("status", "")
+    ).lower() in {"fail", "failed"}:
+        return "INFRA_RETRY"
+    return "VALID"
 
 
 def build_feedback(
@@ -287,7 +292,6 @@ def build_feedback(
         if candidate_score is not None
         else None
     )
-    focus: list[str] = []
     if benchmark is not None and best is not None:
         current_cases = _benchmark_cases(result)
         best_benchmark = _best_benchmark(best)
@@ -338,57 +342,19 @@ def build_feedback(
                 benchmark, best_benchmark
             ),
         }
-        if regressed:
-            focus.append(f"恢复退化用例的性能: {', '.join(regressed[:8])}")
-
-    if overall == "model_failed":
-        focus.append("重新生成一个满足 JSON Schema 的完整候选源码")
-    elif overall == "source_failed":
-        focus.append("修复静态安全检查列出的 import、调用或入口问题")
-    elif overall == "compile_failed":
-        focus.append("只依据编译阶段和源码位置修复 Triton-Ascend 编译错误")
-    elif overall == "correctness_failed":
-        focus.append("修复首个公开失败用例的 mask、边界、shape 或数值精度")
-    elif overall == "anti_bypass_failed":
-        focus.append("移除高层算子回退, 确保目标计算由候选 Triton kernel 完成")
-    elif overall == "benchmark_failed":
-        focus.append("保持正确性, 针对本轮 benchmark 的不稳定用例降低测量 CV, 再依据稳定结果优化延迟")
-    elif overall == "profile_unavailable":
-        focus.append("保持正确性和现有性能; profiler 当前不可用, 不要猜测硬件指标")
-    else:
-        if (
-            benchmark is not None
-            and benchmark.get("minimum_speedup_vs_eager") is not None
-            and float(benchmark["minimum_speedup_vs_eager"]) < 1.0
-        ):
-            focus.append(
-                "参考 PyTorch eager 对比优先改善最慢 shape; "
-                "本次冷启动 SFT 轨迹不设硬性加速比门槛"
-            )
-    if consecutive_non_improvements >= 2:
-        focus.append("连续两轮未提升, 请采用明显不同的 tiling、grid 或融合方案")
-    if not focus:
-        focus.append("保持全部公开正确性, 并改善最低 shape 与加权几何平均性能")
+    del consecutive_non_improvements
 
     performance_decision = (
         decision.decision
         if decision is not None and decision.decision != "INVALID"
         else "INVALID"
     )
-    if overall == "model_failed":
+    if overall == "UNEVALUATED":
         next_prompt_mode = "REGENERATE_INVALID_MODEL_RESPONSE"
-    elif overall in {
-        "source_failed",
-        "compile_failed",
-        "correctness_failed",
-    }:
+    elif overall == "INVALID_CANDIDATE":
         next_prompt_mode = "REPAIR_FAILED_CANDIDATE"
-    elif overall in {
-        "benchmark_failed",
-        "anti_bypass_failed",
-        "profile_unavailable",
-    }:
-        next_prompt_mode = "RETURN_TO_BEST_AFTER_INVALID_PERFORMANCE_EVIDENCE"
+    elif overall == "INFRA_RETRY":
+        next_prompt_mode = "RETRY_AFTER_INFRASTRUCTURE_FAILURE"
     elif performance_decision in {"INITIAL_BEST", "NEW_BEST"}:
         next_prompt_mode = "CONTINUE_FROM_NEW_BEST"
     elif performance_decision == "REGRESSION":
@@ -403,12 +369,17 @@ def build_feedback(
         "task_id": task_id,
         "round": round_number,
         "overall_status": overall,
+        "candidate": result.get("candidate"),
+        "performance": result.get("performance"),
+        "infrastructure": result.get("infrastructure"),
         "source": result.get("source"),
         "compile": compile_result,
         "correctness": correctness,
         "benchmark": benchmark,
         "latency_measurements": latency_measurements,
         "profile": profile,
+        "attribution": result.get("attribution", result.get("anti_bypass")),
+        # Compatibility alias for historical feedback readers.
         "anti_bypass": result.get("anti_bypass"),
         "comparison_with_best": comparison,
         "candidate_generation_intent": dict(candidate_intent or {}),
@@ -419,6 +390,5 @@ def build_feedback(
         "next_round_requirement": {
             "must_keep_correctness": True,
             "must_return_full_code": True,
-            "focus": focus,
         },
     }

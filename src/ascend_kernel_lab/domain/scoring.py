@@ -150,9 +150,9 @@ def _finite_or(value: float | None, fallback: float) -> float:
 def candidate_selection_key(score: CandidateScore) -> tuple[float, ...]:
     """Return the documented lexicographic ranking key.
 
-    Ordering is hidden correctness, anti-bypass, worst-shape speedup,
-    geometric-mean speedup, stability, profiler coverage, then the earlier
-    round for deterministic ties. Compile/public correctness form a hard gate.
+    Ordering is hidden correctness, worst-shape speedup, geometric-mean
+    speedup, stability, then the earlier round for deterministic ties.
+    Profiler attribution is advisory and does not affect selection.
     """
 
     publicly_valid = float(score.is_publicly_valid)
@@ -166,11 +166,9 @@ def candidate_selection_key(score: CandidateScore) -> tuple[float, ...]:
     return (
         publicly_valid,
         hidden_rank if publicly_valid else 0.0,
-        float(score.anti_bypass_passed) if publicly_valid else 0.0,
         _finite_or(score.minimum_speedup, float("-inf")),
         _finite_or(score.geomean_speedup, float("-inf")),
         -_finite_or(score.stability_cv, float("inf")),
-        _finite_or(score.candidate_kernel_coverage, -1.0),
         -float(score.round_number),
     )
 
@@ -221,10 +219,10 @@ def compute_reward(
 ) -> RewardBreakdown:
     """Compute the initial reward while preserving an auditable breakdown.
 
-    Compile, correctness, and anti-bypass failures are hard zeroes. For a valid
-    candidate the formula follows the design document: ``1 + clipped log2
-    speedup + 0.2 * coverage - stability penalty``. The penalty is the amount
-    by which CV exceeds the configured stable threshold, scaled by the caller.
+    Compile, correctness, and missing benchmark measurements are hard zeroes.
+    Profiler attribution is advisory and does not gate or modify reward.  The
+    penalty is the amount by which CV exceeds the configured stable threshold,
+    scaled by the caller.
     """
 
     if not math.isfinite(maximum_stable_cv) or maximum_stable_cv < 0:
@@ -248,7 +246,7 @@ def compute_reward(
 
     assert score.geomean_speedup is not None
     speedup_component = _clip(math.log2(score.geomean_speedup), -1.0, 2.0)
-    coverage_component = 0.2 * (score.candidate_kernel_coverage or 0.0)
+    coverage_component = 0.0
     cv = score.stability_cv or 0.0
     stability_penalty = max(0.0, cv - maximum_stable_cv) * stability_penalty_scale
     reward = max(

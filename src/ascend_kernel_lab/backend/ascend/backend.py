@@ -459,14 +459,22 @@ class AscendTritonBackend(Backend):
                 retryable=True,
                 timed_out=True,
                 started_at=started,
-                details=common,
+                details={
+                    **common,
+                    "failure_origin": "infrastructure",
+                    "failure_type": "StageTimeout",
+                },
                 artifacts=artifacts,
             )
         if process.output_limit_exceeded:
             return StageResult.failure(
                 stage,
                 started_at=started,
-                details=common,
+                details={
+                    **common,
+                    "failure_origin": "candidate",
+                    "failure_type": "OutputLimitExceeded",
+                },
                 artifacts=artifacts,
                 error={
                     "type": "OutputLimitExceeded",
@@ -482,7 +490,12 @@ class AscendTritonBackend(Backend):
                 error_type="StageProtocolError",
                 retryable=True,
                 started_at=started,
-                details={**common, "stderr_tail": process.stderr_text()[-8192:]},
+                details={
+                    **common,
+                    "stderr_tail": process.stderr_text()[-8192:],
+                    "failure_origin": "infrastructure",
+                    "failure_type": "StageProtocolError",
+                },
                 artifacts=artifacts,
             )
         details = dict(raw.get("details", {}))
@@ -505,6 +518,30 @@ class AscendTritonBackend(Backend):
                 stage,
                 message="isolated stage exit code disagrees with its result file",
                 error_type="StageProtocolError",
+                retryable=True,
+                started_at=started,
+                details={
+                    **details,
+                    "failure_origin": "infrastructure",
+                    "failure_type": "StageProtocolError",
+                },
+                artifacts=artifacts,
+            )
+        if raw.get("failure_origin") == "infrastructure":
+            details.setdefault("failure_origin", "infrastructure")
+            details.setdefault(
+                "failure_type",
+                raw.get("failure_type", "StageInfrastructureError"),
+            )
+        if details.get("failure_origin") == "infrastructure":
+            return StageResult.infrastructure_error(
+                stage,
+                message=(
+                    str(normalized_error.get("message", "isolated stage failed"))
+                    if normalized_error is not None
+                    else "isolated stage failed"
+                ),
+                error_type=str(details.get("failure_type", "StageInfrastructureError")),
                 retryable=True,
                 started_at=started,
                 details=details,
@@ -588,6 +625,10 @@ class AscendTritonBackend(Backend):
                 retryable=True,
                 timed_out=True,
                 started_at=started,
+                details={
+                    "failure_origin": "infrastructure",
+                    "failure_type": "DeviceLockTimeout",
+                },
             )
         except (OSError, ValueError, TypeError) as exc:
             return StageResult.infrastructure_error(
@@ -596,6 +637,10 @@ class AscendTritonBackend(Backend):
                 error_type=type(exc).__name__,
                 retryable=isinstance(exc, OSError),
                 started_at=started,
+                details={
+                    "failure_origin": "infrastructure",
+                    "failure_type": type(exc).__name__,
+                },
             )
 
     def source_check(self, candidate_path: Path, task: TaskSpec) -> StageResult:

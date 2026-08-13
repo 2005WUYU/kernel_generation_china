@@ -720,6 +720,8 @@ class QueueEvaluationBackend(Backend):
                         "attempt_count": stored.attempt_count,
                         "max_attempts": stored.max_attempts,
                         "queue_status": stored.status.value,
+                        "failure_origin": "infrastructure",
+                        "failure_type": "StageTimeout",
                     },
                     error={str(key): value for key, value in terminal_error.items()},
                     retryable=False,

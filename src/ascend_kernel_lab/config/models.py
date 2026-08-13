@@ -260,6 +260,7 @@ class ProfileConfig:
     mode: str = "quick"
     run_after_correctness: bool = True
     run_for_final_best: bool = True
+    search_profile_budget_per_task: int = 2
     warmup: int = 1
     iterations: int = 1
     mandatory_groups: tuple[str, ...] = ("task_time", "pipe_utilization")
@@ -269,6 +270,8 @@ class ProfileConfig:
     def __post_init__(self) -> None:
         if self.mode not in {"quick", "full"}:
             raise ValueError("profile mode must be quick or full")
+        if self.search_profile_budget_per_task < 0:
+            raise ValueError("search profile budget per task must be non-negative")
         _positive("profile warmup", self.warmup)
         _positive("profile iterations", self.iterations)
         for group in self.mandatory_groups + self.optional_groups:

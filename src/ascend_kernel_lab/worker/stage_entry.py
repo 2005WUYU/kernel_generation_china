@@ -86,6 +86,10 @@ _FORBIDDEN_TENSOR_CALLS = (
 )
 
 
+class _InfrastructureStageError(RuntimeError):
+    pass
+
+
 def _utc_iso() -> str:
     from datetime import datetime, timezone
 
@@ -816,6 +820,12 @@ def _candidate_stage(
     try:
         details = dict(function())
     except BaseException as exc:
+        infrastructure = isinstance(exc, _InfrastructureStageError)
+        failure_type = (
+            type(exc.__cause__).__name__
+            if infrastructure and exc.__cause__ is not None
+            else type(exc).__name__
+        )
         return {
             "stage": name.upper(),
             "status": "fail",
@@ -823,7 +833,16 @@ def _candidate_stage(
             "started_at": started,
             "finished_at": _utc_iso(),
             "duration_seconds": time.perf_counter() - began,
-            "details": {},
+            "details": {
+                "failure_origin": (
+                    "infrastructure" if infrastructure else "candidate"
+                ),
+                "failure_type": failure_type,
+            },
+            "failure_origin": (
+                "infrastructure" if infrastructure else "candidate"
+            ),
+            "failure_type": failure_type,
             "error": {
                 "type": type(exc).__name__,
                 "message": str(exc)[:16_384],
@@ -832,7 +851,7 @@ def _candidate_stage(
             "retryable": False,
         }
     passed = bool(details.get("passed"))
-    return {
+    result = {
         "stage": name.upper(),
         "status": "pass" if passed else "fail",
         "passed": passed,
@@ -844,6 +863,10 @@ def _candidate_stage(
         "retryable": False,
         **details,
     }
+    if not passed:
+        result.setdefault("failure_origin", "candidate")
+        result.setdefault("failure_type", f"{name}_failed")
+    return result
 
 
 def _candidate_evaluation(
@@ -872,6 +895,8 @@ def _candidate_evaluation(
         return {
             "passed": False,
             "outcome": "compile_failed",
+            "failure_origin": compile_result["failure_origin"],
+            "failure_type": compile_result["failure_type"],
             "compile": compile_result,
             "correctness": None,
             "benchmark": None,
@@ -891,6 +916,8 @@ def _candidate_evaluation(
         return {
             "passed": False,
             "outcome": "correctness_failed",
+            "failure_origin": correctness_result["failure_origin"],
+            "failure_type": correctness_result["failure_type"],
             "compile": compile_result,
             "correctness": correctness_result,
             "benchmark": None,
@@ -908,7 +935,7 @@ def _candidate_evaluation(
             incumbent_entry,
         ),
     )
-    return {
+    result = {
         "passed": bool(benchmark_result["passed"]),
         "outcome": (
             "correct" if bool(benchmark_result["passed"]) else "benchmark_failed"
@@ -917,6 +944,10 @@ def _candidate_evaluation(
         "correctness": correctness_result,
         "benchmark": benchmark_result,
     }
+    if not bool(benchmark_result["passed"]):
+        result["failure_origin"] = benchmark_result["failure_origin"]
+        result["failure_type"] = benchmark_result["failure_type"]
+    return result
 
 
 def _profile(
@@ -1029,9 +1060,14 @@ def _redact_details(stage: str, details: Mapping[str, Any]) -> dict[str, Any]:
     """Remove case identities, shapes, seeds, and element locations from output."""
 
     common = {"passed": bool(details.get("passed"))}
+    failure = {
+        "failure_origin": details.get("failure_origin"),
+        "failure_type": details.get("failure_type"),
+    }
     if stage == "compile":
         return {
             **common,
+            **failure,
             "compiled": bool(details.get("compiled")),
             "compile_time_ms": details.get("compile_time_ms"),
             "compiled_case_count": len(details.get("case_results", ())),
@@ -1041,6 +1077,7 @@ def _redact_details(stage: str, details: Mapping[str, Any]) -> dict[str, Any]:
     if stage == "correctness":
         return {
             **common,
+            **failure,
             "passed_cases": details.get("passed_cases"),
             "total_cases": details.get("total_cases"),
             "maximum_absolute_error": details.get("maximum_absolute_error"),
@@ -1050,6 +1087,7 @@ def _redact_details(stage: str, details: Mapping[str, Any]) -> dict[str, Any]:
     if stage == "benchmark":
         return {
             **common,
+            **failure,
             "measurement_stable": details.get("measurement_stable"),
             "geomean_speedup_vs_eager": details.get("geomean_speedup_vs_eager"),
             "minimum_speedup_vs_eager": details.get("minimum_speedup_vs_eager"),
@@ -1061,11 +1099,12 @@ def _redact_details(stage: str, details: Mapping[str, Any]) -> dict[str, Any]:
     if stage == "profile":
         return {
             **common,
+            **failure,
             "warmup": details.get("warmup"),
             "iterations": details.get("iterations"),
             "case_details_redacted": True,
         }
-    return {**common, "case_details_redacted": True}
+    return {**common, **failure, "case_details_redacted": True}
 
 
 def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1092,9 +1131,12 @@ def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
     settings_raw = payload.get("settings", {})
     if not isinstance(settings_raw, Mapping):
         raise ValueError("stage settings must be an object")
-    torch, _torch_npu, triton = _runtime()
-    device_index = int(device.removeprefix("npu:"))
-    torch.npu.set_device(device_index)
+    try:
+        torch, _torch_npu, triton = _runtime()
+        device_index = int(device.removeprefix("npu:"))
+        torch.npu.set_device(device_index)
+    except BaseException as exc:
+        raise _InfrastructureStageError(str(exc)) from exc
     if stage == "baseline":
         details = _baselines(torch, task, cases, device, settings_raw)
     else:
@@ -1133,6 +1175,8 @@ def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
         "started_at": str(payload.get("started_at", _utc_iso())),
         "finished_at": _utc_iso(),
         "passed": bool(details.get("passed")),
+        "failure_origin": details.get("failure_origin"),
+        "failure_type": details.get("failure_type"),
         "details": details,
     }
 
@@ -1159,13 +1203,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         _atomic_json(result_path, result)
         return 0 if bool(result["passed"]) else 2
     except BaseException as exc:
+        infrastructure = isinstance(exc, _InfrastructureStageError)
+        failure_type = (
+            type(exc.__cause__).__name__
+            if infrastructure and exc.__cause__ is not None
+            else type(exc).__name__
+        )
         failure = {
             "schema_version": "ascend_isolated_stage_v1",
             "stage": "unknown",
             "started_at": started,
             "finished_at": _utc_iso(),
             "passed": False,
-            "details": {},
+            "details": {
+                "failure_origin": (
+                    "infrastructure" if infrastructure else "candidate"
+                ),
+                "failure_type": failure_type,
+            },
             "error": {
                 "type": type(exc).__name__,
                 "message": (

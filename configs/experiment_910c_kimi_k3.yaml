@@ -67,6 +67,7 @@ benchmark:
 
 profile:
   run_after_correctness: true
+  search_profile_budget_per_task: 2
   mandatory_groups:
     - task_time
     - pipe_utilization

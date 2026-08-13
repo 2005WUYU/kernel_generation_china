@@ -64,6 +64,7 @@ class EvaluationRequest:
     incumbent_path: Path | None = None
     combine_candidate_stages: bool = False
     run_profile: bool = True
+    search_profile_policy: bool = False
     profile_coverage_required: bool = True
     minimum_kernel_coverage: float = 0.90
     hidden: bool = False
@@ -89,6 +90,9 @@ class EvaluationResult:
     benchmark: Mapping[str, Any] | None
     profile: Mapping[str, Any] | None
     anti_bypass: Mapping[str, Any]
+    candidate: Mapping[str, Any]
+    performance: Mapping[str, Any]
+    infrastructure: Mapping[str, Any]
     reward_vector: Mapping[str, Any]
     score: CandidateScore
 
@@ -109,6 +113,11 @@ class EvaluationResult:
             "correctness": dict(self.correctness) if self.correctness is not None else None,
             "benchmark": dict(self.benchmark) if self.benchmark is not None else None,
             "profile": dict(self.profile) if self.profile is not None else None,
+            "candidate": dict(self.candidate),
+            "performance": dict(self.performance),
+            "attribution": dict(self.anti_bypass),
+            "infrastructure": dict(self.infrastructure),
+            # Compatibility alias for already-committed v1 consumers.
             "anti_bypass": dict(self.anti_bypass),
             "reward_vector": dict(self.reward_vector),
             "score": asdict(self.score),
@@ -137,11 +146,24 @@ def _combined_stage(value: Any) -> dict[str, Any] | None:
 def _failure_result(
     request: EvaluationRequest,
     *,
-    overall_status: str,
+    failure_stage: str,
     source: Mapping[str, Any],
     compile_result: Mapping[str, Any] | None = None,
     correctness: Mapping[str, Any] | None = None,
+    benchmark: Mapping[str, Any] | None = None,
 ) -> EvaluationResult:
+    stage_result = {
+        "source": source,
+        "compile": compile_result,
+        "correctness": correctness,
+        "benchmark": benchmark,
+    }.get(failure_stage)
+    infrastructure_failure = isinstance(stage_result, Mapping) and (
+        _infrastructure_failure(stage_result)
+        or stage_result.get("failure_origin") == "infrastructure"
+    )
+    overall_status = "INFRA_RETRY" if infrastructure_failure else "INVALID_CANDIDATE"
+    reason = _stage_reason(stage_result, failure_stage)
     score = CandidateScore(
         candidate_id=request.candidate_id,
         round_number=request.round_number,
@@ -161,9 +183,27 @@ def _failure_result(
         source=source,
         compile=compile_result,
         correctness=correctness,
-        benchmark=None,
+        benchmark=benchmark,
         profile=None,
-        anti_bypass={"passed": False, "status": "not_evaluated", "reason": overall_status},
+        anti_bypass={
+            "passed": False,
+            "status": "UNAVAILABLE",
+            "advisory": True,
+            "reason": overall_status,
+        },
+        candidate=_candidate_projection(
+            source=source,
+            compile_result=compile_result,
+            correctness=correctness,
+            status="UNEVALUATED" if infrastructure_failure else "INVALID",
+            reason=reason,
+        ),
+        performance={"status": "NOT_MEASURED", "vs_baseline": None, "metrics": {}},
+        infrastructure={
+            "status": "RETRY" if infrastructure_failure else "OK",
+            "stage": failure_stage if infrastructure_failure else None,
+            "reason": reason if infrastructure_failure else None,
+        },
         reward_vector=asdict(reward),
         score=score,
     )
@@ -173,6 +213,77 @@ def _passed(result: Mapping[str, Any]) -> bool:
         return bool(result["passed"])
     status = str(result.get("status", "")).upper()
     return status == "PASS"
+
+
+def _infrastructure_failure(result: Mapping[str, Any]) -> bool:
+    return str(result.get("status", "")).lower() in {
+        "error",
+        "timeout",
+        "unavailable",
+    }
+
+
+def _stage_reason(result: Mapping[str, Any] | None, fallback: str) -> str:
+    if not isinstance(result, Mapping):
+        return fallback
+    error = result.get("error")
+    if isinstance(error, Mapping) and error.get("message"):
+        return str(error["message"])
+    return str(result.get("failure_type") or result.get("status") or fallback)
+
+
+def _candidate_projection(
+    *,
+    source: Mapping[str, Any],
+    compile_result: Mapping[str, Any] | None,
+    correctness: Mapping[str, Any] | None,
+    status: str,
+    reason: str | None,
+) -> dict[str, Any]:
+    return {
+        "source": "PASS" if _passed(source) else "FAIL",
+        "compile": (
+            "PASS" if compile_result is not None and _passed(compile_result)
+            else "FAIL" if compile_result is not None else "NOT_RUN"
+        ),
+        "correctness": (
+            "PASS" if correctness is not None and _passed(correctness)
+            else "FAIL" if correctness is not None else "NOT_RUN"
+        ),
+        "status": status,
+        "reason": reason,
+    }
+
+
+def _performance_projection(
+    benchmark: Mapping[str, Any] | None,
+    *,
+    measured: bool,
+) -> dict[str, Any]:
+    geomean = _number(benchmark, "geomean_speedup_vs_eager", "speedup_geomean")
+    minimum = _number(benchmark, "minimum_speedup_vs_eager", "minimum_speedup")
+    stability = _number(benchmark, "maximum_cv", "stability_cv")
+    if not measured or geomean is None or minimum is None:
+        return {"status": "NOT_MEASURED", "vs_baseline": None, "metrics": {}}
+    tolerance = max(0.01, stability or 0.0)
+    vs_baseline = (
+        "FASTER" if geomean > 1.0 + tolerance
+        else "SLOWER" if geomean < 1.0 - tolerance
+        else "TIE"
+    )
+    return {
+        "status": "MEASURED",
+        "vs_baseline": vs_baseline,
+        "metrics": {
+            "geomean_speedup_vs_eager": geomean,
+            "minimum_speedup_vs_eager": minimum,
+            "maximum_cv": stability,
+            "measurement_stable": (
+                benchmark.get("measurement_stable")
+                if isinstance(benchmark, Mapping) else None
+            ),
+        },
+    }
 
 
 def _number(mapping: Mapping[str, Any] | None, *keys: str) -> float | None:
@@ -195,13 +306,78 @@ def _profile_summary(profile: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else profile
 
 
+def _profile_attribution(
+    profile: Mapping[str, Any] | None,
+    *,
+    minimum_kernel_coverage: float,
+) -> dict[str, Any]:
+    summary = _profile_summary(profile)
+    coverage = _number(summary, "candidate_kernel_coverage")
+    kernel_count = int(summary.get("kernel_count", 0) or 0)
+    verified = (
+        profile is not None
+        and _passed(profile)
+        and kernel_count >= 1
+        and coverage is not None
+        and coverage >= minimum_kernel_coverage
+    )
+    partial = not verified and (
+        kernel_count >= 1 or (coverage is not None and coverage > 0.0)
+    )
+    status = "VERIFIED" if verified else "PARTIAL" if partial else "UNAVAILABLE"
+    reason = None
+    if profile is None:
+        reason = "profile_not_run"
+    elif status == "PARTIAL":
+        reason = "incomplete_kernel_attribution"
+    elif _passed(profile) and kernel_count == 0:
+        reason = "kernel_name_not_matched"
+    elif status == "UNAVAILABLE":
+        reason = profile.get("unavailable_reason") or profile.get("status")
+    return {
+        # ``passed`` is retained only for readers of the old anti_bypass field.
+        "passed": verified,
+        "status": status,
+        "advisory": True,
+        "candidate_kernel_coverage": coverage,
+        "minimum_verified_coverage": minimum_kernel_coverage,
+        "kernel_count": kernel_count,
+        "reason": reason,
+    }
+
+
+def _search_profile_selected(
+    benchmark: Mapping[str, Any] | None,
+    *,
+    incumbent_path: Path | None,
+) -> bool:
+    if incumbent_path is None:
+        return True
+    if not isinstance(benchmark, Mapping):
+        return False
+    paired = benchmark.get("paired_best_comparison")
+    if not isinstance(paired, Mapping):
+        return False
+    geomean = _number(paired, "geomean_speedup_vs_best")
+    minimum = _number(paired, "minimum_speedup_vs_best")
+    maximum_cv = _number(paired, "maximum_cv") or 0.0
+    if geomean is None or minimum is None:
+        return False
+    tolerance = max(0.01, maximum_cv)
+    return geomean - 1.0 > tolerance and minimum - 1.0 >= -tolerance
+
+
 def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -> EvaluationResult:
     """Run compile, correctness, benchmark, then quick profile in order."""
     request.artifact_dir.mkdir(parents=True, exist_ok=True)
     source_stage = backend.source_check(request.candidate_path, request.task)
     source = _stage_dict(source_stage)
     if not source_stage.passed:
-        return _failure_result(request, overall_status="source_failed", source=source)
+        return _failure_result(
+            request,
+            failure_stage="source",
+            source=source,
+        )
 
     correctness_cases = request.correctness_cases or request.task.correctness_cases
     benchmark_cases = request.benchmark_cases or request.task.benchmark_cases
@@ -219,7 +395,7 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
         if not compile_stage.passed:
             return _failure_result(
                 request,
-                overall_status="compile_failed",
+                failure_stage="compile",
                 source=source,
                 compile_result=compile_result,
             )
@@ -233,7 +409,7 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
         if not correctness_stage.passed:
             return _failure_result(
                 request,
-                overall_status="correctness_failed",
+                failure_stage="correctness",
                 source=source,
                 compile_result=compile_result,
                 correctness=correctness,
@@ -266,17 +442,34 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
         outcome = str(candidate_result.get("outcome", "compile_failed"))
         if compile_result is None:
             compile_result = candidate_result
+        if (
+            candidate_result.get("failure_origin") == "infrastructure"
+            or _infrastructure_failure(candidate_result)
+        ):
+            failure_stage = (
+                "correctness" if correctness is not None and not _passed(correctness)
+                else "compile" if not _passed(compile_result)
+                else "benchmark"
+            )
+            return _failure_result(
+                request,
+                failure_stage=failure_stage,
+                source=source,
+                compile_result=compile_result,
+                correctness=correctness,
+                benchmark=benchmark,
+            )
         if outcome == "compile_failed":
             return _failure_result(
                 request,
-                overall_status=outcome,
+                failure_stage="compile",
                 source=source,
                 compile_result=compile_result,
             )
         if outcome == "correctness_failed":
             return _failure_result(
                 request,
-                overall_status=outcome,
+                failure_stage="correctness",
                 source=source,
                 compile_result=compile_result,
                 correctness=correctness,
@@ -284,7 +477,16 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
         benchmark_passed = benchmark is not None and _passed(benchmark)
 
     profile: dict[str, Any] | None = None
-    if request.run_profile and benchmark_passed:
+    if (
+        request.run_profile
+        and benchmark_passed
+        and (
+            not request.search_profile_policy
+            or _search_profile_selected(
+                benchmark, incumbent_path=request.incumbent_path
+            )
+        )
+    ):
         profile_stage = backend.profile(
             request.candidate_path,
             request.task,
@@ -293,28 +495,13 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
         )
         profile = _stage_dict(profile_stage)
 
-    profile_summary = _profile_summary(profile)
-    coverage = _number(profile_summary, "candidate_kernel_coverage")
-    kernel_count = int(profile_summary.get("kernel_count", 0) or 0)
-    if not benchmark_passed:
-        anti_bypass = {
-            "passed": False,
-            "status": "not_evaluated",
-            "reason": "benchmark_failed",
-            "coverage": None,
-        }
-    elif not request.run_profile:
-        anti_bypass = {"passed": not request.profile_coverage_required, "status": "not_run", "coverage": None}
-    elif profile is None or not _passed(profile):
-        anti_bypass = {"passed": not request.profile_coverage_required, "status": "not_verifiable", "coverage": coverage}
-    else:
-        anti_bypass = {
-            "passed": kernel_count >= 1 and coverage is not None and coverage >= request.minimum_kernel_coverage,
-            "status": "verified" if coverage is not None else "not_verifiable",
-            "candidate_kernel_coverage": coverage,
-            "minimum_required_coverage": request.minimum_kernel_coverage,
-            "kernel_count": kernel_count,
-        }
+    attribution = _profile_attribution(
+        profile,
+        minimum_kernel_coverage=request.minimum_kernel_coverage,
+    )
+    if profile is not None:
+        profile = {**profile, "attribution": dict(attribution)}
+    coverage = _number(attribution, "candidate_kernel_coverage")
 
     geomean = (
         _number(benchmark, "geomean_speedup_vs_eager", "speedup_geomean")
@@ -332,7 +519,7 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
         round_number=request.round_number,
         compile_passed=True,
         correctness_passed=True,
-        anti_bypass_passed=bool(anti_bypass["passed"]),
+        anti_bypass_passed=bool(attribution["passed"]),
         hidden_correctness_passed=True if request.hidden else None,
         minimum_speedup=minimum,
         geomean_speedup=geomean,
@@ -340,19 +527,28 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
         stability_cv=stability,
     )
     reward = compute_reward(score)
+    performance = _performance_projection(benchmark, measured=benchmark_passed)
     if not benchmark_passed:
-        overall = "benchmark_failed"
-    elif score.is_publicly_valid:
-        overall = "correct"
+        infrastructure_failure = bool(
+            benchmark is not None
+            and (
+                _infrastructure_failure(benchmark)
+                or benchmark.get("failure_origin") == "infrastructure"
+            )
+        )
+        overall = "INFRA_RETRY" if infrastructure_failure else "INVALID_CANDIDATE"
+        candidate_status = "UNEVALUATED" if infrastructure_failure else "INVALID"
+        candidate_reason = _stage_reason(benchmark, "benchmark_failed")
+    elif performance["status"] != "MEASURED":
+        overall = "INFRA_RETRY"
+        infrastructure_failure = True
+        candidate_status = "VALID"
+        candidate_reason = "benchmark_metrics_missing"
     else:
-        overall = "anti_bypass_failed"
-    if (
-        benchmark_passed
-        and profile is not None
-        and not _passed(profile)
-        and not request.profile_coverage_required
-    ):
-        overall = "profile_unavailable"
+        overall = "VALID"
+        infrastructure_failure = False
+        candidate_status = "VALID"
+        candidate_reason = None
     return EvaluationResult(
         schema_version="ascend_evaluation_result_v1",
         experiment_id=request.experiment_id,
@@ -365,7 +561,20 @@ def evaluate_candidate(backend: EvaluationBackend, request: EvaluationRequest) -
         correctness=correctness,
         benchmark=benchmark,
         profile=profile,
-        anti_bypass=anti_bypass,
+        anti_bypass=attribution,
+        candidate=_candidate_projection(
+            source=source,
+            compile_result=compile_result,
+            correctness=correctness,
+            status=candidate_status,
+            reason=candidate_reason,
+        ),
+        performance=performance,
+        infrastructure={
+            "status": "RETRY" if infrastructure_failure else "OK",
+            "stage": "benchmark" if infrastructure_failure else None,
+            "reason": candidate_reason if infrastructure_failure else None,
+        },
         reward_vector=asdict(reward),
         score=score,
     )
