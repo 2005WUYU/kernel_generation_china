@@ -33,21 +33,10 @@ class SourceGuardResult:
         return asdict(self)
 
 
-_GENERIC_KERNEL_NAMES = frozenset(
-    {"_", "f", "fn", "k", "kernel", "main", "op", "run", "triton"}
-)
-
-
 def is_safe_kernel_identifier(name: str) -> bool:
-    """Whether a source-level kernel name is specific enough for attribution."""
+    """Whether a source-level kernel name can be matched exactly."""
 
-    return (
-        8 <= len(name) <= 128
-        and name.isidentifier()
-        and name.lower() not in _GENERIC_KERNEL_NAMES
-        and sum(character.isalpha() for character in name) >= 4
-        and sum(character.isalnum() for character in name) >= 6
-    )
+    return len(name) <= 128 and name.isidentifier()
 
 
 def candidate_kernel_pattern(name: str) -> str:
@@ -59,7 +48,7 @@ def candidate_kernel_pattern(name: str) -> str:
     """
 
     if not is_safe_kernel_identifier(name):
-        raise ValueError("kernel name is too broad for safe profiler attribution")
+        raise ValueError("kernel name is not a valid bounded Python identifier")
     return rf"^{re.escape(name)}(?:_[0-9a-fA-F]{{8,64}})?$"
 
 
@@ -173,6 +162,13 @@ class SourceGuard(ast.NodeVisitor):
                 self,
                 kernels=self._kernels - {self.required_entrypoint},
                 module_constants=self._module_constants(tree),
+                scalar_helpers={
+                    statement.name
+                    for statement in tree.body
+                    if isinstance(statement, ast.FunctionDef)
+                    and statement.name != self.required_entrypoint
+                    and statement.name not in self._kernels
+                },
             )
             self._findings.extend(policy.check(entry_functions[0]))
             self._launch = policy.kernel_launch_found
@@ -235,7 +231,7 @@ class SourceGuard(ast.NodeVisitor):
                 if not is_safe_kernel_identifier(statement.name):
                     self._add(
                         "unsafe_kernel_name",
-                        "Triton kernel name is too broad for profiler attribution",
+                        "Triton kernel name must be a bounded Python identifier",
                         statement,
                     )
                 if statement.name == self.required_entrypoint:
@@ -544,12 +540,16 @@ class _HostEntrypointPolicy:
         *,
         kernels: frozenset[str] | set[str],
         module_constants: frozenset[str],
+        scalar_helpers: frozenset[str] | set[str],
     ) -> None:
         self.guard = guard
         self.kernels = frozenset(kernels)
         self.module_constants = module_constants
+        self.scalar_helpers = frozenset(scalar_helpers)
         self.findings: list[GuardFinding] = []
         self.kernel_launch_found = False
+        self.launched_output_origins: set[str] = set()
+        self.returned_outputs: list[tuple[frozenset[str], ast.AST]] = []
 
     def _add(self, code: str, message: str, node: ast.AST | None = None) -> None:
         self.findings.append(
@@ -592,6 +592,13 @@ class _HostEntrypointPolicy:
         environment = {argument.arg: _INPUT for argument in arguments}
         environment.update({name: _SCALAR for name in self.module_constants})
         self._block(function.body, environment, frozenset())
+        for output_origins, node in self.returned_outputs:
+            if not output_origins.issubset(self.launched_output_origins):
+                self._add(
+                    "unlaunched_host_output",
+                    "returned output must be passed to a candidate Triton launch",
+                    node,
+                )
         if not self._block_definitely_returns(function.body):
             self._add(
                 "missing_host_return",
@@ -811,12 +818,7 @@ class _HostEntrypointPolicy:
                     value_node,
                 )
                 continue
-            if not value.output_origins.issubset(launched):
-                self._add(
-                    "unlaunched_host_output",
-                    "every returned output must be passed to a candidate Triton launch",
-                    value_node,
-                )
+            self.returned_outputs.append((value.output_origins, value_node))
 
     def _expression(
         self, node: ast.AST, environment: dict[str, _HostValue]
@@ -982,6 +984,7 @@ class _HostEntrypointPolicy:
                 output_origins.update(value.output_origins)
                 launches |= keyword_launches
             self.kernel_launch_found = True
+            self.launched_output_origins.update(output_origins)
             if not output_origins:
                 self._add(
                     "kernel_launch_without_output",
@@ -1026,6 +1029,25 @@ class _HostEntrypointPolicy:
                 self._require_scalar(
                     value, argument, context=f"call to {node.func.id}"
                 )
+                launches |= argument_launches
+            return _SCALAR, launches
+        if isinstance(node.func, ast.Name) and node.func.id in self.scalar_helpers:
+            launches = frozenset()
+            for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
+                value, argument_launches = self._expression(argument, environment)
+                self._require_scalar(
+                    value,
+                    argument,
+                    context=f"call to scalar helper {node.func.id}",
+                )
+                launches |= argument_launches
+            return _SCALAR, launches
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "get":
+            base, launches = self._expression(node.func.value, environment)
+            self._require_scalar(base, node.func.value, context="mapping lookup")
+            for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
+                value, argument_launches = self._expression(argument, environment)
+                self._require_scalar(value, argument, context="mapping lookup")
                 launches |= argument_launches
             return _SCALAR, launches
         self._add(

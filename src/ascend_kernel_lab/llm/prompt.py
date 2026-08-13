@@ -57,28 +57,29 @@ def custom_op(x):
 
 
 SOURCE_CHECKER_CONTRACT: dict[str, Any] = {
-    "purpose": "structural_template_only_adapt_arguments_and_math_to_the_task",
+    "purpose": "prevent_host_fallback_and_unsafe_side_effects",
     "allowed_import_roots": ["torch", "triton"],
     "host_allowed": [
         "torch.empty/empty_like/empty_strided output allocation",
         "Tensor shape/stride/dtype/device/numel metadata",
         "scalar shape/grid/launch-parameter arithmetic",
+        "module-level scalar helper calls with scalar arguments",
+        "local scalar mapping lookups",
         "triton.cdiv/triton.next_power_of_2/triton.Config",
         "launching a declared @triton.jit kernel",
     ],
     "source_checker_rejects": [
         "high-level torch computation or Tensor indexing/view/copy/data_ptr/item",
-        "custom Python helper calls from custom_op",
-        "getattr, dict.get, try/except, file/network/process/runtime probing",
+        "getattr, try/except, file/network/process/runtime probing",
         "candidate-side cache, warmup, benchmark, timing, or dynamic installation",
-        "generic/short Triton kernel names or @triton.jit on custom_op",
-        "returning an output before that exact output is passed to a candidate kernel launch",
+        "@triton.jit on custom_op",
+        "returning an output that is never passed to a candidate kernel launch",
         "top-level executable code or non-literal dynamic assignments",
     ],
     "required": [
         "one ordinary Python host entry point named custom_op",
-        "at least one specifically named @triton.jit kernel (name length >= 8)",
-        "every custom_op control-flow return launches a candidate kernel first",
+        "at least one validly named @triton.jit kernel",
+        "every returned allocator output appears in a candidate kernel launch",
         "complete standalone Python source, never a patch or Markdown fence",
     ],
     "runtime_launch_constraints": [

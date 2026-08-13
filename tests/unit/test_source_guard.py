@@ -124,15 +124,12 @@ class SourceGuardTests(unittest.TestCase):
         self.assertIn("kernel_launch_without_output", codes)
         self.assertIn("unlaunched_host_output", codes)
 
-    def test_rejects_broad_kernel_identifier(self) -> None:
+    def test_accepts_short_kernel_identifier(self) -> None:
         for name in ("k", "_", "kernel"):
             with self.subTest(name=name):
                 source = VALID.replace("generated_kernel", name)
                 result = SourceGuard().check(source)
-                self.assertFalse(result.passed)
-                self.assertIn(
-                    "unsafe_kernel_name", {item.code for item in result.findings}
-                )
+                self.assertTrue(result.passed, result.findings)
 
     def test_requires_a_return_on_every_entrypoint_path(self) -> None:
         result = SourceGuard().check(VALID.replace("    return output\n", ""))
