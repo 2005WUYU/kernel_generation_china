@@ -7,6 +7,7 @@ CONTROLLER_NAME=${AKG_CONTROLLER_CONTAINER:-ascend-kernel-controller}
 WORKER_PREFIX=${AKG_WORKER_CONTAINER_PREFIX:-ascend-kernel-worker}
 DEVICE_IDS=${AKG_DEVICE_IDS:-0,1,2,3,4,5,6,7}
 RUN_ROOT=$PROJECT_ROOT/runs/$EXPERIMENT_ID
+START_EPOCH=$(date +%s)
 
 TASKS='k01_vector_add
 k02_bias_gelu
@@ -86,21 +87,43 @@ final_count() {
     printf '%s' "$count"
 }
 
+elapsed_time() {
+    elapsed=$(( $(date +%s) - START_EPOCH ))
+    printf '%02d:%02d:%02d' \
+        $((elapsed / 3600)) $(((elapsed % 3600) / 60)) $((elapsed % 60))
+}
+
 print_final_summary() {
-    echo '===== FINAL ====='
+    echo "===== FINAL SUMMARY elapsed=$(elapsed_time) ====="
     python3 - "$RUN_ROOT" $TASKS <<'PY'
 import json
 import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
+passed = 0
 for task_id in sys.argv[2:]:
     path = root / "tasks" / task_id / "final_result.json"
     result = json.loads(path.read_text(encoding="utf-8"))
+    status = str(result.get("status", "-"))
+    if status.startswith("passed"):
+        passed += 1
+
+    def show(value):
+        if value is None:
+            return "-"
+        if isinstance(value, float):
+            return f"{value:.4f}"
+        return str(value)
+
     print(
-        f"{task_id} status={result.get('status')} "
-        f"best_round={result.get('best_round')}"
+        f"{task_id} status={status} "
+        f"best_round={show(result.get('best_round'))} "
+        f"hidden_correct={show(result.get('hidden_correctness_passed'))} "
+        f"hidden_geo={show(result.get('speedup_geomean'))} "
+        f"hidden_min={show(result.get('minimum_speedup'))}"
     )
+print(f"TOTAL passed={passed} failed={len(sys.argv[2:]) - passed} tasks={len(sys.argv[2:])}")
 PY
 }
 
@@ -116,7 +139,7 @@ while :; do
 $tasks"
 
     if [ "$snapshot" != "$last_snapshot" ]; then
-        echo "$(date '+%H:%M:%S') EXPERIMENT=$EXPERIMENT_ID"
+        echo "$(date '+%H:%M:%S') ELAPSED=$(elapsed_time) EXPERIMENT=$EXPERIMENT_ID"
         printf '%s\n' "$snapshot"
         last_snapshot=$snapshot
     fi

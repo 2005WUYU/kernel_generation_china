@@ -35,10 +35,16 @@ class ContainerDeploymentContractTests(unittest.TestCase):
         self.assertIn("sleep 5", watcher)
         self.assertIn("docker top", watcher)
         self.assertIn("final_result.json", watcher)
+        self.assertIn("ELAPSED=$(elapsed_time)", watcher)
+        self.assertIn("FINAL SUMMARY elapsed=$(elapsed_time)", watcher)
+        self.assertIn("hidden_geo=", watcher)
+        self.assertIn("TOTAL passed=", watcher)
         self.assertIn("只生成了 $finals/10 个最终结果", watcher)
         self.assertIn('docker logs --tail 100 "$CONTROLLER_NAME"', watcher)
         self.assertNotIn("AUTH_TOKEN", watcher)
-        self.assertNotIn("hidden", watcher.lower())
+        self.assertNotIn("hidden.env", watcher.lower())
+        self.assertNotIn("hidden_seed", watcher.lower())
+        self.assertNotIn("final_evaluation", watcher.lower())
         self.assertEqual(watcher.count("prompt.json"), 1)
 
     def test_build_context_cannot_include_checkout_or_secrets(self) -> None:
