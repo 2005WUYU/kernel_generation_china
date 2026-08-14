@@ -415,7 +415,13 @@ def _catalog_inputs(
     )
 
 
-def reference(spec: TaskSpec, args: Sequence[Any], torch: Any) -> Any:
+def reference(
+    spec: TaskSpec,
+    args: Sequence[Any],
+    torch: Any,
+    *,
+    case: CaseSpec | None = None,
+) -> Any:
     """Trusted eager reference. It must never be imported by candidate code."""
     if spec.id == "k01_vector_add":
         return args[0] + args[1]
@@ -448,7 +454,9 @@ def reference(spec: TaskSpec, args: Sequence[Any], torch: Any) -> Any:
     if spec.id == "k10_gemm_bias_gelu":
         product = torch.matmul(args[0].float(), args[1].float()) + args[2].float()
         return torch.nn.functional.gelu(product, approximate="tanh").to(args[0].dtype)
-    return _catalog_reference(_operation_number(spec), spec, args, torch)
+    return _catalog_reference(
+        _operation_number(spec), spec, args, torch, case=case
+    )
 
 
 def _to_input_dtype(value: Any, source: Any) -> Any:
@@ -503,6 +511,8 @@ def _catalog_reference(
     spec: TaskSpec,
     args: Sequence[Any],
     torch: Any,
+    *,
+    case: CaseSpec | None,
 ) -> Any:
     x = args[0]
     if operation == 1:
@@ -595,7 +605,9 @@ def _catalog_reference(
             x, (x.shape[-1],), args[1], args[2], 1e-5
         )
     if operation == 43:
-        groups = _case_parameter(spec, "groups", m=x.shape[0], n=x.shape[1])
+        groups = _case_parameter(
+            spec, "groups", case=case, m=x.shape[0], n=x.shape[1]
+        )
         width = x.shape[-1] // groups
         grouped = x.float().reshape(x.shape[0], groups, width)
         mean = grouped.mean(dim=-1, keepdim=True)
@@ -645,6 +657,7 @@ def _catalog_reference(
         bags = _case_parameter(
             spec,
             "bags",
+            case=case,
             vocab=x.shape[0],
             dim=x.shape[1],
             count=args[1].numel(),
@@ -665,14 +678,20 @@ def _catalog_reference(
     if operation == 69:
         return torch.argsort(x, dim=-1)
     if operation == 70:
-        k = _case_parameter(spec, "k", m=x.shape[0], n=x.shape[1])
+        k = _case_parameter(
+            spec, "k", case=case, m=x.shape[0], n=x.shape[1]
+        )
         return torch.topk(x, k, dim=-1, sorted=True).values
     if operation == 71:
-        k = _case_parameter(spec, "k", m=x.shape[0], n=x.shape[1])
+        k = _case_parameter(
+            spec, "k", case=case, m=x.shape[0], n=x.shape[1]
+        )
         values, indices = torch.topk(x, k, dim=-1, sorted=True)
         return values, indices
     if operation == 72:
-        k = _case_parameter(spec, "k", m=x.shape[0], n=x.shape[1])
+        k = _case_parameter(
+            spec, "k", case=case, m=x.shape[0], n=x.shape[1]
+        )
         values, indices = torch.topk(x, k, dim=-1, sorted=True)
         return torch.softmax(values.float(), dim=-1).to(x.dtype), indices
     if operation == 73 or 77 <= operation <= 79:
@@ -713,8 +732,12 @@ def _catalog_reference(
         return _rotary(torch, x, interleaved=True)
     if operation in {93, 94}:
         batch, seq, packed = x.shape
-        heads = _case_parameter(spec, "heads", batch=batch, seq=seq)
-        dim = _case_parameter(spec, "dim", batch=batch, seq=seq, heads=heads)
+        heads = _case_parameter(
+            spec, "heads", case=case, batch=batch, seq=seq
+        )
+        dim = _case_parameter(
+            spec, "dim", case=case, batch=batch, seq=seq, heads=heads
+        )
         q, k, v = x.reshape(batch, seq, 3, heads, dim).unbind(dim=2)
         if operation == 94:
             q = _rotary(torch, q, interleaved=True)
@@ -756,14 +779,20 @@ def _catalog_reference(
     if operation == 105:
         return torch.softmax(x.float(), dim=-1).to(x.dtype)
     if operation == 106:
-        topk = _case_parameter(spec, "topk", tokens=x.shape[0], experts=x.shape[1])
+        topk = _case_parameter(
+            spec, "topk", case=case, tokens=x.shape[0], experts=x.shape[1]
+        )
         return torch.topk(x, topk, dim=-1, sorted=True)
     if operation == 107:
-        topk = _case_parameter(spec, "topk", tokens=x.shape[0], experts=x.shape[1])
+        topk = _case_parameter(
+            spec, "topk", case=case, tokens=x.shape[0], experts=x.shape[1]
+        )
         values, indices = torch.topk(x, topk, dim=-1, sorted=True)
         return torch.softmax(values.float(), dim=-1).to(x.dtype), indices
     if operation == 108:
-        experts = _case_parameter(spec, "experts", tokens=x.shape[0], topk=x.shape[1])
+        experts = _case_parameter(
+            spec, "experts", case=case, tokens=x.shape[0], topk=x.shape[1]
+        )
         return torch.bincount(x.reshape(-1), minlength=experts)
     if operation == 109:
         flattened = args[1].reshape(-1)
@@ -774,7 +803,9 @@ def _catalog_reference(
         return torch.index_select(x, 0, args[1])
     if operation == 111:
         return (x.float() * args[1].float().unsqueeze(-1)).sum(dim=1).to(x.dtype)
-    topk = _case_parameter(spec, "topk", tokens=x.shape[0], experts=x.shape[1])
+    topk = _case_parameter(
+        spec, "topk", case=case, tokens=x.shape[0], experts=x.shape[1]
+    )
     values, indices = torch.topk(x, topk, dim=-1, sorted=True)
     del values
     flattened = indices.reshape(-1)
@@ -783,7 +814,15 @@ def _catalog_reference(
     return torch.index_select(expanded, 0, order), torch.index_select(flattened, 0, order)
 
 
-def _case_parameter(spec: TaskSpec, target: str, **known: int) -> int:
+def _case_parameter(
+    spec: TaskSpec,
+    target: str,
+    *,
+    case: CaseSpec | None = None,
+    **known: int,
+) -> int:
+    if case is not None and target in case.params:
+        return int(case.params[target])
     for case in spec.public_cases:
         params = case.params
         if target in params and all(params.get(name) == value for name, value in known.items()):

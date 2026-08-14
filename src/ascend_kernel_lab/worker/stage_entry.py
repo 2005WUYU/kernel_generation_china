@@ -18,6 +18,7 @@ import sys
 import time
 import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -355,7 +356,7 @@ def _correctness(
             originals = tuple(reuse["originals"])
             actual = reuse["actual"]
         reference_args = tuple(value.clone() for value in args)
-        expected = reference(task, reference_args, torch)
+        expected = reference(task, reference_args, torch, case=case)
         if reuse is None:
             with _candidate_guard(torch):
                 actual = entry(*args)
@@ -617,7 +618,7 @@ def _benchmark(
         )
         originals = tuple(value.clone() for value in candidate_inputs)
         expected_inputs = tuple(value.clone() for value in candidate_inputs)
-        expected = reference(task, expected_inputs, torch)
+        expected = reference(task, expected_inputs, torch, case=case)
         incumbent_originals = (
             tuple(value.clone() for value in incumbent_inputs)
             if incumbent_inputs is not None
@@ -628,6 +629,7 @@ def _benchmark(
                 task,
                 tuple(value.clone() for value in incumbent_inputs),
                 torch,
+                case=case,
             )
             if incumbent_inputs is not None
             else None
@@ -638,7 +640,7 @@ def _benchmark(
             return entry(*inputs)
 
         def baseline_call(inputs: tuple[Any, ...] = baseline_inputs) -> Any:
-            return reference(task, inputs, torch)
+            return reference(task, inputs, torch, case=case)
 
         def incumbent_call(inputs: tuple[Any, ...] = incumbent_inputs or ()) -> Any:
             assert incumbent_entry is not None
@@ -1070,7 +1072,7 @@ def _baselines(
         eager_inputs = generate_inputs(task, case, torch, device).args
 
         def eager_call(inputs: tuple[Any, ...] = eager_inputs) -> Any:
-            return reference(task, inputs, torch)
+            return reference(task, inputs, torch, case=case)
 
         for _ in range(warmup):
             eager_call()
@@ -1170,6 +1172,7 @@ def execute(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("stage payload task must be an object")
     task = _task(task_raw)
     cases = _cases(payload.get("cases"))
+    task = replace(task, public_cases=cases)
     correctness_cases = tuple(case for case in cases if case.kind == "correctness")
     benchmark_cases = tuple(case for case in cases if case.kind == "benchmark")
     device = str(payload.get("device", "npu:0"))
