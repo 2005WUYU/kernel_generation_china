@@ -486,7 +486,7 @@ case "$ACTION" in
             --read-only \
             --cap-drop ALL \
             --security-opt no-new-privileges \
-            --pids-limit 512 \
+            --pids-limit "${AKG_CONTROLLER_PIDS_LIMIT:-512}" \
             --memory "${AKG_CONTROLLER_MEMORY:-8g}" \
             --log-opt "max-size=${AKG_LOG_MAX_SIZE:-20m}" \
             --log-opt "max-file=${AKG_LOG_MAX_FILES:-5}" \
