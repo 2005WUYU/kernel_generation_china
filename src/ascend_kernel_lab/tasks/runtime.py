@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .loader import CaseSpec, TaskSpec
@@ -24,8 +24,10 @@ def _sample(torch: Any, shape: Sequence[int], case: CaseSpec, device: str) -> An
     dtype = _dtype(torch, case.dtype)
     generator = torch.Generator(device=device)
     generator.manual_seed(case.seed)
-    backing_shape = list(shape)
-    backing_shape[-1] += max(0, case.address_offset)
+    numel = 1
+    for dimension in shape:
+        numel *= dimension
+    backing_shape = (numel + case.address_offset,)
     distribution = case.distribution
     if distribution == "zeros":
         backing = torch.zeros(backing_shape, dtype=dtype, device=device)
@@ -39,8 +41,7 @@ def _sample(torch: Any, shape: Sequence[int], case: CaseSpec, device: str) -> An
         backing = torch.full(backing_shape, 0.375, dtype=dtype, device=device)
     else:
         backing = torch.randn(backing_shape, dtype=dtype, device=device, generator=generator)
-    if case.address_offset:
-        backing = backing[..., case.address_offset :]
+    backing = backing[case.address_offset :].view(tuple(shape))
     if case.noncontiguous and len(shape) >= 2:
         enlarged = torch.empty((*shape[:-1], shape[-1] * 2), dtype=dtype, device=device)
         enlarged[..., ::2].copy_(backing)
@@ -985,7 +986,7 @@ def hidden_cases_from_template(
     count_correctness: int = 20,
     count_benchmark: int = 6,
 ) -> tuple[CaseSpec, ...]:
-    """Generate hidden cases from ranges without persisting the resulting shapes.
+    """Generate hidden cases from declared profiles or legacy template ranges.
 
     The caller supplies a deployment secret. Neither that secret nor the returned
     cases may be placed in prompts or candidate working directories.
@@ -995,40 +996,35 @@ def hidden_cases_from_template(
     import random
     from pathlib import Path
 
-    catalog_profiles: tuple[Mapping[str, int], ...] = ()
+    public_profiles: Mapping[str, tuple[CaseSpec, ...]] = {}
     if isinstance(task, TaskSpec):
         if task.root is None:
             raise ValueError("hidden cases require a registry-backed task")
-        root = task.root
         task_id = task.id
-        template_path = root / "hidden_template.json"
-        if template_path.is_file():
-            template = json.loads(template_path.read_text(encoding="utf-8"))
-        else:
-            catalog_profiles = tuple(
-                dict(case.params) for case in task.public_cases if case.kind == "correctness"
-            )
-            template = {
-                "dtypes": sorted({case.dtype for case in task.correctness_cases}),
-                "allow_noncontiguous": False,
-            }
+        public_profiles = {
+            "correctness": task.correctness_cases,
+            "benchmark": task.benchmark_cases,
+        }
+        template: Mapping[str, Any] = {}
     else:
         root = Path(task)
         task_id = root.name
         template = json.loads((root / "hidden_template.json").read_text(encoding="utf-8"))
-    dtypes = template["dtypes"]
+    dtypes: Sequence[str] = template.get("dtypes", ())
     distributions = ("normal", "near_zero", "large", "zeros", "repeated")
     dims: Mapping[str, Sequence[int]] = template.get("dimensions", {})
 
     def make(rng: random.Random, index: int, kind: str) -> CaseSpec:
-        params = (
-            dict(rng.choice(catalog_profiles))
-            if catalog_profiles
-            else {
-                name: rng.choice(tuple(int(v) for v in values))
-                for name, values in dims.items()
-            }
-        )
+        if public_profiles:
+            return replace(
+                rng.choice(public_profiles[kind]),
+                id=f"hidden_{kind}_{index:02d}",
+                seed=rng.randrange(1, 2**31),
+            )
+        params = {
+            name: rng.choice(tuple(int(v) for v in values))
+            for name, values in dims.items()
+        }
         return CaseSpec(
             id=f"hidden_{kind}_{index:02d}",
             kind=kind,

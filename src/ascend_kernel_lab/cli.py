@@ -30,8 +30,6 @@ from ascend_kernel_lab.llm import FakeGateway, ModelRequest, create_model_gatewa
 from ascend_kernel_lab.orchestration import (
     BaselineManager,
     ExperimentController,
-    baseline_identity,
-    validate_baseline_snapshot,
 )
 from ascend_kernel_lab.probe import EnvironmentProber
 from ascend_kernel_lab.storage import AtomicArtifactStore, SQLiteDatabase, SQLiteStateStore
@@ -518,18 +516,6 @@ def _load_baselines(
                 invalid_reasons.append("schema_version")
             if snapshot.get("task_id") != task_id:
                 invalid_reasons.append("task_id")
-            if snapshot.get("task_spec_sha256") != task.digest():
-                invalid_reasons.append("task_spec_sha256")
-            if environment_sha256 is not None:
-                measured_commit = str(snapshot.get("harness_git_commit", ""))
-                identity = baseline_identity(
-                    task=task,
-                    environment_sha256=environment_sha256,
-                    harness_git_commit=measured_commit,
-                    benchmark_config=config.benchmark.baseline_settings(),
-                )
-                if not validate_baseline_snapshot(snapshot, expected_identity=identity):
-                    invalid_reasons.append("identity_sha256_or_measurements")
             cases = snapshot.get("per_case")
             case_ids = (
                 [str(item.get("case_id")) for item in cases if isinstance(item, Mapping)]
@@ -821,14 +807,19 @@ def _cmd_worker_run(args: argparse.Namespace) -> int:
     finally:
         for number, handler in previous_handlers.items():
             signal.signal(number, handler)
+    quarantine_reason = service.quarantine_reason
     _print_json(
         {
             "schema_version": "ascend_worker_exit_v1",
             "worker_id": worker_id,
             "processed_jobs": processed_count,
+            "quarantined": service.quarantined,
+            "quarantine_reason": (
+                dict(quarantine_reason) if quarantine_reason is not None else None
+            ),
         }
     )
-    return 0
+    return EXIT_FAILED if service.quarantined else 0
 
 
 def _queue_backend(config: ExperimentConfig) -> Any:

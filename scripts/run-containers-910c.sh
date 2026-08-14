@@ -328,7 +328,7 @@ start_worker_container() {
         --name "$worker_container" \
         --user "$WORKER_UID:$SHARED_GID" \
         --group-add "$NPU_DEVICE_GID" \
-        --restart on-failure:3 \
+        --restart on-failure \
         --health-cmd 'kill -0 1' \
         --health-interval 10s \
         --health-timeout 3s \
@@ -513,8 +513,8 @@ case "$ACTION" in
             --read-only \
             --cap-drop ALL \
             --security-opt no-new-privileges \
-            --pids-limit "${AKG_CONTROLLER_PIDS_LIMIT:-512}" \
-            --memory "${AKG_CONTROLLER_MEMORY:-8g}" \
+            --pids-limit "${AKG_CONTROLLER_PIDS_LIMIT:-4096}" \
+            --memory "${AKG_CONTROLLER_MEMORY:-64g}" \
             --log-opt "max-size=${AKG_LOG_MAX_SIZE:-20m}" \
             --log-opt "max-file=${AKG_LOG_MAX_FILES:-5}" \
             --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \

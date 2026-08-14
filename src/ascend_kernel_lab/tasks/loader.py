@@ -170,6 +170,16 @@ class TaskSpec:
 
     def public_prompt_view(self) -> dict[str, Any]:
         """Return the only task representation allowed to enter a model prompt."""
+        def case_profile(case: CaseSpec) -> dict[str, Any]:
+            return {
+                "dtype": case.dtype,
+                "params": dict(case.params),
+                "distribution": case.distribution,
+                "weight": case.weight,
+                "address_offset": case.address_offset,
+                "noncontiguous": case.noncontiguous,
+            }
+
         return {
             "task_id": self.id,
             "version": self.version,
@@ -179,6 +189,22 @@ class TaskSpec:
             "outputs": list(self.outputs),
             "semantics": dict(self.semantics),
             "public_cases": [case.to_dict() for case in self.public_cases],
+            "input_domain": {
+                "layouts": [
+                    {"name": value["name"], "layout": value["layout"]}
+                    for value in self.inputs
+                ],
+                "correctness_case_profiles": [
+                    case_profile(case) for case in self.correctness_cases
+                ],
+                "benchmark_case_profiles": [
+                    case_profile(case) for case in self.benchmark_cases
+                ],
+                "hidden_sampling": {
+                    "profile_selection": "exact_declared_profile",
+                    "may_vary": ["id", "seed"],
+                },
+            },
             "correctness_policy": dict(self.correctness),
             "benchmark_policy": dict(self.benchmark),
             "restrictions": dict(self.restrictions),

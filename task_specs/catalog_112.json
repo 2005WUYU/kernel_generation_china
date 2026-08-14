@@ -8076,9 +8076,9 @@
       ],
       "semantics": {
         "op": "op_044",
-        "formula": "Divide each row by its L2 norm plus epsilon=1e-12",
+        "formula": "Divide each row by max(L2 norm, epsilon=1e-12)",
         "schema": "normalization",
-        "definition": "Divide each row by its L2 norm plus epsilon=1e-12"
+        "definition": "Divide each row by max(L2 norm, epsilon=1e-12)"
       },
       "correctness": {
         "check_input_unchanged": true,

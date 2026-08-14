@@ -110,6 +110,13 @@ worker_counts() {
     printf '%s/%s running %s/%s healthy' "$running" "$total" "$healthy" "$total"
 }
 
+container_exit_diagnostics() {
+    name=$1
+    docker container inspect --format \
+        'name={{.Name}} running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} error={{json .State.Error}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} memory={{.HostConfig.Memory}} pids={{.HostConfig.PidsLimit}} log={{.HostConfig.LogConfig.Type}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}' \
+        "$name" 2>/dev/null || echo "name=$name absent"
+}
+
 model_active_count() {
     docker top "$CONTROLLER_NAME" -eo args 2>/dev/null |
         awk 'NR > 1 && /(^|[ /])claude([ ]|$)/ { count += 1 } END { print count + 0 }'
@@ -536,8 +543,26 @@ $tasks"
             exit 0
         fi
         echo "Controller 已停止，但只生成了 $finals/$task_total 个最终结果。" >&2
+        echo '===== CONTAINER EXIT STATES =====' >&2
+        container_exit_diagnostics "$CONTROLLER_NAME" >&2
+        old_ifs=$IFS
+        IFS=,
+        for device in $DEVICE_IDS; do
+            container_exit_diagnostics "$WORKER_PREFIX-$device" >&2
+        done
+        IFS=$old_ifs
+        echo '===== FILESYSTEM =====' >&2
+        df -h "$PROJECT_ROOT" >&2 || true
         echo '===== CONTROLLER LOG =====' >&2
         docker logs --tail 100 "$CONTROLLER_NAME" >&2 || true
+        echo '===== WORKER LOG TAILS =====' >&2
+        old_ifs=$IFS
+        IFS=,
+        for device in $DEVICE_IDS; do
+            echo "----- $WORKER_PREFIX-$device -----" >&2
+            docker logs --tail 30 "$WORKER_PREFIX-$device" >&2 || true
+        done
+        IFS=$old_ifs
         exit 1
     fi
     sleep 5
