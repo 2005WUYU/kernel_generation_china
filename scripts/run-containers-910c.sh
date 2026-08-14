@@ -43,7 +43,7 @@ CONTAINER_PROJECT_ROOT=/workspace
 LOCK_ROOT=${AKG_DEVICE_LOCK_ROOT:-/var/lock/ascend-kernel-lab}
 TRITON_CACHE_ROOT=${AKG_TRITON_CACHE_ROOT:-/var/cache/ascend-kernel-lab/triton}
 TRITON_CACHE_ENVIRONMENT_HASH=${AKG_TRITON_CACHE_ENVIRONMENT_HASH:-}
-CONTAINER_TRITON_CACHE_DIR=/workspace/cache/triton
+CONTAINER_TRITON_CACHE_DIR=/var/cache
 CONFIG_REQUESTED=${AKG_CONFIG_PATH:-configs/experiment_910c_deepseek_v4_pro.yaml}
 
 worker_names() {
