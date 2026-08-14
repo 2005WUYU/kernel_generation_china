@@ -5,7 +5,7 @@ experiment:
   maximum_repair_rounds: 0
   rounds_per_task: 5
   task_concurrency: 112
-  model_request_concurrency: 16
+  model_request_concurrency: 112
   tasks:
     - k001_vector_add
     - k002_vector_sub

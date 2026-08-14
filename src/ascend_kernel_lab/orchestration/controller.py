@@ -1674,6 +1674,19 @@ class ExperimentController:
 
     def _call_and_commit_model(self, task: TaskSpec, round_number: int, request: ModelRequest) -> ModelResponse:
         with self._model_request_slots:
+            self._commit_json(
+                self._relative(
+                    task.id, round_number, "model_request_started.json"
+                ),
+                {
+                    "schema_version": "ascend_model_request_state_v1",
+                    "task_id": task.id,
+                    "round": round_number,
+                    "state": "REQUEST_IN_FLIGHT",
+                },
+                task_id=task.id,
+                round_number=round_number,
+            )
             validated = complete_model_response(
                 self.model_gateway,
                 request,

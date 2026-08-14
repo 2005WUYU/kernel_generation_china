@@ -289,7 +289,8 @@ counts = {
     "final": 0,
     "failed_stage": 0,
     "npu": 0,
-    "model": 0,
+    "api_queued": 0,
+    "api_inflight": 0,
     "active": 0,
     "unstarted": 0,
 }
@@ -332,7 +333,8 @@ for task_id in task_ids:
             )
         )
     display_rounds = max(maximum_rounds, max(round_numbers, default=0))
-    waiting_model = False
+    api_queued = False
+    api_inflight = False
     npu_active = False
     stage_failed = False
     started = bool(round_numbers)
@@ -371,11 +373,15 @@ for task_id in task_ids:
         elif (round_root / "model_response.json").is_file():
             stage = "模型已返回"
         elif prompt_exists:
-            stage = "等待模型"
+            if (round_root / "model_request_started.json").is_file():
+                stage = "API请求中"
+            else:
+                stage = "等待API槽"
         else:
             stage = "未开始"
         started = started or prompt_exists or stage != "未开始"
-        waiting_model = waiting_model or stage == "等待模型"
+        api_queued = api_queued or stage == "等待API槽"
+        api_inflight = api_inflight or stage == "API请求中"
         npu_active = npu_active or "排队" in stage or "执行中" in stage
         stage_failed = stage_failed or "失败" in stage
         fields.append(f"R{round_number:02d}{phase}={stage}")
@@ -389,15 +395,18 @@ for task_id in task_ids:
     elif npu_active:
         counts["npu"] += 1
         priority = 1
-    elif waiting_model:
-        counts["model"] += 1
+    elif api_inflight:
+        counts["api_inflight"] += 1
         priority = 2
+    elif api_queued:
+        counts["api_queued"] += 1
+        priority = 3
     elif started:
         counts["active"] += 1
-        priority = 3
+        priority = 4
     else:
         counts["unstarted"] += 1
-        priority = 4
+        priority = 5
     rows.append((priority, task_id, row))
 
 if detail_limit <= 0 or len(rows) <= detail_limit:
@@ -408,7 +417,8 @@ else:
 print(
     f"TASKS total={len(rows)} final={counts['final']} "
     f"failed_stage={counts['failed_stage']} npu={counts['npu']} "
-    f"waiting_model={counts['model']} active={counts['active']} "
+    f"api_inflight={counts['api_inflight']} "
+    f"api_queued={counts['api_queued']} active={counts['active']} "
     f"unstarted={counts['unstarted']} "
     f"DETAIL={len(selected_rows)}/{len(rows)}"
 )
