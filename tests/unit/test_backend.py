@@ -285,11 +285,15 @@ def custom_op(x, y):
         self.assertFalse(bad.passed)
         self.assertTrue(bad.details["findings"])
 
-    def test_compile_creates_an_isolated_cache_and_parses_result(self) -> None:
+    def test_compile_uses_shared_cache_without_publishing_cache_blobs(self) -> None:
         runner = RecordingRunner()
+        shared_cache = self.root / "shared-triton-cache"
+        environment_hash = "a" * 64
         backend = AscendTritonBackend(
             runner=runner,  # type: ignore[arg-type]
             lock_root=self.root / "locks",
+            triton_cache_dir=shared_cache,
+            triton_cache_environment_hash=environment_hash,
         )
         result = backend.compile(
             self._candidate(),
@@ -302,12 +306,24 @@ def custom_op(x, y):
         request = cast(dict[str, Any], call["request"])
         environment = cast(dict[str, str], call["env"])
         self.assertEqual(request["stage"], "compile")
-        self.assertEqual(environment["TRITON_ALWAYS_COMPILE"], "1")
-        self.assertTrue(Path(result.artifacts["triton_cache"]).is_dir())
+        self.assertEqual(environment["TRITON_CACHE_DIR"], str(shared_cache))
+        self.assertNotIn("TRITON_ALWAYS_COMPILE", environment)
+        self.assertNotIn("triton_cache", result.artifacts)
+        self.assertNotIn("ir", result.artifacts)
+        self.assertEqual(
+            result.details["compile_cache"],
+            {
+                "schema_version": "shared_triton_cache_identity_v1",
+                "cache_root": "shared_triton_cache",
+                "candidate_source_sha256": hashlib.sha256(
+                    self._candidate().read_bytes()
+                ).hexdigest(),
+                "environment_hash": environment_hash,
+            },
+        )
         self.assertTrue(Path(result.artifacts["candidate"]).is_file())
         private_work = cast(Path, call["cwd"])
-        self.assertEqual(stat.S_IMODE(private_work.stat().st_mode), 0o700)
-        self.assertEqual(stat.S_IMODE(private_work.parent.stat().st_mode), 0o700)
+        self.assertFalse(private_work.exists())
         published = Path(result.artifacts["attempt_dir"])
         published_mode = stat.S_IMODE(published.stat().st_mode)
         self.assertEqual(published_mode & 0o777, 0o770)

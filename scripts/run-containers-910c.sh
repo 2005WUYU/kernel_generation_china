@@ -41,6 +41,9 @@ SHARED_GID=${AKG_SHARED_GID:-}
 NPU_DEVICE_GID=${AKG_NPU_DEVICE_GID:-}
 CONTAINER_PROJECT_ROOT=/workspace
 LOCK_ROOT=${AKG_DEVICE_LOCK_ROOT:-/var/lock/ascend-kernel-lab}
+TRITON_CACHE_ROOT=${AKG_TRITON_CACHE_ROOT:-/var/cache/ascend-kernel-lab/triton}
+TRITON_CACHE_ENVIRONMENT_HASH=${AKG_TRITON_CACHE_ENVIRONMENT_HASH:-}
+CONTAINER_TRITON_CACHE_DIR=/workspace/cache/triton
 CONFIG_REQUESTED=${AKG_CONFIG_PATH:-configs/experiment_910c_deepseek_v4_pro.yaml}
 
 worker_names() {
@@ -301,6 +304,23 @@ worker_library_path() {
     fi
 }
 
+prepare_shared_triton_cache() {
+    if [ -z "$TRITON_CACHE_ENVIRONMENT_HASH" ]; then
+        baseline_collection=$PROJECT_ROOT/runs/baselines/latest_collection.json
+        TRITON_CACHE_ENVIRONMENT_HASH=$(python3 - "$baseline_collection" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream)["environment_sha256"])
+PY
+)
+    fi
+    TRITON_CACHE_HOST_DIR=$TRITON_CACHE_ROOT/$TRITON_CACHE_ENVIRONMENT_HASH
+    install -d -o "$WORKER_UID" -g "$SHARED_GID" -m 2770 \
+        "$TRITON_CACHE_ROOT" "$TRITON_CACHE_HOST_DIR"
+}
+
 start_worker_container() {
     physical_device=$1
     worker_container=$2
@@ -333,6 +353,8 @@ start_worker_container() {
         --env "AKG_PROJECT_ROOT=$CONTAINER_PROJECT_ROOT" \
         --env "AKG_CONFIG_PATH=$CONTAINER_CONFIG_PATH" \
         --env "AKG_DEVICE_LOCK_ROOT=/var/lock/ascend-kernel-lab/device-$physical_device" \
+        --env "AKG_TRITON_CACHE_ENVIRONMENT_HASH=$TRITON_CACHE_ENVIRONMENT_HASH" \
+        --env "TRITON_CACHE_DIR=$CONTAINER_TRITON_CACHE_DIR" \
         --env USER=akg-worker \
         --env LOGNAME=akg-worker \
         --env HOME=/tmp/akg-home \
@@ -343,6 +365,7 @@ start_worker_container() {
         --volume "$PROJECT_ROOT:$CONTAINER_PROJECT_ROOT:ro" \
         --volume "$PROJECT_ROOT/runs:$CONTAINER_PROJECT_ROOT/runs:rw" \
         --volume "$LOCK_ROOT:/var/lock/ascend-kernel-lab:rw" \
+        --volume "$TRITON_CACHE_HOST_DIR:$CONTAINER_TRITON_CACHE_DIR:rw" \
         "$WORKER_IMAGE" \
         python3 -m ascend_kernel_lab worker run \
         -c "$CONTAINER_CONFIG_PATH" \
@@ -369,6 +392,7 @@ case "$ACTION" in
             sh "$CONTAINER_CONFIG_PATH"
         ;;
     probe|baseline)
+        prepare_shared_triton_cache
         WORKER_LD_LIBRARY_PATH=$(worker_library_path)
         for name in $(managed_worker_names); do
             if docker container inspect "$name" --format '{{.State.Running}}' 2>/dev/null | grep -qx true; then
@@ -407,7 +431,8 @@ case "$ACTION" in
             --env USER=akg-worker \
             --env LOGNAME=akg-worker \
             --env HOME=/tmp/akg-home \
-            --env TRITON_CACHE_DIR=/tmp/akg-triton-cache \
+            --env "AKG_TRITON_CACHE_ENVIRONMENT_HASH=$TRITON_CACHE_ENVIRONMENT_HASH" \
+            --env "TRITON_CACHE_DIR=$CONTAINER_TRITON_CACHE_DIR" \
             --env TRITON_DUMP_DIR=/tmp/akg-triton-dump \
             --env AKG_DEVICE_LOCK_ROOT=/var/lock/ascend-kernel-lab \
             --env GIT_CONFIG_COUNT=1 \
@@ -417,6 +442,7 @@ case "$ACTION" in
             --volume "$PROJECT_ROOT:$CONTAINER_PROJECT_ROOT:ro" \
             --volume "$PROJECT_ROOT/runs:$CONTAINER_PROJECT_ROOT/runs:rw" \
             --volume "$LOCK_ROOT:/var/lock/ascend-kernel-lab:rw" \
+            --volume "$TRITON_CACHE_HOST_DIR:$CONTAINER_TRITON_CACHE_DIR:rw" \
             --entrypoint /bin/sh \
             "$WORKER_IMAGE" -c \
             'set -eu
@@ -431,6 +457,7 @@ case "$ACTION" in
              exec "$@"' sh "$@"
         ;;
     start-worker|start-workers)
+        prepare_shared_triton_cache
         WORKER_LD_LIBRARY_PATH=$(worker_library_path)
         validate_env_file "$HIDDEN_ENV_FILE" hidden
         validate_env_file "$WORKER_ENV_FILE" worker

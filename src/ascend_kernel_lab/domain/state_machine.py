@@ -104,7 +104,11 @@ TASK_TRANSITIONS: Mapping[TaskState, frozenset[TaskState]] = {
         {TaskState.FINAL_BENCHMARK, TaskState.TASK_FAILED}
     ),
     TaskState.FINAL_BENCHMARK: frozenset(
-        {TaskState.FINAL_FULL_PROFILE, TaskState.TASK_FAILED}
+        {
+            TaskState.FINAL_FULL_PROFILE,
+            TaskState.TASK_FINISHED,
+            TaskState.TASK_FAILED,
+        }
     ),
     TaskState.FINAL_FULL_PROFILE: frozenset(
         {TaskState.TASK_FINISHED, TaskState.TASK_FAILED}

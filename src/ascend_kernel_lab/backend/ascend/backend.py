@@ -97,6 +97,8 @@ class AscendTritonBackend(Backend):
         benchmark_settings: Mapping[str, Any] | None = None,
         profile_settings: Mapping[str, Any] | None = None,
         device_environment: Mapping[str, str] | None = None,
+        triton_cache_dir: Path | str | None = None,
+        triton_cache_environment_hash: str | None = None,
     ) -> None:
         if not re.fullmatch(r"npu:\d+", device):
             raise ValueError("device must use npu:<index> syntax")
@@ -128,6 +130,16 @@ class AscendTritonBackend(Backend):
         self.benchmark_settings = dict(benchmark_settings or {})
         self.profile_settings = dict(profile_settings or {})
         self.device_environment = dict(device_environment or {})
+        configured_cache = triton_cache_dir or os.environ.get("TRITON_CACHE_DIR")
+        self.triton_cache_dir = Path(
+            configured_cache
+            or (Path(tempfile.gettempdir()) / "ascend-kernel-lab-triton-cache")
+        )
+        self.triton_cache_dir.mkdir(mode=0o770, parents=True, exist_ok=True)
+        self.triton_cache_environment_hash = (
+            triton_cache_environment_hash
+            or os.environ.get("AKG_TRITON_CACHE_ENVIRONMENT_HASH")
+        )
 
     def _lock(self) -> DeviceLock:
         return DeviceLock(
@@ -151,6 +163,8 @@ class AscendTritonBackend(Backend):
         for number in range(1, 10_000):
             name = stage_name if number == 1 else f"{stage_name}_attempt_{number:02d}"
             candidate = root / name
+            if os.path.lexists(root / "published" / name):
+                continue
             try:
                 candidate.mkdir(mode=0o700)
                 candidate.chmod(0o700)
@@ -189,11 +203,9 @@ class AscendTritonBackend(Backend):
         attempt = self._attempt_dir(artifact_dir, stage_name)
         work = attempt / "work"
         work.mkdir(mode=0o700)
-        cache = work / "triton-cache"
-        dump = work / "ir"
         temporary = work / "tmp"
         home = work / "home"
-        for path in (cache, dump, temporary, home):
+        for path in (temporary, home):
             path.mkdir(mode=0o700)
         self._copy_candidate(candidate_path, work)
         if incumbent_path is not None:
@@ -201,42 +213,22 @@ class AscendTritonBackend(Backend):
         env = {
             "HOME": str(home),
             "TMPDIR": str(temporary),
-            "TRITON_CACHE_DIR": str(cache),
-            "TRITON_DUMP_DIR": str(dump),
+            "TRITON_CACHE_DIR": str(self.triton_cache_dir),
             "DEVICE_ID": self.device_index,
             **self.device_environment,
         }
         return attempt, work, env
 
-    @staticmethod
-    def _seed_triton_cache(
-        artifact_dir: Path,
-        work: Path,
-        predecessor_stages: Sequence[str],
-    ) -> str | None:
-        requested = Path(artifact_dir).resolve()
-        worker_jobs = requested.parent.parent
-        for stage_name in predecessor_stages:
-            sources = (
-                tuple(
-                    worker_jobs.glob(
-                        f"*/attempt_*/published/{stage_name}*/triton-cache"
-                    )
-                )
-                if worker_jobs.name == "worker_jobs"
-                else tuple(
-                    (requested / "published").glob(
-                        f"{stage_name}*/triton-cache"
-                    )
-                )
-            )
-            if sources:
-                source = max(sources, key=lambda path: path.stat().st_mtime_ns)
-                shutil.copytree(
-                    source, work / "triton-cache", dirs_exist_ok=True
-                )
-                return str(source)
-        return None
+    def _cache_identity(self, candidate_path: Path) -> dict[str, Any]:
+        digest = hashlib.sha256(Path(candidate_path).read_bytes()).hexdigest()
+        identity: dict[str, Any] = {
+            "schema_version": "shared_triton_cache_identity_v1",
+            "cache_root": "shared_triton_cache",
+            "candidate_source_sha256": digest,
+        }
+        if self.triton_cache_environment_hash:
+            identity["environment_hash"] = self.triton_cache_environment_hash
+        return identity
 
     @staticmethod
     def _payload(
@@ -384,8 +376,6 @@ class AscendTritonBackend(Backend):
             "stdout": attempt / "stdout.log",
             "stderr": attempt / "stderr.log",
             "stage_result": work / "stage_result.json",
-            "triton_cache": work / "triton-cache",
-            "ir": work / "ir",
             "profile_raw": attempt / "profile_raw",
             "profile_summary": attempt / "profile_summary.json",
         }
@@ -596,23 +586,15 @@ class AscendTritonBackend(Backend):
         *,
         timeout_seconds: float,
         settings: Mapping[str, Any] | None = None,
-        compile_debug: bool = False,
         incumbent_path: Path | None = None,
     ) -> StageResult:
         started = datetime.now(timezone.utc)
+        attempt: Path | None = None
+        cache_identity = self._cache_identity(candidate_path)
         try:
             attempt, work, env = self._prepare(
                 artifact_dir, stage_name, candidate_path, incumbent_path
             )
-            cache_predecessors = {
-                "correctness": ("compile",),
-                "benchmark": ("correctness", "compile"),
-            }.get(stage_name, ())
-            cache_seed = self._seed_triton_cache(
-                artifact_dir, work, cache_predecessors
-            )
-            if compile_debug:
-                env.update({"TRITON_DEBUG": "1", "TRITON_ALWAYS_COMPILE": "1"})
             private_cases = bool(cases) and all(
                 case.id.startswith("hidden_") for case in cases
             )
@@ -654,14 +636,12 @@ class AscendTritonBackend(Backend):
                 work,
                 private_cases=private_cases,
             )
-            if cache_seed is None:
-                return result
             return StageResult(
                 stage=result.stage,
                 status=result.status,
                 started_at=result.started_at,
                 finished_at=result.finished_at,
-                details={**result.details, "triton_cache_seeded_from": cache_seed},
+                details={**result.details, "compile_cache": cache_identity},
                 artifacts=result.artifacts,
                 error=result.error,
                 retryable=result.retryable,
@@ -677,6 +657,7 @@ class AscendTritonBackend(Backend):
                 details={
                     "failure_origin": "infrastructure",
                     "failure_type": "DeviceLockTimeout",
+                    "compile_cache": cache_identity,
                 },
             )
         except (OSError, ValueError, TypeError) as exc:
@@ -689,8 +670,12 @@ class AscendTritonBackend(Backend):
                 details={
                     "failure_origin": "infrastructure",
                     "failure_type": type(exc).__name__,
+                    "compile_cache": cache_identity,
                 },
             )
+        finally:
+            if attempt is not None:
+                shutil.rmtree(attempt, ignore_errors=True)
 
     def source_check(self, candidate_path: Path, task: TaskSpec) -> StageResult:
         del task
@@ -726,7 +711,6 @@ class AscendTritonBackend(Backend):
             cases,
             artifact_dir,
             timeout_seconds=self.compile_timeout_seconds,
-            compile_debug=True,
         )
 
     def check_correctness(
@@ -905,11 +889,7 @@ class AscendTritonBackend(Backend):
                 candidate_kernel_pattern(name) for name in kernel_names
             )
             attempt, work, env = self._prepare(artifact_dir, "profile", candidate_path)
-            cache_seed = self._seed_triton_cache(
-                artifact_dir,
-                work,
-                ("candidate_evaluation", "benchmark", "correctness", "compile"),
-            )
+            cache_identity = self._cache_identity(candidate_path)
             private_cases = bool(cases) and all(
                 case.id.startswith("hidden_") for case in cases
             )
@@ -1103,7 +1083,7 @@ class AscendTritonBackend(Backend):
                 "mandatory_groups": list(mandatory_groups),
                 "requested_groups": list(requested_groups),
                 "missing_mandatory_groups": list(missing_groups),
-                "triton_cache_seeded_from": cache_seed,
+                "compile_cache": cache_identity,
             }
             if not summary.profile_available or missing_groups:
                 return StageResult(
@@ -1172,15 +1152,14 @@ class AscendTritonBackend(Backend):
         attempt = self._attempt_dir(artifact_dir, "baseline")
         work = attempt / "work"
         work.mkdir(mode=0o700)
-        cache = work / "triton-cache"
         temporary = work / "tmp"
         home = work / "home"
-        for path in (cache, temporary, home):
+        for path in (temporary, home):
             path.mkdir(mode=0o700)
         env = {
             "HOME": str(home),
             "TMPDIR": str(temporary),
-            "TRITON_CACHE_DIR": str(cache),
+            "TRITON_CACHE_DIR": str(self.triton_cache_dir),
             "DEVICE_ID": self.device_index,
             **self.device_environment,
         }

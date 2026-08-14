@@ -613,29 +613,6 @@ def custom_op(x):
     return {
         "status": "candidate",
         "round": round_number,
-        "changes": [
-            {"target": "BLOCK_SIZE", "before": None, "after": 256}
-        ],
-        "evidence": [
-            {
-                "fact": "The candidate code processes 256 adjacent elements per program",
-                "source": "current_code",
-            }
-        ],
-        "hypotheses": [
-            {
-                "claim": "The blocked copy should exercise the offline pipeline candidate path",
-                "confidence": "high",
-                "evidence_refs": [0],
-            }
-        ],
-        "predictions": [
-            {
-                "metric": "correctness.passed",
-                "expected_direction": "increase",
-                "reason": "hypothesis[0]",
-            }
-        ],
         "code": source,
     }
 
@@ -937,7 +914,11 @@ def _experiment_components(
     environment = _load_probe_snapshot(
         config,
         args.probe_root,
-        require_profile=not args.allow_unverified_profile,
+        require_profile=(
+            config.profile.run_after_correctness
+            or config.profile.run_for_final_best
+        )
+        and not args.allow_unverified_profile,
     )
     baseline = _load_baselines(
         config,
@@ -989,7 +970,11 @@ def _cmd_experiment_run(args: argparse.Namespace) -> int:
         environment=environment,
         baseline=baseline,
         hidden_seed=_hidden_seed(fake=args.fake),
-        profile_coverage_required=not args.allow_unverified_profile,
+        profile_coverage_required=(
+            config.profile.run_after_correctness
+            or config.profile.run_for_final_best
+        )
+        and not args.allow_unverified_profile,
         allow_insecure_hidden_seed_for_testing=bool(args.fake),
     )
     try:

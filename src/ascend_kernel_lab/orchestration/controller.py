@@ -198,7 +198,6 @@ def _final_gate_status(
     *,
     profile_coverage_required: bool,
 ) -> tuple[str, bool]:
-    del profile_coverage_required
     if _infrastructure_retry(evaluation):
         return "failed_final_infrastructure", _passed_stage(
             evaluation.get("correctness")
@@ -219,6 +218,8 @@ def _final_gate_status(
         )
     ):
         return "failed_final_benchmark", True
+    if not profile_coverage_required:
+        return "passed", True
     attribution = evaluation.get("attribution", evaluation.get("anti_bypass"))
     profile_verified = isinstance(attribution, Mapping) and (
         str(attribution.get("status", "")).upper() == "VERIFIED"
@@ -279,6 +280,13 @@ class ExperimentController:
         self.harness_commit = _git_commit(config.project_root)
         self._model_request_slots = threading.BoundedSemaphore(
             config.model_request_concurrency
+        )
+
+    @property
+    def profiling_enabled(self) -> bool:
+        return bool(
+            self.config.profile.run_after_correctness
+            or self.config.profile.run_for_final_best
         )
 
     @property
@@ -351,7 +359,9 @@ class ExperimentController:
             ).hexdigest()
         manifest["runtime_policy"] = {
             "schema_version": "ascend_runtime_policy_v1",
-            "final_profile_gate": "advisory",
+            "final_profile_gate": (
+                "advisory" if self.profiling_enabled else "disabled"
+            ),
             "blind_suite_generator": "hidden-v1",
             "blind_suite_identity_sha256": suite_identity,
             "harness_git_commit": self.harness_commit,
@@ -638,8 +648,7 @@ class ExperimentController:
             )
         return TaskRunSummary(task.id, str(final["status"]), None, None, final)
 
-    @staticmethod
-    def _follow_up_metrics(evaluation: Mapping[str, Any]) -> dict[str, Any]:
+    def _follow_up_metrics(self, evaluation: Mapping[str, Any]) -> dict[str, Any]:
         """Keep only fast, actionable evidence from the previous evaluation."""
 
         def stage_status(name: str) -> Any:
@@ -740,7 +749,7 @@ class ExperimentController:
                 "cases": cases,
             }
 
-        profile = evaluation.get("profile")
+        profile = evaluation.get("profile") if self.profiling_enabled else None
         profile_summary: dict[str, Any] | None = None
         if isinstance(profile, Mapping):
             summary_value = profile.get("summary")
@@ -808,7 +817,7 @@ class ExperimentController:
         if profile_summary is None and isinstance(attribution, Mapping):
             profile_summary = {"attribution": dict(attribution)}
 
-        return {
+        metrics = {
             "overall_status": evaluation.get("overall_status"),
             "candidate": evaluation.get("candidate"),
             "performance": evaluation.get("performance"),
@@ -817,19 +826,23 @@ class ExperimentController:
             "compile": stage_status("compile"),
             "correctness": correctness_summary,
             "benchmark_vs_pytorch_eager": benchmark_summary,
-            "quick_profile": profile_summary,
-            "search_profile": evaluation.get("search_profile"),
         }
+        if self.profiling_enabled:
+            metrics["quick_profile"] = profile_summary
+            metrics["search_profile"] = evaluation.get("search_profile")
+        return metrics
 
-    @staticmethod
     def _follow_up_failure_reasons(
-        evaluation: Mapping[str, Any], feedback: Mapping[str, Any]
+        self, evaluation: Mapping[str, Any], feedback: Mapping[str, Any]
     ) -> list[str]:
         overall = str(evaluation.get("overall_status", "unknown"))
         if overall in {"VALID", "correct", "success"}:
             return []
         reasons = [overall]
-        for stage_name in ("source", "compile", "correctness", "benchmark", "profile"):
+        stage_names = ["source", "compile", "correctness", "benchmark"]
+        if self.profiling_enabled:
+            stage_names.append("profile")
+        for stage_name in stage_names:
             stage = evaluation.get(stage_name)
             if not isinstance(stage, Mapping):
                 continue
@@ -851,9 +864,9 @@ class ExperimentController:
                             reasons.append(f"source[{code}]: {message}")
         correctness = evaluation.get("correctness")
         if isinstance(correctness, Mapping) and not _passed_stage(correctness):
-            correctness_metrics = ExperimentController._follow_up_metrics(
-                evaluation
-            ).get("correctness")
+            correctness_metrics = self._follow_up_metrics(evaluation).get(
+                "correctness"
+            )
             if isinstance(correctness_metrics, Mapping):
                 failed_cases = correctness_metrics.get("failed_cases")
                 if isinstance(failed_cases, Sequence) and not isinstance(
@@ -1311,7 +1324,8 @@ class ExperimentController:
         if _model_unevaluated(previous_evaluation):
             feedback_instruction = (
                 "刚才的模型响应没有通过结构化响应校验; 不要沿用内部失败占位源码。"
-                "请从当前任务或 BEST 重新生成完整 Kernel 和模型原生四层证据响应。"
+                "请从当前任务或 BEST 重新生成包含 status、round、code 的完整 Kernel; "
+                "其他解释字段可选。"
             )
         elif _infrastructure_retry(previous_evaluation):
             feedback_instruction = (
@@ -1321,7 +1335,7 @@ class ExperimentController:
         elif candidate["role"] == "failed_candidate_under_repair":
             feedback_instruction = (
                 "刚才的候选未通过 compile/correctness; 必须从该失败候选继续修复, "
-                "保留其模型原生 changes/evidence/hypotheses/predictions, "
+                "若原响应包含模型解释则保留其语义, "
                 "并只依据原始错误修改。"
             )
         elif (
@@ -1351,7 +1365,6 @@ class ExperimentController:
         else:
             feedback_instruction = (
                 "这是正确但尚未形成可比较 BEST 的工作候选; 请从它继续并完成 benchmark。"
-                "profile attribution 仅作参考，不是通过门槛。"
             )
         feedback_state: dict[str, Any] = {
             "mode": previous_feedback.get(
@@ -1417,16 +1430,18 @@ class ExperimentController:
                 ),
             }
         elif best is not None and previous_code and int(best["round"]) != round_number - 1:
+            failed_stage_names = [
+                "source",
+                "compile",
+                "correctness",
+                "benchmark",
+            ]
+            if self.profiling_enabled:
+                failed_stage_names.append("profile")
             failed_stage = next(
                 (
                     name
-                    for name in (
-                        "source",
-                        "compile",
-                        "correctness",
-                        "benchmark",
-                        "profile",
-                    )
+                    for name in failed_stage_names
                     if _infrastructure_retry(previous_evaluation)
                     and isinstance(previous_evaluation.get(name), Mapping)
                     and not _passed_stage(previous_evaluation.get(name))
@@ -1447,9 +1462,6 @@ class ExperimentController:
                 "candidate_metrics": self._follow_up_metrics(
                     previous_evaluation
                 ),
-                "system_computed_metric_and_profile_delta": previous_feedback.get(
-                    "comparison_with_best"
-                ),
                 "invalid_performance_evidence": (
                     {
                         "stage": failed_stage,
@@ -1462,6 +1474,18 @@ class ExperimentController:
                     else None
                 ),
             }
+            comparison_with_best = previous_feedback.get("comparison_with_best")
+            if isinstance(comparison_with_best, Mapping):
+                comparison_with_best = dict(comparison_with_best)
+                if not self.profiling_enabled:
+                    comparison_with_best.pop("quick_profile_delta", None)
+            failed_candidate[
+                (
+                    "system_computed_metric_and_profile_delta"
+                    if self.profiling_enabled
+                    else "system_computed_metric_delta"
+                )
+            ] = comparison_with_best
         repair_prompt = candidate["role"] == "failed_candidate_under_repair"
         prompt_best = best if best is not None and not repair_prompt else None
         use_working_candidate = prompt_best is None and failed_candidate is None
@@ -1972,23 +1996,30 @@ class ExperimentController:
                 if reused is not None:
                     evaluation_mapping, score = reused
                 else:
-                    profile_attempt_fingerprint = (
-                        self._search_profile_attempt_fingerprint(task)
-                    )
-                    profiles_run = self._search_profiles_run(
-                        task, before_round=round_number
-                    )
-                    repeated_profile_failure = self._search_profile_failure_seen(
-                        task,
-                        before_round=round_number,
-                        attempt_fingerprint=profile_attempt_fingerprint,
-                    )
-                    search_profile_enabled = (
-                        self.config.profile.run_after_correctness
-                        and profiles_run
-                        < self.config.profile.search_profile_budget_per_task
-                        and not repeated_profile_failure
-                    )
+                    if self.config.profile.run_after_correctness:
+                        profile_attempt_fingerprint = (
+                            self._search_profile_attempt_fingerprint(task)
+                        )
+                        profiles_run = self._search_profiles_run(
+                            task, before_round=round_number
+                        )
+                        repeated_profile_failure = (
+                            self._search_profile_failure_seen(
+                                task,
+                                before_round=round_number,
+                                attempt_fingerprint=profile_attempt_fingerprint,
+                            )
+                        )
+                        search_profile_enabled = (
+                            profiles_run
+                            < self.config.profile.search_profile_budget_per_task
+                            and not repeated_profile_failure
+                        )
+                    else:
+                        profile_attempt_fingerprint = None
+                        profiles_run = 0
+                        repeated_profile_failure = False
+                        search_profile_enabled = False
                     evaluation = evaluate_candidate(
                         self.backend,
                         EvaluationRequest(
@@ -2014,31 +2045,32 @@ class ExperimentController:
                         ),
                     )
                     evaluation_mapping = evaluation.to_dict()
-                    failure_fingerprint = self._profile_failure_fingerprint(
-                        evaluation_mapping
-                    )
-                    profile_attempted = isinstance(
-                        evaluation_mapping.get("profile"), Mapping
-                    )
-                    evaluation_mapping["search_profile"] = {
-                        "attempted": profile_attempted,
-                        "attempt_fingerprint": profile_attempt_fingerprint,
-                        "failure_fingerprint": failure_fingerprint,
-                        "budget_before_round": profiles_run,
-                        "budget_limit": (
-                            self.config.profile.search_profile_budget_per_task
-                        ),
-                        "selection": (
-                            "FIRST_COMPARABLE_OR_NEW_BEST"
-                            if profile_attempted
-                            else "SKIPPED_PREVIOUS_SAME_FAILURE"
-                            if repeated_profile_failure
-                            else "SKIPPED_BUDGET_EXHAUSTED"
-                            if profiles_run
-                            >= self.config.profile.search_profile_budget_per_task
-                            else "SKIPPED_NOT_FIRST_OR_NEW_BEST"
-                        ),
-                    }
+                    if self.config.profile.run_after_correctness:
+                        failure_fingerprint = self._profile_failure_fingerprint(
+                            evaluation_mapping
+                        )
+                        profile_attempted = isinstance(
+                            evaluation_mapping.get("profile"), Mapping
+                        )
+                        evaluation_mapping["search_profile"] = {
+                            "attempted": profile_attempted,
+                            "attempt_fingerprint": profile_attempt_fingerprint,
+                            "failure_fingerprint": failure_fingerprint,
+                            "budget_before_round": profiles_run,
+                            "budget_limit": (
+                                self.config.profile.search_profile_budget_per_task
+                            ),
+                            "selection": (
+                                "FIRST_COMPARABLE_OR_NEW_BEST"
+                                if profile_attempted
+                                else "SKIPPED_PREVIOUS_SAME_FAILURE"
+                                if repeated_profile_failure
+                                else "SKIPPED_BUDGET_EXHAUSTED"
+                                if profiles_run
+                                >= self.config.profile.search_profile_budget_per_task
+                                else "SKIPPED_NOT_FIRST_OR_NEW_BEST"
+                            ),
+                        }
                     score = evaluation.score
             evaluation_mapping["trajectory_phase"] = phase
             evaluation_mapping["phase_index"] = phase_index
@@ -2409,7 +2441,10 @@ class ExperimentController:
                     baseline_snapshot=self.baseline.get(task.id) if isinstance(self.baseline.get(task.id), Mapping) else self.baseline,
                     benchmark_settings=self.config.benchmark.final_settings(),
                     run_profile=self.config.profile.run_for_final_best,
-                    profile_coverage_required=self.profile_coverage_required,
+                    profile_coverage_required=(
+                        self.profile_coverage_required
+                        and self.config.profile.run_for_final_best
+                    ),
                     hidden=True,
                 ),
             )
@@ -2431,7 +2466,10 @@ class ExperimentController:
             )
         status, hidden_passed = _final_gate_status(
             final_evaluation,
-            profile_coverage_required=self.profile_coverage_required,
+            profile_coverage_required=(
+                self.profile_coverage_required
+                and self.config.profile.run_for_final_best
+            ),
         )
         self.store.save_candidate_score(
             replace(best, hidden_correctness_passed=hidden_passed)
@@ -2479,7 +2517,10 @@ class ExperimentController:
                         self.experiment_id, task.id, TaskState.TASK_FAILED
                     )
             else:
-                if task_record.state is TaskState.FINAL_BENCHMARK:
+                if (
+                    task_record.state is TaskState.FINAL_BENCHMARK
+                    and self.config.profile.run_for_final_best
+                ):
                     task_record = self.store.transition_task(
                         self.experiment_id, task.id, TaskState.FINAL_FULL_PROFILE
                     )
@@ -2488,7 +2529,10 @@ class ExperimentController:
                     if status.startswith("passed")
                     else TaskState.TASK_FAILED
                 )
-                if task_record.state is TaskState.FINAL_FULL_PROFILE:
+                if task_record.state in {
+                    TaskState.FINAL_BENCHMARK,
+                    TaskState.FINAL_FULL_PROFILE,
+                }:
                     task_record = self.store.transition_task(
                         self.experiment_id, task.id, terminal
                     )

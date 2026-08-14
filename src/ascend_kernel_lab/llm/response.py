@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import json
-import math
-import re
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,15 +15,9 @@ from .errors import (
 )
 from .types import ModelCompletion, ModelGateway, ModelRequest
 
-_CURRENT_FIELDS = {
-    "status",
-    "round",
-    "changes",
-    "evidence",
-    "hypotheses",
-    "predictions",
-    "code",
-}
+_REQUIRED_FIELDS = {"status", "round", "code"}
+_OPTIONAL_LAYER_FIELDS = {"changes", "evidence", "hypotheses", "predictions"}
+_RAW_OPTIONAL_FIELD = "raw_optional_content"
 _LEGACY_V2_FIELDS = {
     "status",
     "round",
@@ -38,18 +31,18 @@ _LEGACY_V1_FIELDS = (
 ) | {"change_summary"}
 _TRUNCATED_REASONS = {"length", "max_tokens", "max_output_tokens", "token_limit"}
 _SUCCESS_REASONS = {"stop", "end_turn", "success", "completed"}
-_PREDICTION_REASON = re.compile(r"^hypothesis\[([0-9]+)\]$")
 
 
 @dataclass(frozen=True, slots=True)
 class ModelResponse:
     status: str
     round: int
-    changes: tuple[Mapping[str, Any], ...]
-    evidence: tuple[Mapping[str, Any], ...]
-    hypotheses: tuple[Mapping[str, Any], ...]
-    predictions: tuple[Mapping[str, Any], ...]
+    changes: tuple[Any, ...]
+    evidence: tuple[Any, ...]
+    hypotheses: tuple[Any, ...]
+    predictions: tuple[Any, ...]
     code: str
+    raw_optional_content: Mapping[str, Any] | None = None
     legacy_intent: Mapping[str, tuple[str, ...]] | None = None
     legacy_summary_field: str | None = None
 
@@ -67,15 +60,18 @@ class ModelResponse:
                 "assumptions": list(self.legacy_intent.get("assumptions", ())),
                 "code": self.code,
             }
-        return {
+        result = {
             "status": self.status,
             "round": self.round,
-            "changes": [dict(item) for item in self.changes],
-            "evidence": [dict(item) for item in self.evidence],
-            "hypotheses": [dict(item) for item in self.hypotheses],
-            "predictions": [dict(item) for item in self.predictions],
+            "changes": [deepcopy(item) for item in self.changes],
+            "evidence": [deepcopy(item) for item in self.evidence],
+            "hypotheses": [deepcopy(item) for item in self.hypotheses],
+            "predictions": [deepcopy(item) for item in self.predictions],
             "code": self.code,
         }
+        if self.raw_optional_content:
+            result[_RAW_OPTIONAL_FIELD] = deepcopy(dict(self.raw_optional_content))
+        return result
 
     @property
     def is_legacy(self) -> bool:
@@ -100,139 +96,24 @@ def _string_list(value: Any, path: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _non_empty_string(value: Any, path: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ModelResponseError(f"{path} must be a non-empty string")
-    if "\x00" in value:
-        raise ModelResponseError(f"{path} must not contain NUL")
-    return value
-
-
-def _object_list(value: Any, path: str) -> list[Mapping[str, Any]]:
-    if not isinstance(value, list):
-        raise ModelResponseError(f"{path} must be an array of objects")
-    if not value or len(value) > 32:
-        raise ModelResponseError(f"{path} must contain between 1 and 32 items")
-    if any(not isinstance(item, Mapping) for item in value):
-        raise ModelResponseError(f"{path} must be an array of objects")
-    return value
-
-
-def _exact_fields(item: Mapping[str, Any], path: str, expected: set[str]) -> None:
-    fields = set(item)
-    if not all(isinstance(key, str) for key in fields):
-        raise ModelResponseError(f"{path} keys must be strings")
-    unknown = sorted(fields - expected)
-    missing = sorted(expected - fields)
-    if unknown:
-        raise ModelResponseError(f"unknown {path} field(s): {', '.join(unknown)}")
-    if missing:
-        raise ModelResponseError(f"missing {path} field(s): {', '.join(missing)}")
-
-
-def _json_value(value: Any, path: str) -> Any:
-    if value is None or isinstance(value, (bool, int, str)):
-        if isinstance(value, str) and "\x00" in value:
-            raise ModelResponseError(f"{path} must not contain NUL")
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ModelResponseError(f"{path} must be a finite JSON number")
-        return value
-    if isinstance(value, list):
-        return [_json_value(item, f"{path}[{index}]") for index, item in enumerate(value)]
-    if isinstance(value, Mapping) and all(isinstance(key, str) for key in value):
-        return {
-            key: _json_value(item, f"{path}.{key}")
-            for key, item in value.items()
-        }
-    raise ModelResponseError(f"{path} must be a JSON value")
-
-
 def _validate_current_layers(
     decoded: Mapping[str, Any],
 ) -> tuple[
-    tuple[Mapping[str, Any], ...],
-    tuple[Mapping[str, Any], ...],
-    tuple[Mapping[str, Any], ...],
-    tuple[Mapping[str, Any], ...],
+    tuple[Any, ...],
+    tuple[Any, ...],
+    tuple[Any, ...],
+    tuple[Any, ...],
 ]:
-    changes: list[Mapping[str, Any]] = []
-    for index, item in enumerate(_object_list(decoded["changes"], "changes")):
-        path = f"changes[{index}]"
-        _exact_fields(item, path, {"target", "before", "after"})
-        changes.append(
-            {
-                "target": _non_empty_string(item["target"], f"{path}.target"),
-                "before": _json_value(item["before"], f"{path}.before"),
-                "after": _json_value(item["after"], f"{path}.after"),
-            }
-        )
+    def optional_list(name: str) -> tuple[Any, ...]:
+        value = decoded.get(name)
+        return tuple(deepcopy(value)) if isinstance(value, list) else ()
 
-    evidence: list[Mapping[str, Any]] = []
-    for index, item in enumerate(_object_list(decoded["evidence"], "evidence")):
-        path = f"evidence[{index}]"
-        _exact_fields(item, path, {"fact", "source"})
-        evidence.append(
-            {
-                "fact": _non_empty_string(item["fact"], f"{path}.fact"),
-                "source": _non_empty_string(item["source"], f"{path}.source"),
-            }
-        )
-
-    hypotheses: list[Mapping[str, Any]] = []
-    for index, item in enumerate(_object_list(decoded["hypotheses"], "hypotheses")):
-        path = f"hypotheses[{index}]"
-        _exact_fields(item, path, {"claim", "confidence", "evidence_refs"})
-        confidence = item["confidence"]
-        if confidence not in {"low", "medium", "high"}:
-            raise ModelResponseError(
-                f"{path}.confidence must be low, medium, or high"
-            )
-        refs = item["evidence_refs"]
-        if (
-            not isinstance(refs, list)
-            or not refs
-            or len(refs) > 32
-            or any(type(ref) is not int or ref < 0 for ref in refs)
-            or len(set(refs)) != len(refs)
-        ):
-            raise ModelResponseError(
-                f"{path}.evidence_refs must contain unique non-negative integers"
-            )
-        if any(ref >= len(evidence) for ref in refs):
-            raise ModelResponseError(f"{path}.evidence_refs contains an invalid index")
-        hypotheses.append(
-            {
-                "claim": _non_empty_string(item["claim"], f"{path}.claim"),
-                "confidence": confidence,
-                "evidence_refs": list(refs),
-            }
-        )
-
-    predictions: list[Mapping[str, Any]] = []
-    for index, item in enumerate(_object_list(decoded["predictions"], "predictions")):
-        path = f"predictions[{index}]"
-        _exact_fields(item, path, {"metric", "expected_direction", "reason"})
-        direction = item["expected_direction"]
-        if direction not in {"increase", "decrease", "unchanged"}:
-            raise ModelResponseError(
-                f"{path}.expected_direction must be increase, decrease, or unchanged"
-            )
-        reason = _non_empty_string(item["reason"], f"{path}.reason")
-        match = _PREDICTION_REASON.fullmatch(reason)
-        if match is None or int(match.group(1)) >= len(hypotheses):
-            raise ModelResponseError(
-                f"{path}.reason must reference an existing hypothesis[index]"
-            )
-        predictions.append(
-            {
-                "metric": _non_empty_string(item["metric"], f"{path}.metric"),
-                "expected_direction": direction,
-                "reason": reason,
-            }
-        )
-    return tuple(changes), tuple(evidence), tuple(hypotheses), tuple(predictions)
+    return (
+        optional_list("changes"),
+        optional_list("evidence"),
+        optional_list("hypotheses"),
+        optional_list("predictions"),
+    )
 
 
 def validate_model_response(
@@ -243,10 +124,10 @@ def validate_model_response(
 ) -> ModelResponse:
     """Validate JSON content exactly.
 
-    New model completions must use the evidence-graded four-layer protocol.
-    The older ``optimization_summary`` and ``change_summary`` protocols are
-    accepted only when a caller explicitly identifies an already-committed
-    historical artifact.
+    New model completions require only status, round, and complete code.
+    Explanatory fields are optional advisory content and never gate code.
+    Already-committed legacy artifacts retain their historical normalization
+    when a caller explicitly enables it.
     """
 
     if isinstance(value, bytes):
@@ -265,25 +146,18 @@ def validate_model_response(
         raise ModelResponseError("response must be a JSON object")
     fields = set(decoded)
     legacy_summary_field: str | None = None
-    if fields == _LEGACY_V2_FIELDS:
+    if allow_legacy and fields == _LEGACY_V2_FIELDS:
         legacy_summary_field = "optimization_summary"
-    elif fields == _LEGACY_V1_FIELDS:
+    elif allow_legacy and fields == _LEGACY_V1_FIELDS:
         legacy_summary_field = "change_summary"
-    if legacy_summary_field is not None and not allow_legacy:
-        raise ModelResponseError(
-            "legacy response fields are allowed only for committed historical artifacts"
-        )
     expected_fields = (
         _LEGACY_V2_FIELDS
         if legacy_summary_field == "optimization_summary"
         else _LEGACY_V1_FIELDS
         if legacy_summary_field == "change_summary"
-        else _CURRENT_FIELDS
+        else _REQUIRED_FIELDS
     )
-    unknown = sorted(fields - expected_fields)
     missing = sorted(expected_fields - fields)
-    if unknown:
-        raise ModelResponseError(f"unknown response field(s): {', '.join(unknown)}")
     if missing:
         raise ModelResponseError(f"missing response field(s): {', '.join(missing)}")
     status = decoded["status"]
@@ -313,13 +187,26 @@ def validate_model_response(
             ),
             "assumptions": _string_list(decoded["assumptions"], "assumptions"),
         }
-        changes: tuple[Mapping[str, Any], ...] = ()
-        evidence: tuple[Mapping[str, Any], ...] = ()
-        hypotheses: tuple[Mapping[str, Any], ...] = ()
-        predictions: tuple[Mapping[str, Any], ...] = ()
+        changes: tuple[Any, ...] = ()
+        evidence: tuple[Any, ...] = ()
+        hypotheses: tuple[Any, ...] = ()
+        predictions: tuple[Any, ...] = ()
     else:
         changes, evidence, hypotheses, predictions = _validate_current_layers(decoded)
         legacy_intent = None
+    raw_optional_content: dict[str, Any] = {}
+    preserved = decoded.get(_RAW_OPTIONAL_FIELD)
+    if isinstance(preserved, Mapping):
+        raw_optional_content.update(deepcopy(dict(preserved)))
+    elif _RAW_OPTIONAL_FIELD in decoded:
+        raw_optional_content[_RAW_OPTIONAL_FIELD] = deepcopy(preserved)
+    if legacy_summary_field is None:
+        for field, item in decoded.items():
+            if field in _REQUIRED_FIELDS or field == _RAW_OPTIONAL_FIELD:
+                continue
+            if field in _OPTIONAL_LAYER_FIELDS and isinstance(item, list):
+                continue
+            raw_optional_content[field] = deepcopy(item)
     return ModelResponse(
         status=status,
         round=round_number,
@@ -328,6 +215,7 @@ def validate_model_response(
         hypotheses=hypotheses,
         predictions=predictions,
         code=code,
+        raw_optional_content=raw_optional_content or None,
         legacy_intent=legacy_intent,
         legacy_summary_field=legacy_summary_field,
     )

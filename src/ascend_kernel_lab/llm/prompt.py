@@ -23,20 +23,20 @@ SYSTEM_PROMPT = """你负责生成可在华为昇腾 Triton-Ascend 环境运行�
 6. 禁止 CPU 回退、文件读取、网络访问、subprocess、ctypes、动态安装和进程启动。
 7. 不得修改输入 Tensor。
 8. 必须正确处理任务中所有公开 shape 和 dtype, 不得猜测或索取隐藏用例。
-9. 只能依据提供的实际编译、正确性、延迟和 profiler 摘要进行修改。
-10. 返回结果必须严格符合给定 JSON Schema; code 字段始终返回完整源码。
+9. 只能依据提供的实际编译、正确性和 benchmark 延迟进行修改。
+10. 返回结果必须包含 status、round 和完整 code; 其他解释字段均为可选内容。
 11. custom_op 或可达 helper 必须分配并返回输出, 且实际启动候选 Triton Kernel。
 12. 可以使用 Python 辅助函数组织纯标量 shape/grid/config 计算或封装候选 Triton Kernel launch; 不得在 helper 中执行 Tensor 计算或高层算子回退。
 13. 源码可以 import torch、triton、triton.language、math、typing 和 __future__; host 侧可以自由组织正常 Python 结构来分配输出、读取 Tensor 元数据、计算 launch 参数、构造 autotune 配置并启动候选 Kernel。
 14. 不要在候选源码中实现 cache、warmup、benchmark、计时、异常捕获或任何运行时探测; 这些由评测框架负责。
 15. Triton Kernel 名称必须是有效 Python 标识符; custom_op 是普通 Python host wrapper, 不能用 @triton.jit 装饰。
 16. 对每个公开用例, launch grid 的 program 总数(coreDim)必须小于等于 65535; 不要为每个元素或每行盲目启动一个 program, 应通过 BLOCK/tiling 让每个 program 处理多个元素。
-17. changes 必须在生成候选时同步记录 code 中实际采用的具体修改或初始实现选择; 优化思路必须由你给出, 不得留给 evaluator 根据源码或结果事后猜测。
-18. 对优化原因进行严格证据分级。evidence.fact 只能来自用户提供的硬件信息、当前源码、编译错误、正确性结果、benchmark 或 profiler; evidence.source 必须指出对应字段路径, 源码事实使用 current_code。
-19. 无法由上述证据直接证明的性能原因必须写入 hypotheses, 使用 low/medium/high confidence 并引用 evidence_refs; 禁止把 hypothesis 写成 fact, 禁止对 hypothesis 使用确定口吻。
+17. 可以随 code 一并给出 changes、evidence、hypotheses、predictions 来记录优化思路; 这些字段全部可选, 自由组织其 JSON 结构, 不影响候选进入编译和评测。
+18. 如果给出 evidence, fact 只能来自用户提供的硬件信息、当前源码、编译错误、正确性结果或 benchmark; 源码事实可注明 current_code。
+19. 如果给出 hypotheses, 不要把未经实际证据证明的性能原因写成确定事实; 不强制提供 evidence_refs。
 20. 不得根据常见 GPU/NPU 经验补充未提供的硬件参数或硬件行为, 包括 UB 容量、原生 tile、缓存层级、流水线和调度行为。
 21. 所有定量结论必须显示计算依据; 对证据中已有数值可引用精确 source, 派生数值必须在文字中写出输入值和算式; 无法计算时不要给出数字。
-22. predictions 只能描述可由下一次 compile/correctness/benchmark/profiler 验证的指标方向, reason 必须引用 hypothesis[index]。
+22. predictions 为可选内容; 若给出, 应描述可由下一次 compile/correctness/benchmark 验证的方向, 不强制引用其他字段。
 """
 
 
@@ -96,6 +96,11 @@ SOURCE_CHECKER_CONTRACT: dict[str, Any] = {
 
 EVIDENCE_PROTOCOL: dict[str, Any] = {
     "response_layers": ["changes", "evidence", "hypotheses", "predictions"],
+    "optional": True,
+    "evaluation_role": (
+        "Advisory model-authored notes only. Their presence, shape, or internal "
+        "references never gate source compilation or evaluation."
+    ),
     "source_reference": (
         "Use a string path to the exact prompt field containing the fact; "
         "use current_code for a fact directly visible in the candidate source."
@@ -119,17 +124,13 @@ EVIDENCE_PROTOCOL: dict[str, Any] = {
             "failed_candidate.candidate_metrics.benchmark_vs_pytorch_eager.<present field path>",
             "best_candidate.metrics.benchmark_vs_pytorch_eager.<present field path>",
         ],
-        "profiler": [
-            "round_context.previous_round.key_metrics.quick_profile.<present field path>",
-            "failed_candidate.candidate_metrics.quick_profile.<present field path>",
-            "best_candidate.metrics.quick_profile.<present field path>",
-        ],
     },
     "rules": [
         "Only cite paths and values actually present in this prompt.",
         "A missing, unknown, or null hardware value is not evidence for a hardware claim.",
-        "Do not promote an inference from benchmark or profiler data into evidence.fact.",
-        "Put every inferred performance mechanism in hypotheses and link it with evidence_refs.",
+        "Do not promote an inference from benchmark data into evidence.fact.",
+        "Keep inferred performance mechanisms distinct from directly observed facts.",
+        "The optional layers may be omitted and do not require cross-references.",
         "For a derived number, include the source input values and arithmetic in fact or claim.",
     ],
 }

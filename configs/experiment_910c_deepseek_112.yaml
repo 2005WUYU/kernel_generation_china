@@ -174,14 +174,12 @@ benchmark:
 
 profile:
   mode: quick
-  run_after_correctness: true
-  run_for_final_best: true
-  search_profile_budget_per_task: 2
+  run_after_correctness: false
+  run_for_final_best: false
+  search_profile_budget_per_task: 0
   warmup: 1
   iterations: 1
-  mandatory_groups:
-    - task_time
-    - pipe_utilization
+  mandatory_groups: []
   optional_groups: []
   full_profile_for_final_best: false
 
