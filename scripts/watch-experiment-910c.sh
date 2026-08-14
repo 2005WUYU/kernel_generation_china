@@ -287,6 +287,7 @@ def queue_stage(task_id, round_number):
 rows = []
 counts = {
     "final": 0,
+    "round_complete": 0,
     "failed_stage": 0,
     "npu": 0,
     "api_queued": 0,
@@ -366,8 +367,10 @@ for task_id in task_ids:
             except (OSError, json.JSONDecodeError):
                 overall_status = "unknown"
             stage = f"完成[{overall_status}]"
+            counts["round_complete"] += 1
         elif (round_root / "feedback.json").is_file():
             stage = "完成"
+            counts["round_complete"] += 1
         elif (round_root / "candidate.py").is_file():
             stage = queue_stage(task_id, round_number)
         elif (round_root / "model_response.json").is_file():
@@ -414,8 +417,16 @@ if detail_limit <= 0 or len(rows) <= detail_limit:
 else:
     selected_rows = sorted(rows)[:detail_limit]
 
+round_target = len(rows) * optimization_budget
+round_progress = (
+    counts["round_complete"] * 100.0 / round_target
+    if round_target
+    else 0.0
+)
 print(
     f"TASKS total={len(rows)} final={counts['final']} "
+    f"ROUND_PROGRESS={counts['round_complete']}/{round_target} "
+    f"({round_progress:.1f}%) "
     f"failed_stage={counts['failed_stage']} npu={counts['npu']} "
     f"api_inflight={counts['api_inflight']} "
     f"api_queued={counts['api_queued']} active={counts['active']} "
